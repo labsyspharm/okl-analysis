@@ -1,0 +1,718 @@
+---
+title: "Descriptive analysis of OKL affinity data"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(fst)
+library(data.table)
+
+theme_set(theme_minimal())
+
+synapser::synLogin()
+syn <- synDownloader(here("data"))
+```
+
+```{r loading}
+inputs <- list(
+  okl_single_dose = "syn26486828",
+  # hmsl_single_dose = "syn26260430",
+  # hmsl_single_dose_agg = "syn26260426",
+  compound_dictionary = "syn26260332"
+  # references = "syn26260402",
+  # target_mapping = "syn26260398",
+  # target_dictionary = "syn26260394",
+  # compound_mapping = "syn26260389"
+)
+
+input_files <- map(
+  inputs, syn
+)
+
+single_dose <- input_files[["okl_single_dose"]] %>%
+  fread()
+
+compound_dictionary <- input_files[["compound_dictionary"]] %>%
+  read_fst(as.data.table = TRUE)
+# 
+# single_dose_data <- input_files[["hmsl_single_dose"]] %>%
+#   read_fst(as.data.table = TRUE)
+# 
+# single_dose_data_agg <- input_files[["hmsl_single_dose_agg"]] %>%
+#   read_fst(as.data.table = TRUE)
+# 
+# references <- input_files[["references"]] %>%
+#   read_fst(as.data.table = TRUE)
+# 
+# target_mapping <- input_files[["target_mapping"]] %>%
+#   read_fst(as.data.table = TRUE)
+# 
+# target_dictionary <- input_files[["target_dictionary"]] %>%
+#   read_fst(as.data.table = TRUE)
+# 
+# compound_mapping <- input_files[["compound_mapping"]] %>%
+#   read_fst(as.data.table = TRUE)
+```
+
+<!-- ## Wrangling -->
+
+<!-- ```{r wrangling} -->
+<!-- data_sources_map <- tribble( -->
+<!--   ~experiment, ~synapse_id, -->
+<!--   "hmsl_single_dose_okl_1", "syn25998856", -->
+<!--   "hmsl_single_dose_okl_2", "syn26053108", -->
+<!--   "hmsl_single_dose_okl_3", "syn26388880" -->
+<!-- ) -->
+
+<!-- single_dose_data_raw <- single_dose_data %>% -->
+<!--   left_join(references) %>% -->
+<!--   left_join(data_sources_map, by = c("reference_value" = "synapse_id")) %>% -->
+<!--   semi_join( -->
+<!--     target_dictionary[organism == "Homo sapiens"] -->
+<!--   ) -->
+<!-- ``` -->
+
+<!-- ```{r repeat_measurements} -->
+<!-- repeats <- single_dose_data_raw[ -->
+<!--   !is.na(experiment) -->
+<!-- ][ -->
+<!--   , if (.N > 1) copy(.SD)[ -->
+<!--     , `:=`("replicate", as.ordered(seq_len(.N))) -->
+<!--   ], -->
+<!--   keyby = .(lspci_id, description, concentration) -->
+<!-- ] -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- library(ggbeeswarm) -->
+<!-- repeats %>% -->
+<!--   ggplot(aes(description, percent_control, color = replicate)) + -->
+<!--     geom_quasirandom(groupOnX = TRUE) + -->
+<!--   facet_wrap(~concentration, ncol = 1) -->
+
+<!-- ``` -->
+
+```{r}
+p <- single_dose %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  ggplot(aes(as.factor(`lspci_id`), `Percent Control`)) +
+    geom_violin() +
+    facet_wrap(~`Compound Concentration (nM)`, scales = "free_x")
+```
+
+```{r}
+p <- single_dose %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  ggplot(aes(`Percent Control`, color = as.ordered(`Compound Concentration (nM)`))) +
+    geom_freqpoly() +
+    scale_color_viridis_d(direction = -1) +
+    labs(color = "Concentration")
+ggsave("all_combs_percent_control_hist.pdf", p, width = 5, height = 3)
+```
+
+```{r}
+single_dose %>%
+  count(hmsl_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`, `Percent Control`) %>%
+  count(n)
+```
+
+
+```{r}
+per_conc <- single_dose %>%
+  select(hmsl_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`, `Percent Control`) %>%
+  pivot_wider(
+    id_cols = c(hmsl_id, `DiscoveRx Gene Symbol`),
+    names_from = `Compound Concentration (nM)`,
+    values_from = `Percent Control`,
+    values_fn = mean
+  )
+
+p <- per_conc %>%
+  drop_na(`100`, `1000`) %>%
+  ggplot(aes(`100`, `1000`)) +
+  geom_point()
+```
+
+```{r}
+library(rasterly)
+p <- per_conc %>%
+  drop_na(`100`, `1000`) %>%
+  ggRasterly(
+    mapping = aes(x = `100`, y = `1000`), color = rev(viridis_map),
+    shape = 16
+  ) +
+  theme_minimal() +
+  geom_segment(aes(x = 0, y = 0, xend = 100, yend = 100), size = 0.2) +
+  labs(
+    color = "Density"
+  )
+ggsave(
+  here("percent_control_100_vs_1000.pdf"),
+  p, width = 4, height = 3
+)
+```
+
+```{r}
+library(rasterly)
+p <- per_conc %>%
+  drop_na(`100`, `10000`) %>%
+  mutate(
+    across(where(is.numeric), ~log10(.x + 0.01))
+  ) %>%
+  ggRasterly(
+    mapping = aes(x = `100`, y = `10000`), color = rev(viridis_map),
+    shape = 16
+  ) +
+  theme_minimal() +
+  labs(
+    color = "Density"
+  )
+ggsave(
+  here("percent_control_100_vs_10000_log.pdf"),
+  p, width = 4, height = 3
+)
+```
+
+```{r}
+p <- 
+
+```
+
+```{r}
+p <- per_conc %>%
+  drop_na(`100`, `10000`) %>%
+  plotly::plot_ly(x = ~`100`, y = ~`10000`) %>%
+  add_rasterly_heatmap(scaling = "log")
+```
+
+
+Number of targets per drug under threshold
+
+```{r}
+binding_stats <- single_dose %>%
+  group_by(`Compound Concentration (nM)`, `hmsl_id`) %>%
+  summarize(
+    n_total = n(),
+    n_decided = sum(tas %in% c(2, 10), na.rm = TRUE),
+    n_binding = sum(tas == 2, na.rm = TRUE),
+    n_nonbinding = sum(tas == 10, na.rm = TRUE),
+    frac_binding = n_binding / n_decided,
+    frac_nonbinding = n_nonbinding / n_decided,
+    n_below_50 = sum(`Percent Control` < 50),
+    frac_below_50 = n_below_50 / n_total,
+    .groups = "drop"
+  )
+```
+
+```{r}
+p <- binding_stats %>%
+  drop_na(n_binding) %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  ggplot(aes(n_binding, color = as.ordered(`Compound Concentration (nM)`))) +
+    geom_freqpoly() +
+    labs(color = "Concentration")
+
+p <- binding_stats %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  ggplot(aes(n_below_50, color = as.ordered(`Compound Concentration (nM)`))) +
+    geom_freqpoly() +
+    labs(color = "Concentration", x = "N inhibition below 50%")
+ggsave("n_below_50_histogram.pdf", p, width = 5, height = 3)
+```
+
+
+
+
+```{r}
+p <- binding_stats %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  arrange(desc(n_binding)) %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  mutate(
+    rank_n_binding = seq_len(n())
+  ) %>%
+  ungroup() %>%
+  ggplot(
+    aes(
+      rank_n_binding, n_binding,
+      color = as.ordered(`Compound Concentration (nM)`)
+    )
+  ) +
+    geom_step() +
+    labs(
+      title = "N of bound targets (TAS = 2) per drug",
+      color = "Concentration"
+    )
+
+p <- binding_stats %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  arrange(desc(n_below_50)) %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  mutate(
+    rank_n_below_50 = seq_len(n())
+  ) %>%
+  ungroup() %>%
+  ggplot(aes(rank_n_below_50, n_below_50, color = as.ordered(`Compound Concentration (nM)`))) +
+    geom_step() +
+    labs(
+      title = "N of targets with >50% inhibition per drug",
+      color = "Concentration"
+    )
+
+p <- binding_stats %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  arrange(desc(frac_binding)) %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  mutate(
+    rank_frac_binding = seq_len(n())
+  ) %>%
+  ungroup() %>%
+  ggplot(
+    aes(
+      rank_frac_binding, frac_binding,
+      color = as.ordered(`Compound Concentration (nM)`)
+    )
+  ) +
+    geom_step(alpha = 0.8) +
+    labs(
+      title = "Fraction of targets that are bound by drug",
+      color = "Concentration"
+    )
+ggsave("rank_frac_binding.pdf", p, width = 5, height = 3)
+
+p <- binding_stats %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  arrange(desc(frac_below_50)) %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  mutate(
+    rank_frac_below_50 = seq_len(n())
+  ) %>%
+  ungroup() %>%
+  ggplot(aes(rank_frac_below_50, frac_below_50, color = as.ordered(`Compound Concentration (nM)`))) +
+    geom_step(alpha = 0.8) +
+    labs(
+      title = "Fraction of targets with >50% inhibition by drug",
+      color = "Concentration"
+    )
+ggsave("rank_frac_below_50.pdf", p, width = 5, height = 3)
+```
+
+
+```{r}
+percent_remaining_mats <- single_dose %>%
+  group_nest(`Compound Concentration (nM)`) %>%
+  crossing(trans = c("log", "lin")) %>%
+  mutate(
+    mat = map2(
+      data, trans,
+      function(data, trans) {
+        trans_fun <- if (trans == "log")
+          function(x) log10(x + 0.01)
+        else
+          identity
+        data %>%
+          mutate(across(`Percent Control`, trans_fun)) %>%
+          select(hmsl_id, `DiscoveRx Gene Symbol`, `Percent Control`) %>%
+          pivot_wider(values_from = `Percent Control`, names_from = hmsl_id, values_fn = mean) %>%
+          column_to_rownames("DiscoveRx Gene Symbol")
+      }
+    )
+  ) %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000))
+
+library(pheatmap)
+percent_remaining_heatmaps <- percent_remaining_mats %>%
+  mutate(
+    heatmap = map(
+      mat,
+      pheatmap,
+      show_rownames = FALSE, show_colnames = FALSE,
+      color = rev(viridis_map)
+    )
+  )
+
+pwalk(
+  percent_remaining_heatmaps,
+  function(heatmap, `Compound Concentration (nM)`, trans, ...) {
+    ggsave(
+      paste0("heatmap_", `Compound Concentration (nM)`, "_", trans, ".pdf"),
+      heatmap, width = 5, height = 3
+    )
+  }
+)
+
+```
+
+
+```{r}
+p <- single_dose %>%
+  filter(hmsl_id == "HMSL10139", `DiscoveRx Gene Symbol` %in% c("TYK2(JH1domain-catalytic)", "JAK3(JH1domain-catalytic)", "NEK10", "PRKCE")) %>%
+  ggplot(aes(`Compound Concentration (nM)`, `Percent Control`, color = `Entrez Gene Symbol`)) +
+    # geom_line() +
+    # geom_point(alpha = 0.8) +
+    geom_beeswarm(alpha = 0.8) +
+    scale_x_log10() +
+    theme_minimal() +
+    geom_line() +
+    labs(title = "JAK inhibitor AZD1480")
+
+ggsave(
+  "dose_respons_scatter_AZD1480.pdf",
+  p, width = 4, height = 2.5
+)
+
+p <- single_dose %>%
+  filter(hmsl_id == "HMSL10139", `DiscoveRx Gene Symbol` %in% c("TYK2(JH1domain-catalytic)", "JAK3(JH1domain-catalytic)", "NEK10", "PRKCE")) %>%
+  ggplot(aes(`Compound Concentration (nM)`, log10(`Percent Control` + 0.0005), color = `Entrez Gene Symbol`)) +
+    # geom_line() +
+    # geom_point(alpha = 0.8) +
+    geom_beeswarm(alpha = 0.8) +
+    scale_x_log10() +
+    theme_minimal() +
+    geom_line() +
+    labs(title = "JAK inhibitor AZD1480", y = "log10(Percent Control)")
+
+ggsave(
+  "dose_response_scatter_log_AZD1480.pdf",
+  p, width = 4, height = 2.5
+) 
+```
+
+```{r}
+single_dose_trans <- single_dose %>%
+  mutate(
+    log_inhibition = log10(`Percent Control` + 0.01)
+  )
+
+largest_inconsistency <- single_dose %>%
+  mutate(across(`Percent Control`, ~log10(.x + 0.01))) %>%
+  group_by(
+    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
+    `Compound Concentration (nM)`
+  ) %>%
+  summarize(across(`Percent Control`, mean), .groups = "drop") %>%
+  arrange(`Compound Concentration (nM)`) %>%
+  group_by(
+    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`
+  ) %>%
+  summarize(
+    data = list(cur_data()),
+    drops = list(`Percent Control`[-1] - `Percent Control`[-n()]),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_inhib = map_dbl(data, ~min(.x$`Percent Control`)),
+    largest_increase_idx = map_int(drops, ~which.max(magrittr::inset(.x, .x < 0, 0))),
+    largest_increase_conc = map2_chr(largest_increase_idx, data, ~paste(.y$`Compound Concentration (nM)`[c(.x, .x + 1)], collapse = "-")),
+    largest_increase = map_dbl(drops, ~max(magrittr::inset(.x, .x < 0, 0))),
+    drops_auc = map_dbl(drops, sum),
+    # largest_increase_norm = map2_dbl(largest_increase, data, ~.x - mean(.y$`Percent Control`))
+    largest_increase_norm = largest_increase - drops_auc
+  )
+
+between_doses <- single_dose_trans %>%
+  group_by(
+    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
+    `Compound Concentration (nM)`
+  ) %>%
+  summarize(across(log_inhibition, mean), .groups = "drop") %>%
+  arrange(`Compound Concentration (nM)`) %>%
+  group_by(
+    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`
+  ) %>%
+  summarize(
+    data = list(cur_data()),
+    drops = list(log_inhibition[-1] - log_inhibition[-n()]),
+    pc_extended = list(c(log10(100 + 0.01), log_inhibition, log10(0 + 0.01))),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_inhib = map_dbl(data, ~min(.x$log_inhibition)),
+    largest_increase_idx = map_int(drops, ~which.max(magrittr::inset(.x, .x < 0, 0))),
+    largest_increase_conc = map2_chr(largest_increase_idx, data, ~paste(.y$`Compound Concentration (nM)`[c(.x, .x + 1)], collapse = "-")),
+    largest_increase = map_dbl(drops, ~max(magrittr::inset(.x, .x < 0, 0))),
+    drops_auc = map_dbl(drops, sum),
+    # largest_increase_norm = map2_dbl(largest_increase, data, ~.x - mean(.y$`Percent Control`))
+    largest_increase_norm = largest_increase - drops_auc
+  ) %>%
+  mutate(
+    # data = pmap(
+    #   list(pc_extended, data),
+    #   function(pc_extended, data) {
+    #     data %>%
+    #       mutate(
+    #         means = (pc_extended[-c(1, 2)] + head(pc_extended, -2)) * 0.5,
+    #         mean_diff = log_inhibition - means
+    #       )
+    #   }
+    # )
+    means = map(pc_extended, ~(.x[-c(1, 2)] + head(.x, -2)) * 0.5),
+    mean_diff = map2(means, data, ~.y$log_inhibition - .x),
+    largest_increase_idx = map_int(drops, ~which.max(magrittr::inset(.x, .x < 0, 0)))
+  ) %>%
+  mutate(
+    possible_sus = map(largest_increase_idx, ~c(0, 1) + .x),
+    sus_index = map2(mean_diff, possible_sus, ~.y[which.max(abs(.x)[.y])]) %>%
+      unlist(),
+    sus_mean_diff = map2_dbl(mean_diff, sus_index, ~.x[.y]),
+    sus_conc = map2_dbl(sus_index, data, ~.y$`Compound Concentration (nM)`[.x])
+  ) %>%
+  mutate(
+    is_bad = largest_increase > 0.5
+  )
+```
+
+```{r}
+p <- between_doses %>%
+  ggplot(
+    aes(sus_mean_diff, largest_increase)
+  ) +
+    geom_point()
+
+p <- between_doses %>%
+  ggplot(
+    aes(factor(sus_conc))
+  ) +
+    geom_bar() +
+    facet_wrap(~is_bad)
+
+random_bad <- between_doses %>%
+  filter(is_bad) %>%
+  sample_n(10) %>%
+  left_join(
+    compound_dictionary %>%
+      select(hmsl_id, pref_name)
+  ) %>%
+  mutate(
+    measurement_name = paste(pref_name, "-", `DiscoveRx Gene Symbol`)
+  )
+  
+
+p <- random_bad %>%
+  unnest(data) %>%
+  ggplot(aes(`Compound Concentration (nM)`, log_inhibition)) +
+    geom_line() +
+    facet_wrap(~measurement_name) +
+    scale_x_log10() +
+    geom_segment(
+      aes(sus_conc, xend = sus_conc), inherit.aes = FALSE,
+      y = -2, yend = -1, color = "red", data = random_bad
+    )
+```
+
+
+```{r}
+p <- largest_inconsistency %>%
+  ggplot(aes(largest_increase)) +
+    geom_histogram() +
+    geom_vline(xintercept = 0.5, color = "red")
+
+ggsave(
+  "largest_increase_hist.pdf",
+  p, width = 4, height = 2
+)
+
+p <- largest_inconsistency %>%
+  ggplot(aes(largest_increase, largest_increase_norm)) +
+    geom_point()
+
+p <- largest_inconsistency %>%
+  ggplot(aes(largest_decrease, largest_increase)) +
+    geom_point()
+
+p <- largest_inconsistency %>%
+  ggplot(aes(drops_auc, largest_increase)) +
+    geom_point()
+
+p <- largest_inconsistency %>%
+  ggplot(aes(max_inhib, largest_increase)) +
+    geom_point()
+
+p <- largest_inconsistency %>%
+  ggplot(aes(largest_increase_conc, largest_increase)) +
+    geom_quasirandom(groupOnX = TRUE)
+```
+
+
+```{r}
+rois <- largest_inconsistency %>%
+  mutate(
+    roi = case_when(
+      largest_increase > 3 & largest_decrease < -3 ~ "top_left",
+      largest_increase > 3 & largest_decrease > -1 ~ "top_right",
+      TRUE ~ "none"
+    )
+  ) %>%
+  filter(roi != "none") %>%
+  select(where(negate(is.list)))
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+n_inconsistent_per_target <- largest_inconsistency %>%
+  mutate(largest_increase_bad = largest_increase > 0.5) %>%
+  group_by(`DiscoveRx Gene Symbol`, `Entrez Gene Symbol`) %>%
+  summarize(
+    n_bad = sum(largest_increase_bad),
+    n_bad_norm = sum(largest_increase_bad) / sum(max_inhib < 0.5),
+    # Normalize by number of active targets
+    frac_bad = n_bad / n(),
+    # Only take into account bad 
+    mean_largest_increase = mean(largest_increase),
+    # badness_score = sum(largest_increase) + sum(max_inhib),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_bad_norm))
+
+n_inconsistent_per_compound <- largest_inconsistency %>%
+  mutate(largest_increase_bad = largest_increase > 0.5) %>%
+  group_by(`lspci_id`, `hmsl_id`) %>%
+  summarize(
+    n_bad = sum(largest_increase_bad),
+    frac_bad = n_bad / n(),
+    mean_largest_increase = mean(largest_increase),
+    # badness_score = sum(largest_increase) + sum(max_inhib),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(frac_bad)) %>%
+  left_join(
+    compound_dictionary %>%
+      select(hmsl_id, pref_name)
+  )
+
+```
+
+
+
+
+```{r}
+p <- n_inconsistent_per_target %>%
+  ggplot(aes(frac_bad)) +
+    geom_histogram()
+
+ggsave(
+  "frac_bad_per_target_hist.pdf",
+  p, width = 4, height = 2
+)
+
+p <- n_inconsistent_per_compound %>%
+  ggplot(aes(frac_bad)) +
+    geom_histogram()
+
+ggsave(
+  "frac_bad_per_compound_hist.pdf",
+  p, width = 4, height = 2
+)
+
+```
+
+```{r}
+p <- single_dose %>%
+  filter(`DiscoveRx Gene Symbol` == "ACVR1B") %>%
+  # head(n = 10) %>%
+  ggplot(aes(as.ordered(`Compound Concentration (nM)`), `Percent Control`, group = hmsl_id)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~hmsl_id) +
+  labs(x = "Concentration (nM)")
+
+ggsave(
+  "asdf.png",
+  p, width = 10, height = 7
+)
+```
+
+```{r}
+plot_beeswarm_single_drug <- function(name) {
+  library(ggbeeswarm)
+  lspci_id <- if (is.numeric(name))
+    name
+  else if (str_starts(name, "HMSL"))
+    compound_mapping[external_id == name][["lspci_id"]][1]
+  else
+    compound_dictionary[pref_name == name][["lspci_id"]][1, 1]
+  single_dose %>%
+    filter(lspci_id == .env$lspci_id) %>%
+    ggplot(aes(as.ordered(`Compound Concentration (nM)`), `Percent Control`)) +
+      geom_quasirandom()
+}
+
+plot_heatmap_single_drug <- function(name) {
+  library(ggbeeswarm)
+  lspci_id <- if (is.numeric(name))
+    name
+  else if (str_starts(name, "HMSL"))
+    compound_mapping[external_id == name][["lspci_id"]][1]
+  else
+    compound_dictionary[pref_name == name][["lspci_id"]][1, 1]
+  d <- single_dose %>%
+    filter(lspci_id == .env$lspci_id) %>%
+    mutate(across(`Compound Concentration (nM)`, . %>% as.factor() %>% fct_inseq())) %>%
+    select(`DiscoveRx Gene Symbol`, `Compound Concentration (nM)`, `Percent Control`) %>%
+    pivot_wider(names_from = `DiscoveRx Gene Symbol`, values_from = `Percent Control`) %>%
+    column_to_rownames("Compound Concentration (nM)")
+  ComplexHeatmap::Heatmap(
+    as.matrix(d),
+    show_column_names = FALSE,
+    cluster_rows = FALSE,
+    row_order = order(as.double(rownames(d))),
+    col = rev(viridis_map)
+  )
+  # pheatmap(
+  #   d, show_rownames = TRUE, show_colnames = FALSE,
+  #   cluster_rows = FALSE,
+  #   color = rev(viridis_map)
+  # )
+    # ggplot(
+    #   aes(
+    #     `DiscoveRx Gene Symbol`,
+    #     as.ordered(`Compound Concentration (nM)`),
+    #     fill = `Percent Control`
+    #   )
+    # ) +
+    # geom_tile() +
+    # scale_fill_viridis_c(direction = -1)
+}
+
+plot_single_drug <- function(drug, target) {
+  library(ggbeeswarm)
+  lspci_id <- if (is.numeric(drug))
+    drug
+  else if (str_starts(drug, "HMSL"))
+    compound_mapping[external_id == drug][["lspci_id"]][1]
+  else
+    compound_dictionary[pref_name == drug][["lspci_id"]][1, 1]
+  df <- single_dose %>%
+    filter(lspci_id == .env$lspci_id, str_detect(`DiscoveRx Gene Symbol`, target))
+  p <- df %>%
+    ggplot(aes(as.ordered(`Compound Concentration (nM)`), `Percent Control`)) +
+      geom_quasirandom(groupOnX = TRUE)
+  if (length(unique(df$`DiscoveRx Gene Symbol`)) > 1)
+    p <- p +
+      facet_wrap(~`DiscoveRx Gene Symbol`)
+  p
+}
+
+plot_single_drug("HMSL10004", "TYK2")
+
+p <- plot_heatmap_single_drug("HMSL10139")
+withr::with_pdf(
+  "AZD1480_dose_response_hm.pdf",
+  ComplexHeatmap::draw(plot_heatmap_single_drug("HMSL10139")), width = 6, height = 2
+)
+ggsave(
+  "AZD1480_dose_response_hm.pdf",
+  p, width = 6, height = 2.5
+)
+
+```
