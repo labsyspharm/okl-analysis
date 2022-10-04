@@ -11,7 +11,7 @@ library(synExtra)
 library(here)
 library(fst)
 library(data.table)
-library(dtplyr)
+# library(dtplyr)
 
 theme_set(theme_minimal())
 
@@ -44,11 +44,11 @@ compound_dictionary <- input_files[["compound_dictionary"]] %>%
 compound_names <- compound_dictionary %>%
   select(lspci_id, name = pref_name) %>%
   drop_na() %>%
-  lazy_dt() %>%
+  # lazy_dt() %>%
   group_by(lspci_id) %>%
   slice_head(n = 1) %>%
-  ungroup() %>%
-  as_tibble()
+  ungroup()
+  # as_tibble()
 
 qpcr_misses <- syn("syn33531640") %>%
   readxl::read_excel()
@@ -1003,20 +1003,42 @@ binary_between_doses <- single_dose_trans %>%
     `Compound Concentration (nM)`
   ) %>%
   summarize(
-    across(c(`Percent Control`, log_inhibition), mean),
+    across(
+      c(`Percent Control`, log_inhibition), 
+      ~if (!all(qpcr_miss))
+        mean(.x[!qpcr_miss])
+      else
+        mean(.x)
+    ),
+    qpcr_miss = all(qpcr_miss),
     .groups = "drop"
   ) %>%
   arrange(`Compound Concentration (nM)`) %>%
   mutate(
-    inhib_hit = `Percent Control` <= 35
+    inhib_hit = `Percent Control` <= 35 & !qpcr_miss
   ) %>%
   group_by(
     lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`
   ) %>%
   summarize(
     data = list(cur_data()),
-    inhib_concordant = {
-      !any((inhib_hit[-1] - head(inhib_hit, -1)) < 0)
+    # inhib_concordant = {
+    #   !any((inhib_hit[-1] - head(inhib_hit, -1)) < 0)
+    # },
+    inhib_concordant = if (any(inhib_hit)) {
+      cg <- cur_group()
+      # if (cg[["Entrez Gene Symbol"]] == "MKNK1" && cg[["lspci_id"]] == 17778) browser()
+      inhib_idx <- which(inhib_hit)[1]
+      if (inhib_idx == length(inhib_hit))
+        TRUE
+      else {
+        after <- tail(`Percent Control`, -inhib_idx)
+        x <- !any((after > 35) & (after > (2 * `Percent Control`[inhib_idx])))
+        # if (x) browser()
+        x
+      }
+    } else {
+        TRUE
     },
     .groups = "drop"
   )
