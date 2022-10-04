@@ -11,11 +11,12 @@ library(synExtra)
 library(here)
 library(fst)
 library(data.table)
+library(dtplyr)
 
 theme_set(theme_minimal())
 
 synapser::synLogin()
-syn <- synDownloader(here("data"))
+syn <- synDownloader("~/data/", .cache = TRUE)
 ```
 
 ```{r loading}
@@ -39,6 +40,19 @@ single_dose <- input_files[["okl_single_dose"]] %>%
 
 compound_dictionary <- input_files[["compound_dictionary"]] %>%
   read_fst(as.data.table = TRUE)
+
+compound_names <- compound_dictionary %>%
+  select(lspci_id, name = pref_name) %>%
+  drop_na() %>%
+  lazy_dt() %>%
+  group_by(lspci_id) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  as_tibble()
+
+qpcr_misses <- syn("syn33531640") %>%
+  readxl::read_excel()
+
 # 
 # single_dose_data <- input_files[["hmsl_single_dose"]] %>%
 #   read_fst(as.data.table = TRUE)
@@ -201,11 +215,13 @@ binding_stats <- single_dose %>%
     n_decided = sum(tas %in% c(2, 10), na.rm = TRUE),
     n_binding = sum(tas == 2, na.rm = TRUE),
     n_nonbinding = sum(tas == 10, na.rm = TRUE),
+    n_below_50 = sum(`Percent Control` < 50),
+    .groups = "drop"
+  ) %>%
+  mutate(
     frac_binding = n_binding / n_decided,
     frac_nonbinding = n_nonbinding / n_decided,
-    n_below_50 = sum(`Percent Control` < 50),
-    frac_below_50 = n_below_50 / n_total,
-    .groups = "drop"
+    frac_below_50 = n_below_50 / n_total
   )
 ```
 
@@ -385,9 +401,24 @@ ggsave(
 
 ```{r}
 single_dose_trans <- single_dose %>%
+  left_join(
+    qpcr_misses %>%
+      transmute(
+        hmsl_id = `Compound Name`,
+        `DiscoveRx Gene Symbol` = `Ambit Gene Symbol`,
+        `Compound Conc`,
+        qpcr_miss = TRUE
+      ),
+    by = c("hmsl_id", "DiscoveRx Gene Symbol", "Compound Concentration (nM)" = "Compound Conc")
+  ) %>%
   mutate(
-    log_inhibition = log10(`Percent Control` + 0.01)
-  )
+    log_inhibition = log10(`Percent Control` + 0.01),
+    qpcr_miss = replace_na(qpcr_miss, FALSE)
+  ) %>%
+  as_tibble()
+
+single_dose_trans %>%
+  count(qpcr_miss)
 
 largest_inconsistency <- single_dose %>%
   mutate(across(`Percent Control`, ~log10(.x + 0.01))) %>%
@@ -413,7 +444,8 @@ largest_inconsistency <- single_dose %>%
     drops_auc = map_dbl(drops, sum),
     # largest_increase_norm = map2_dbl(largest_increase, data, ~.x - mean(.y$`Percent Control`))
     largest_increase_norm = largest_increase - drops_auc
-  )
+  ) %>%
+  as_tibble()
 
 between_doses <- single_dose_trans %>%
   group_by(
@@ -434,6 +466,7 @@ between_doses <- single_dose_trans %>%
   mutate(
     max_inhib = map_dbl(data, ~min(.x$log_inhibition)),
     largest_increase_idx = map_int(drops, ~which.max(magrittr::inset(.x, .x < 0, 0))),
+    largest_increase_inhib = map2_dbl(drops, largest_increase_idx, magrittr::extract),
     largest_increase_conc = map2_chr(largest_increase_idx, data, ~paste(.y$`Compound Concentration (nM)`[c(.x, .x + 1)], collapse = "-")),
     largest_increase = map_dbl(drops, ~max(magrittr::inset(.x, .x < 0, 0))),
     drops_auc = map_dbl(drops, sum),
@@ -453,7 +486,7 @@ between_doses <- single_dose_trans %>%
     # )
     means = map(pc_extended, ~(.x[-c(1, 2)] + head(.x, -2)) * 0.5),
     mean_diff = map2(means, data, ~.y$log_inhibition - .x),
-    largest_increase_idx = map_int(drops, ~which.max(magrittr::inset(.x, .x < 0, 0)))
+    # largest_increase_idx = map_int(drops, ~which.max(magrittr::inset(.x, .x < 0, 0)))
   ) %>%
   mutate(
     possible_sus = map(largest_increase_idx, ~c(0, 1) + .x),
@@ -465,7 +498,209 @@ between_doses <- single_dose_trans %>%
   mutate(
     is_bad = largest_increase > 0.5
   )
+
+flagged_data <- between_doses %>%
+  select(
+    lspci_id, hmsl_id,
+    `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
+    data, sus_conc, is_bad,
+  ) %>%
+  unnest(data) %>%
+  mutate(flagged = `Compound Concentration (nM)` == sus_conc & is_bad) %>%
+  select(-sus_conc) %>%
+  rename(contains_flagged = is_bad) %>%
+  left_join(
+    compound_names
+  )
+
+write_csv(flagged_data, "okl_kinomescan_flagged.csv.gz")
 ```
+
+
+```{r}
+p <- between_doses
+
+```
+
+
+```{r}
+library(ggrepel)
+
+p <- flagged_data %>%
+  group_by(
+    `Compound Concentration (nM)`
+  ) %>%
+  summarize(
+    frac_below_50 = sum(log_inhibition < log10(0.501)) / n(),
+    frac_flagged = sum(flagged) / n(),
+    .groups = "drop"
+  ) %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  ggplot(
+    aes(frac_below_50, frac_flagged)
+  ) +
+  geom_point() +
+  geom_text_repel(
+    aes(label = `Compound Concentration (nM)`),
+    min.segment.length = unit(0, "lines"),
+    max.overlaps = 20, max.iter = 50000, max.time = 2.5
+  ) +
+  labs(
+    x = "Fraction of measurements <50% remaining",
+    y = "Fraction of flagged measurements"
+  ) +
+  theme_light()
+
+ggsave(
+  "fraction_below_50_vs_fraction_flagged_concentrations.pdf",
+  p, width = 5, height = 5
+)
+
+flagged_data %>%
+  summarize(
+    n = sum(flagged),
+    frac = n / n()
+  )
+
+flagged_data %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  summarize(
+    n = sum(flagged),
+    frac = n / n(),
+    .groups = "drop"
+  )
+
+n_flagged <- flagged_data %>%
+  group_by(lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`) %>%
+  summarize(
+    any_flagged = any(flagged),
+    any_active = log_inhibition < log10(50),
+    .groups = "drop"
+  )
+
+n_flagged %>%
+  summarize(
+    n = sum(any_flagged),
+    frac = n / n(),
+    .groups = "drop"
+  )
+  
+
+n_flagged %>%
+  group_by(any_active) %>%
+  summarize(
+    n = sum(any_flagged),
+    frac = n / n(),
+    .groups = "drop"
+  )
+
+library(ggalluvial)
+
+n_flagged %>%
+  group_by(any_flagged, any_active) %>%
+  summarize(Freq = n(), .groups = "drop") %>%
+  mutate(across(c(-Freq), as.factor)) %>%
+  ggplot(y = Freq, axis1 = any_flagged, axis2 = any_active) +
+  geom_alluvium() +
+  geom_stratum() +
+  geom_label(stat = "stratum")
+
+library(alluvial)
+
+n_flagged %>%
+  group_by(any_flagged, any_active) %>%
+  summarize(Freq = n(), .groups = "drop") %>%
+  mutate(across(c(-Freq), as.factor)) %>% {
+    alluvial(
+      select(., -Freq), freq=.$Freq
+    )
+  }
+  
+
+```
+
+
+```{r}
+library(ggrepel)
+
+p <- flagged_data %>%
+  group_by(
+    lspci_id, hmsl_id, `Compound Concentration (nM)`
+  ) %>%
+  summarize(
+    frac_below_50 = sum(log_inhibition < log10(0.501)) / n(),
+    frac_flagged = sum(flagged) / n(),
+    .groups = "drop"
+  ) %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  arrange(desc(frac_flagged)) %>%
+  mutate(top_10_flagged = seq_len(n()) %in% 1:10) %>%
+  ungroup() %>%
+  ggplot(
+    aes(frac_below_50, frac_flagged)
+  ) +
+  geom_point() +
+  facet_wrap(~`Compound Concentration (nM)`, scales = "free") +
+  geom_text_repel(
+    aes(label = paste0(name, "nM")),
+    data = ~.x %>%
+      filter(top_10_flagged) %>%
+      left_join(compound_names),
+    min.segment.length = unit(0, "lines"),
+    max.overlaps = 20, max.iter = 50000, max.time = 2.5
+  ) +
+  labs(
+    x = "Fraction of measurements <50% remaining",
+    y = "Fraction of flagged measurements"
+  ) +
+  theme_light()
+
+
+ggsave(
+  "fraction_below_50_vs_fraction_flagged.pdf",
+  p, width = 10, height = 8
+)
+
+p <- flagged_data %>%
+  group_by(
+    `Compound Concentration (nM)`, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`
+  ) %>%
+  summarize(
+    frac_below_50 = sum(log_inhibition < log10(0.501)) / n(),
+    frac_flagged = sum(flagged) / n(),
+    .groups = "drop"
+  ) %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  arrange(desc(frac_flagged)) %>%
+  mutate(top_10_flagged = seq_len(n()) %in% 1:10) %>%
+  ungroup() %>%
+  ggplot(
+    aes(frac_below_50, frac_flagged)
+  ) +
+  geom_point() +
+  facet_wrap(~`Compound Concentration (nM)`, scales = "free") +
+  geom_text_repel(
+    aes(label = `DiscoveRx Gene Symbol`),
+    data = ~.x %>%
+      filter(top_10_flagged),
+    min.segment.length = unit(0, "lines"),
+    max.overlaps = 20, max.iter = 50000, max.time = 2.5
+  ) +
+  labs(
+    x = "Fraction of measurements <50% remaining",
+    y = "Fraction of flagged measurements"
+  ) +
+  theme_light()
+
+
+ggsave(
+  "fraction_below_50_vs_fraction_flagged_targets.pdf",
+  p, width = 10, height = 8
+)
+```
+
 
 ```{r}
 p <- between_doses %>%
@@ -475,11 +710,44 @@ p <- between_doses %>%
     geom_point()
 
 p <- between_doses %>%
+  mutate(
+    is_bad = largest_increase > 0.8
+  ) %>%
   ggplot(
     aes(factor(sus_conc))
   ) +
     geom_bar() +
     facet_wrap(~is_bad)
+
+n_conc_df <- between_doses %>%
+  filter(is_bad) %>%
+  unnest(data) %>%
+  group_by(sus_conc) %>%
+  summarize(n_dose = n(), .groups = "drop")
+
+sus_conc_frac <- between_doses %>%
+  filter(is_bad) %>%
+  group_by(sus_conc) %>%
+  summarize(
+    n_bad = n(), .groups = "drop"
+  ) %>%
+  left_join(
+    n_conc_df
+  ) %>%
+  mutate(frac_bad = n_bad / n_dose)
+
+p <- sus_conc_frac %>%
+  ggplot(
+    aes(factor(sus_conc), frac_bad)
+  ) +
+    geom_col()
+
+p <- between_doses %>%
+  filter(is_bad) %>%
+  ggplot(
+    aes(factor(sus_conc))
+  ) +
+    geom_bar()
 
 random_bad <- between_doses %>%
   filter(is_bad) %>%
@@ -494,8 +762,15 @@ random_bad <- between_doses %>%
   
 
 p <- random_bad %>%
+  mutate(
+    data = map2(data, means, ~mutate(.x, means = .y))
+  ) %>%
+  select(-means) %>%
   unnest(data) %>%
-  ggplot(aes(`Compound Concentration (nM)`, log_inhibition)) +
+  pivot_longer(c(log_inhibition, means)) %>%
+  ggplot(aes(`Compound Concentration (nM)`, value, color = name, linetype = name)) +
+    scale_color_manual(values = c("log_inhibition" = "black", "means" = "gray10")) +
+    scale_linetype_manual(values = c("log_inhibition" = "solid", "means" = "dotted")) +
     geom_line() +
     facet_wrap(~measurement_name) +
     scale_x_log10() +
@@ -503,6 +778,9 @@ p <- random_bad %>%
       aes(sus_conc, xend = sus_conc), inherit.aes = FALSE,
       y = -2, yend = -1, color = "red", data = random_bad
     )
+ggsave(
+  "random_bad_2.pdf", p, width = 8, height = 6
+)
 ```
 
 
@@ -715,4 +993,103 @@ ggsave(
   p, width = 6, height = 2.5
 )
 
+```
+
+
+```{r binary_flagging}
+binary_between_doses <- single_dose_trans %>%
+    group_by(
+    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
+    `Compound Concentration (nM)`
+  ) %>%
+  summarize(
+    across(c(`Percent Control`, log_inhibition), mean),
+    .groups = "drop"
+  ) %>%
+  arrange(`Compound Concentration (nM)`) %>%
+  mutate(
+    inhib_hit = `Percent Control` <= 35
+  ) %>%
+  group_by(
+    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`
+  ) %>%
+  summarize(
+    data = list(cur_data()),
+    inhib_concordant = {
+      !any((inhib_hit[-1] - head(inhib_hit, -1)) < 0)
+    },
+    .groups = "drop"
+  )
+
+
+n_flagged_binary <- binary_between_doses %>%
+  mutate(
+    any_active = map_lgl(
+      data, ~any(.x$`Percent Control` <= 35)
+    )
+  )
+
+n_flagged_binary %>%
+  summarize(
+    n = sum(!inhib_concordant),
+    frac = n / n(),
+    .groups = "drop"
+  )
+  
+
+n_flagged_binary %>%
+  group_by(any_active) %>%
+  summarize(
+    n = sum(!inhib_concordant),
+    frac = n / n(),
+    .groups = "drop"
+  )
+
+binary_between_doses <- single_dose_trans %>%
+  filter(qpcr_miss == FALSE) %>%
+  group_by(
+    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
+    `Compound Concentration (nM)`
+  ) %>%
+  summarize(
+    across(c(`Percent Control`, log_inhibition), mean),
+    .groups = "drop"
+  ) %>%
+  arrange(`Compound Concentration (nM)`) %>%
+  mutate(
+    inhib_hit = `Percent Control` <= 35
+  ) %>%
+  group_by(
+    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`
+  ) %>%
+  summarize(
+    data = list(cur_data()),
+    inhib_concordant = !any((inhib_hit[-1] - head(inhib_hit, -1)) < 0),
+    .groups = "drop"
+  ) %>%
+  as_tibble()
+
+
+n_flagged_binary <- binary_between_doses %>%
+  mutate(
+    any_active = map_lgl(
+      data, ~any(.x$`Percent Control` <= 35)
+    )
+  )
+
+n_flagged_binary %>%
+  summarize(
+    n = sum(!inhib_concordant),
+    frac = n / n(),
+    .groups = "drop"
+  )
+  
+
+n_flagged_binary %>%
+  group_by(any_active) %>%
+  summarize(
+    n = sum(!inhib_concordant),
+    frac = n / n(),
+    .groups = "drop"
+  )
 ```
