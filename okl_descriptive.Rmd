@@ -1115,3 +1115,255 @@ n_flagged_binary %>%
     .groups = "drop"
   )
 ```
+
+```{r}
+single_dose_trans_agg <- single_dose_trans %>%
+  group_by(
+    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
+    `Compound Concentration (nM)`
+  ) %>%
+  summarize(
+    across(
+      c(`Percent Control`, log_inhibition), 
+      ~if (!all(qpcr_miss))
+        mean(.x[!qpcr_miss])
+      else
+        mean(.x)
+    ),
+    qpcr_miss = all(qpcr_miss),
+    .groups = "drop"
+  ) %>%
+  arrange(`Compound Concentration (nM)`)
+
+single_dose_hits <- single_dose_trans %>%
+  mutate(
+    inhib_hit = `Percent Control` <= 35 & !qpcr_miss,
+    log_conc = log10(`Compound Concentration (nM)`)
+  ) %>%
+  group_by(
+    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`
+  ) %>%
+  summarize(
+    data = list(cur_data()),
+    lin_mod = list(
+      lm(`Percent Control` ~ log_conc, data = cur_data())
+    ),
+    # inhib_concordant = {
+    #   !any((inhib_hit[-1] - head(inhib_hit, -1)) < 0)
+    # },
+    inhib_concordant = if (any(inhib_hit)) {
+      cg <- cur_group()
+      # if (cg[["Entrez Gene Symbol"]] == "MKNK1" && cg[["lspci_id"]] == 17778) browser()
+      inhib_idx <- which(inhib_hit)[1]
+      if (inhib_idx == length(inhib_hit))
+        TRUE
+      else {
+        after <- tail(`Percent Control`, -inhib_idx)
+        x <- !any((after > 35) & (after > (2 * `Percent Control`[inhib_idx])))
+        # if (x) browser()
+        x
+      }
+    } else {
+        TRUE
+    },
+    .groups = "drop"
+  )
+
+library(broom)
+single_dose_classification_res <- single_dose_hits %>%
+  mutate(
+    lin_mod_res = map(lin_mod, tidy)
+  )
+
+single_dose_classification_res2 <- single_dose_classification_res %>%
+  unnest(lin_mod_res) %>%
+  filter(term == "log_conc")
+
+single_dose_classification <- single_dose_classification_res2 %>%
+  rowwise() %>%
+  mutate(
+    classification = {
+      if (!inhib_concordant) {
+        "discordant"
+      } else if (all(!data$inhib_hit)) {
+        "non-binding"
+      } else if (inhib_concordant && sum(data$inhib_hit) >= 2) {
+        "binding"
+      } else if (!is.na(estimate) && !is.na(p.value) && estimate < 0 && p.value < 0.1) {
+        "weakly-binding"
+      } else {
+        "undetermined"
+      }
+    } %>%
+      factor(
+        levels = c("binding", "weakly-binding", "non-binding", "undetermined", "discordant"),
+        ordered = TRUE
+      )
+  ) %>%
+  ungroup() %>%
+  power_left_join(
+    compound_names,
+    by = "lspci_id",
+    check = check_specs(
+      duplicate_keys_right = "abort",
+      unmatched_keys_left = "abort",
+      unmatched_keys_right = "ignore"
+    )
+  ) %>%
+  select(
+    lspci_id, name, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`, classification, everything()
+  )
+
+write_csv(
+  single_dose_classification %>%
+    select(where(negate(is.list))),
+  "classification/dose_response_classification.csv"
+)
+
+single_dose_classification %>%
+  group_by(classification) %>%
+  summarize(
+    n = n(),
+    frac_total = n() / nrow(.),
+    frac_binding = n() / sum(map_lgl(.$data, ~any(.x$inhib_hit))),
+    .groups = "drop"
+  )
+
+library(powerjoin)
+p <- single_dose_classification %>%
+  count(lspci_id, name, classification) %>%
+  complete(nesting(lspci_id, name), classification, fill = list(n = 0)) %>%
+  group_by(lspci_id, name) %>%
+  mutate(frac = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    name = factor(
+      name,
+      levels = filter(., classification == "binding") %>%
+        arrange(frac) %>%
+        pull(name)
+    )
+  ) %>%
+  arrange(desc(name)) %>%
+  mutate(split_var = floor(seq(from = 0, to = 2.99999, length.out = n()))) %>%
+  ggplot(aes(frac, name, color = classification)) +
+    geom_point() +
+    scale_color_manual(
+      values = c(
+        "binding" = "firebrick1",
+        "weakly-binding" = "darkorange",
+        "non-binding" = "black",
+        "undetermined" = "gray",
+        "discordant" = "blue"
+      )
+    ) +
+    facet_wrap(~split_var, scales = "free_y", nrow = 1) +
+    theme(strip.text = element_blank()) +
+    labs(x = "Fraction of dose-response curves", y = "Compound")
+
+dir.create("classification")
+ggsave(
+  "classification/lm_classification_waterfall.pdf", p, width = 18, height = 10
+)
+
+library(ggbeeswarm)
+p <- single_dose_classification %>%
+  count(lspci_id, name, classification) %>%
+  complete(nesting(lspci_id, name), classification, fill = list(n = 0)) %>%
+  group_by(lspci_id, name) %>%
+  mutate(frac = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    name = factor(
+      name,
+      levels = filter(., classification == "binding") %>%
+        arrange(frac) %>%
+        pull(name)
+    )
+  ) %>%
+  ggplot(aes(classification, frac)) +
+    geom_quasirandom()
+
+ggsave(
+  "classification/hist_classes.pdf", p, width = 8, height = 6
+)
+
+library(egg)
+set.seed(42)
+p <- single_dose_classification %>%
+  group_by(classification) %>%
+  slice_sample(n = 10) %>%
+  ungroup() %>%
+  mutate(binding_name = paste(name, `Entrez Gene Symbol`, sep = " - ")) %>%
+  unnest(data) %>%
+  ggplot(aes(`Compound Concentration (nM)`, `Percent Control`)) +
+    geom_rect(
+      aes(fill = classification, xmin = 10, xmax = 10000,
+      ymin = 0, ymax = 100),
+      alpha = 0.5,
+      data = ~.x %>%
+        distinct(binding_name, classification),
+      inherit.aes = FALSE
+    ) +
+    geom_point() +
+    geom_line() +
+    scale_x_log10() +
+    geom_hline(yintercept = 35) +
+    facet_wrap(~classification + binding_name) +
+    # geom_custom(
+    #   data = ~.x %>%
+    #     distinct(binding_name, classification),
+    #   mapping = aes(fill = classification), 
+    #   grob_fun = function(x) rectGrob(gp=gpar(fill=fill,col=NA, alpha=0.5)),
+    #   inherit.aes = TRUE
+    # ) +
+    geom_text(
+      aes(label = paste(round(estimate, digits = 1), signif(p.value, digits = 2))),
+      data = ~.x %>%
+        distinct(classification, binding_name, estimate, p.value),
+      x = 20, y = 20
+    )
+ggsave(
+  "classification/class_examples.pdf", p, width = 14, height = 12
+)
+
+single_dose_classification %>%
+  filter(
+    name == "SILMITASERTIB",
+    `Entrez Gene Symbol` == "MAP2K2"
+  ) %>%
+  View()
+
+library(ggrepel)
+p <- single_dose_classification %>%
+  count(lspci_id, name, classification) %>%
+  complete(nesting(lspci_id, name), classification, fill = list(n = 0)) %>%
+  group_by(lspci_id, name) %>%
+  mutate(frac = n / sum(n)) %>%
+  ungroup() %>%
+  # mutate(
+  #   name = factor(
+  #     name,
+  #     levels = filter(., classification == "binding") %>%
+  #       arrange(frac) %>%
+  #       pull(name)
+  #   )
+  # ) %>%
+  select(lspci_id, name, classification, frac) %>%
+  pivot_wider(names_from = classification, values_from = frac) %>%
+  ggplot(aes(binding, discordant)) +
+    geom_point() +
+    geom_text_repel(
+      aes(label = name),
+      data = ~.x %>%
+        mutate(name = if_else(discordant < 0.04, "", name)),
+      min.segment.length = 0
+    ) +
+    labs(x = "Fraction of 'binding' dose-response curves", y = "Fraction of discordant dose-response curves")
+
+ggsave(
+  "classification/discordant_vs_binding.pdf", p, width = 10, height = 10
+)
+
+```
+
