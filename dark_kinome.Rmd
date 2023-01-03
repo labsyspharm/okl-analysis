@@ -1,0 +1,778 @@
+---
+title: "Dark Kinome analysis"
+author: "Clemens Hug"
+date: "12/1/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(synExtra)
+library(here)
+library(fst)
+library(data.table)
+library(reldist)
+library(ggbeeswarm)
+
+theme_set(theme_minimal())
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+## Loading
+
+```{r loading}
+inputs <- list(
+  okl_single_dose = "syn26486828",
+  kinases = "syn24827232",
+  compound_names = "syn26260347",
+  dose_response_agg = "syn26260410",
+  dose_response = "syn26260418"
+)
+
+input_files <- map(
+  inputs, syn
+)
+
+single_dose <- input_files[["okl_single_dose"]] %>%
+  fread() %>%
+  mutate(
+    percent_control_norm = 100 - (
+      pmin(100, pmax(0, `Percent Control`))
+    ),
+    log_inhibition = -log10(pmax(0.05, `Percent Control`) / 100)
+  )
+
+kinase_data <- input_files[["kinases"]] %>%
+  fread() %>%
+  mutate(
+    across(
+      where(~is_empty(setdiff(.x, c(0, 1, NA)))),
+      factor,
+      levels = c(0, 1),
+      labels = c("no", "yes")
+    )
+  )
+
+compound_names <- input_files[["compound_names"]] %>%
+  read_fst(as.data.table = TRUE) %>% {
+    .[
+      , head(.SD, 1), keyby = .(lspci_id)
+    ]
+  }
+
+dose_response_agg <- input_files[["dose_response_agg"]] %>%
+  read_csv()
+  
+dose_response_single <- input_files[["dose_response"]] %>%
+  read_csv()
+```
+
+## Selectivity
+
+Gini index works well for selectivity if entire target space is profiled.
+
+Ursu, A. et al. Gini coefficients as a single value metric to define chemical probe selectivity. ACS Chem Biol 15, 2031–2040 (2020).
+
+```{r selectivity}
+ginis <- single_dose %>%
+  filter(!exclude_target, `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  mutate(
+    percent_control_norm = 100 - (
+      pmin(100, pmax(0, `Percent Control`))
+    ),
+    log_inhibition = -log10(pmax(0.05, `Percent Control`) / 100)
+  ) %>%
+  group_by(
+    lspci_id, hmsl_id, `Compound Concentration (nM)`
+  ) %>%
+  summarize(
+    across(
+      c(log_inhibition, percent_control_norm),
+      .fns = list(
+        gini = gini,
+        mean = mean,
+        max = max,
+        min = min,
+        median = median
+      )
+    ),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    compound_names[, .(lspci_id, name)]
+  )
+
+ginis_target <- single_dose %>%
+  filter(!exclude_target, `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  mutate(
+    percent_control_norm = 100 - (
+      pmin(100, pmax(0, `Percent Control`))
+    ),
+    log_inhibition = -log10(pmax(0.05, `Percent Control`) / 100)
+  ) %>%
+  group_by(
+    `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`, `Compound Concentration (nM)`
+  ) %>%
+  summarize(
+    across(
+      c(log_inhibition, percent_control_norm),
+      .fns = list(
+        gini = gini,
+        mean = mean,
+        max = max,
+        min = min,
+        median = median
+      )
+    ),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    kinase_data, by = c("Entrez Gene Symbol" = "hgnc_symbol")
+  )
+
+p <- ginis %>%
+  ggplot(aes(percent_control_norm_gini, log_inhibition_gini)) +
+    geom_point() +
+    geom_abline(intercept = 0, slope = 1) +
+    coord_equal() +
+    facet_wrap(~`Compound Concentration (nM)`)
+
+of_interest <- c("STAUROSPORINE", "AT-9283", "LESTAURTINIB", "TORIN1", "ELIMUSERTIB", "XMD11-50", "CERALASERTIB", "CI-1040")
+
+library(ggrepel)
+p <- {ginis %>%
+  ggplot(aes(log_inhibition_mean, log_inhibition_gini, text = paste(lspci_id, name))) +
+    geom_point() +
+    geom_text_repel(
+      aes(label = name),
+      data = ~filter(.x, name %in% of_interest)
+    ) +
+    facet_wrap(~`Compound Concentration (nM)`, scales = "free_x")} %>%
+  plotly::ggplotly()
+
+p <- ginis %>%
+  ggplot(aes(log_inhibition_mean, log_inhibition_gini, text = paste(lspci_id, name))) +
+    geom_point() +
+    geom_text_repel(
+      aes(label = name),
+      data = ~mutate(.x, name = if_else(name %in% of_interest, name, ""))
+    ) +
+    facet_wrap(~`Compound Concentration (nM)`, scales = "free_x") +
+    labs(x = "Mean of log inhibition", y = "Gini index of log inhibition")
+ggsave("log_inhibition_gini_scatter.pdf", p, width = 9, height = 9)
+
+p <- ginis %>%
+  ggplot(aes(percent_control_norm_min, gini)) +
+    geom_point()
+p <- ginis %>%
+  ggplot(aes(percent_control_norm_median, gini)) +
+    geom_point()
+
+p <- single_dose %>%
+  filter(!exclude_target) %>%
+    filter(!exclude_target, `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  inner_join(
+    ginis %>%
+      filter(name %in% of_interest)
+  ) %>%
+  ggplot(aes(log_inhibition, name)) +
+    geom_quasirandom(shape = 16, size = 1, alpha = 0.7, groupOnX = FALSE) +
+    theme_light() +
+    facet_wrap(~`Compound Concentration (nM)`)
+ggsave("log_inhibtion_beeswarm_of_interest.pdf", p, width = 9, height = 7)
+
+```
+
+```{r selectivity_by_target}
+p <- {ginis_target %>%
+  ggplot(aes(log_inhibition_mean, log_inhibition_gini, text = paste(`DiscoveRx Gene Symbol`), color = is_idg_dark_kinase)) +
+    geom_point() +
+    facet_wrap(~`Compound Concentration (nM)`, scales = "free_x")} %>%
+  plotly::ggplotly()
+
+
+p <- ginis_target %>%
+  ggplot(aes(log_inhibition_mean, log_inhibition_gini)) +
+    geom_point() +
+    # geom_text_repel(
+    #   aes(label = name),
+    #   data = ~mutate(.x, name = if_else(name %in% of_interest, name, ""))
+    # ) +
+    facet_wrap(~`Compound Concentration (nM)`, scales = "free_x") +
+    labs(x = "Mean of log inhibition", y = "Gini index of log inhibition")
+ggsave("log_inhibition_gini_targets_scatter.pdf", p, width = 9, height = 9)
+```
+
+```{r concentration_cs_selectivity}
+p <- ginis %>%
+  ggplot(aes(fct_inseq(as.character(`Compound Concentration (nM)`)), gini)) +
+    geom_quasirandom()
+
+```
+
+
+```{r pca}
+pc_input <- single_dose %>%
+  filter(!exclude_target, `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  mutate(
+    sample_id = paste(lspci_id, `Compound Concentration (nM)`, sep = "_")
+  )
+
+pc <- pc_input %>%
+  select(sample_id, `DiscoveRx Gene Symbol`, `Percent Control`) %>%
+  pivot_wider(names_from = `DiscoveRx Gene Symbol`, values_from = `Percent Control`) %>%
+  column_to_rownames("sample_id") %>%
+  # as.matrix() %>% {
+  #   .[,!colSums(is.na(.)) > 0]
+  # } %>%
+  prcomp()
+
+pc_tidy <- pc %>%
+  broom::tidy(matrix = "scores") %>%
+  rename(sample_id = row)
+
+pc_wide <- pc_tidy %>%
+  pivot_wider(names_from = PC, values_from = value) %>%
+  left_join(
+    pc_input %>%
+      distinct(sample_id, lspci_id, hmsl_id, `Compound Concentration (nM)`)
+  )
+
+p <- ggplot(pc_wide, aes(`1`, `2`, color = fct_inseq(as.character(`Compound Concentration (nM)`)))) +
+  geom_point()
+
+p <- ggplot(pc_wide, aes(fct_inseq(as.character(`Compound Concentration (nM)`)), `1`)) +
+  geom_quasirandom()
+
+pc <- pc_input %>%
+  select(sample_id, `DiscoveRx Gene Symbol`, `Percent Control`) %>%
+  pivot_wider(names_from = sample_id, values_from = `Percent Control`) %>%
+  column_to_rownames("DiscoveRx Gene Symbol") %>%
+  # as.matrix() %>% {
+  #   .[,!colSums(is.na(.)) > 0]
+  # } %>%
+  prcomp()
+
+pc_tidy <- pc %>%
+  broom::tidy(matrix = "scores") %>%
+  rename(`DiscoveRx Gene Symbol` = row)
+
+pc_wide <- pc_tidy %>%
+  pivot_wider(names_from = PC, values_from = value) %>%
+  left_join(
+    kinase_data %>%
+      distinct(hgnc_symbol, is_idg_dark_kinase),
+    by = c("DiscoveRx Gene Symbol" = "hgnc_symbol")
+  )
+
+p <- ggplot(pc_wide, aes(`1`, `2`, color = is_idg_dark_kinase)) +
+  geom_point()
+
+p <- ggplot(pc_wide, aes(fct_inseq(as.character(`Compound Concentration (nM)`)), `1`)) +
+  geom_quasirandom()
+
+```
+
+```{r heatmaps}
+percent_remaining_mats <- single_dose %>%
+  filter(!exclude_target) %>%
+  group_nest(`Compound Concentration (nM)`) %>%
+  crossing(
+    trans = c("log", "lin"),
+    norm = c("range", "none"),
+    col_order = c("clustered", "gini")
+  ) %>%
+  mutate(
+    mat = pmap(
+      .,
+      function(data, trans, norm, ...) {
+        trans_fun <- if (trans == "log")
+          function(x) -log10(x + 0.05)
+        else
+          identity
+        mat <- data %>%
+          mutate(across(`Percent Control`, trans_fun)) %>%
+          select(lspci_id, `DiscoveRx Gene Symbol`, `Percent Control`) %>%
+          arrange(lspci_id, `DiscoveRx Gene Symbol`) %>%
+          pivot_wider(values_from = `Percent Control`, names_from = lspci_id) %>%
+          column_to_rownames("DiscoveRx Gene Symbol") %>%
+          as.matrix()
+        if (norm == "range") {
+          mn <- mat - apply(mat, 2, min)[col(mat)]
+          mn <- mn / apply(mn, 2, max)[col(mn)]
+          mat <- mn
+        }
+        mat
+      }
+    )
+  ) %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  left_join(
+    ginis %>%
+      arrange(lspci_id) %>%
+      group_nest(`Compound Concentration (nM)`, .key = "gini")
+  ) %>%
+  left_join(
+    ginis_target %>%
+      semi_join(
+        single_dose %>%
+          filter(!exclude_target)
+      ) %>%
+      arrange(`DiscoveRx Gene Symbol`) %>%
+      group_nest(`Compound Concentration (nM)`, .key = "gini_target")
+  )
+
+library(ComplexHeatmap)
+
+percent_remaining_heatmaps <- percent_remaining_mats %>%
+  mutate(
+    heatmap = pmap(
+      .,
+      function(mat, gini, gini_target, norm, col_order, trans, ...) {
+        gini_target <- gini_target %>%
+            group_by(`DiscoveRx Gene Symbol`) %>%
+            summarize(log_inhibition_gini = mean(log_inhibition_gini, na.rm = TRUE))
+        cluster_columns <- TRUE
+        cluster_rows <- TRUE
+        if (col_order == "gini") {
+          cluster_columns <- FALSE
+          cluster_rows <- FALSE
+          row_order <- order(gini_target$log_inhibition_gini)
+          col_order <- order(gini$log_inhibition_gini)
+          gini <- gini[col_order,]
+          gini_target <- gini_target[row_order, ]
+          mat <- mat[row_order, col_order]
+        }
+        kinase_info <- tibble(`DiscoveRx Gene Symbol` = rownames(mat)) %>%
+          left_join(
+            distinct(single_dose %>% filter(!exclude_target), `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`)
+          ) %>%
+          left_join(
+            kinase_data, by = c("Entrez Gene Symbol" = "hgnc_symbol")
+          ) %>%
+          group_by(`DiscoveRx Gene Symbol`) %>%
+          summarize(
+            dark_kinase = factor(max(as.integer(is_idg_dark_kinase), na.rm = TRUE), levels = c(1, 2), labels = c("other", "IDG dark kinase")), .groups = "drop"
+          )
+        row_ha = rowAnnotation(
+          # dark_kinase = kinase_info$dark_kinase,
+          gini = gini_target$log_inhibition_gini,
+          col = list(
+            gini = circlize::colorRamp2(
+              seq(0, 1, length.out = 9),
+              RColorBrewer::brewer.pal(9, "Reds")
+            )
+            # dark_kinase = c("other" = "white", "IDG dark kinase" = "black")
+          )
+        )
+        column_ha = HeatmapAnnotation(
+          gini = gini$log_inhibition_gini,
+          col = list(
+            gini = circlize::colorRamp2(
+              seq(0, 1, length.out = 9),
+              RColorBrewer::brewer.pal(9, "Reds")
+            )
+          ),
+          show_legend = FALSE
+        )
+        set.seed(42)
+        browser()
+        Heatmap(
+          mat,
+          name = paste(
+            c(
+              if (norm == "range") "normalized\n" else NULL,
+              if (trans == "log") "log inhibition" else "percent remaining"
+            ),
+            collapse = ""
+          ),
+          col = circlize::colorRamp2(
+            seq(0, case_when(norm == "range" ~ 1, trans == "lin" ~ 100, TRUE ~ max(mat)), length.out = 100),
+            viridisLite::inferno(100, direction = if (trans == "lin") -1 else 1)
+          ),
+          top_annotation = column_ha,
+          left_annotation = row_ha,
+          show_row_names = FALSE, show_column_names = FALSE,
+          cluster_columns = cluster_columns,
+          cluster_rows = cluster_rows,
+          row_split = kinase_info$dark_kinase
+        )
+      }
+    )
+  )
+
+pwalk(
+  percent_remaining_heatmaps,
+  function(heatmap, `Compound Concentration (nM)`, trans, norm, col_order, ...) {
+    # browser()
+    # ggsave(
+    #   paste0("heatmap_", `Compound Concentration (nM)`, "_", trans, "_norm_", norm, "_col_order_", col_order, ".pdf"),
+    #   heatmap, width = 5, height = 3
+    # )
+    withr::with_cairo_pdf(
+      paste0("heatmap_split_", `Compound Concentration (nM)`, "_", trans, "_norm_", norm, "_col_order_", col_order, ".pdf"),
+      draw(heatmap)
+    )
+  }
+)
+
+```
+
+```{r binding_dark_kinases}
+single_dose_kinase_data <- single_dose %>%
+  filter(!exclude_target, `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  mutate(
+    percent_control_norm = 100 - (
+      pmin(100, pmax(0, `Percent Control`))
+    ),
+    log_inhibition = -log10(pmax(0.05, `Percent Control`) / 100)
+  ) %>%
+  left_join(
+    kinase_data,
+    by = c("Entrez Gene Symbol" = "hgnc_symbol")
+  )
+
+single_dose_dark_stats <- single_dose_kinase_data %>%
+  drop_na(is_idg_dark_kinase)
+
+dark_kinase_inhibition_test <- single_dose_dark_stats %>%
+  drop_na(log_inhibition, is_idg_dark_kinase) %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  summarize(
+    t_test = possibly(t.test, NULL)(
+      log_inhibition ~ is_idg_dark_kinase,
+      data = cur_data()
+    ) %>%
+      broom::tidy() %>%
+      list()
+  ) %>%
+  unnest(t_test) %>%
+  mutate(
+    fc = {100 * (estimate2 / estimate1) - 100} %>%
+      round(1)
+  )
+
+p <- single_dose_dark_stats %>%
+  ggplot(aes(as.factor(is_idg_dark_kinase), log_inhibition)) +
+    geom_violin()
+
+p <- single_dose_dark_stats %>%
+  ggplot(aes(log_inhibition, color = factor(is_idg_dark_kinase, levels = c("no", "yes"), labels = c("other", "IDG dark kinase")))) +
+    stat_ecdf(geom = "step") +
+    facet_wrap(~`Compound Concentration (nM)`) +
+    geom_text(
+      aes(
+        label = paste("mean other", signif(estimate1, 2), "\nmean IDG dark kinase", signif(estimate2, 2), "\n", paste0(fc, "%"), "\np", signif(p.value, 2))
+      ),
+      inherit.aes = FALSE,
+      x = 0.75, y = 0.4, hjust = 0, data = dark_kinase_inhibition_test
+    ) +
+    # geom_segment(
+    #   aes(x = log_inhibition_mean, xend = log_inhibition_mean),
+    #   inherit.aes = FALSE, y = 0, yend = 0.125,
+    #   data = ~group_by(.x, is_idg_dark_kinase) %>%
+    #     summarize(log_inhibition_mean = mean(log_inhibition), .groups = "drop")
+    # ) +
+    labs(x = "Log inhibition", y = "Cumulative fraction", color = "Kinase type")
+ggsave(
+  "log_inhibition_ecdf_dark_kinases.pdf", p, width = 7, height = 4
+)
+
+```
+
+
+```{r dark_kinase_selectivity}
+dark_kinase_inhibition <- single_dose_kinase_data %>%
+  filter(!exclude_target, `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  drop_na(tas) %>%
+  mutate(
+    is_idg_dark_kinase = factor(as.integer(is_idg_dark_kinase), levels = c("no", "yes"), labels = c("other", "IDG dark kinase"))
+  ) %>%
+  drop_na(is_idg_dark_kinase) %>%
+  group_by(
+    lspci_id, hmsl_id, `Compound Concentration (nM)`, is_idg_dark_kinase
+  ) %>%
+  summarize(
+    inhibits_dark_kinase = any(tas %in% c(1, 2)) %>%
+      factor(levels = c(TRUE, FALSE), labels = c("yes", "no")),
+    n_dark_kinase_inhibited = sum(tas %in% c(1, 2)),
+    .groups = "drop"
+  )
+
+  # summarize(
+  #   any_inhibited = any(tas %in% c(1, 2)) %>%
+  #     factor(levels = c(TRUE, FALSE), labels = c("yes", "no")),
+  #   n_inhibited = sum(tas %in% c(1, 2)),
+  #   .groups = "drop"
+  # ) %>%
+  # pivot_wider(
+  #   names_from = c(is_idg_dark_kinase),
+  #   values_from = c(any_inhibited, n_inhibited)
+  # )
+
+ginis_dark_kinase <- ginis %>%
+  inner_join(
+    dark_kinase_inhibition
+  )
+
+p <- ginis_dark_kinase %>%
+  ggplot(aes(inhibits_dark_kinase, log_inhibition_gini)) +
+    geom_quasirandom() +
+    facet_wrap(~`Compound Concentration (nM)`) +
+    labs(x = "Inhibits at least on dark kinase", y = "Gini of log inhibition")
+ggsave("dark_kinase_inhibited_vs_gini.pdf", p, width = 5, height = 3)
+
+p <- ginis_dark_kinase %>%
+  ggplot(aes(inhibits_dark_kinase, log_inhibition_gini)) +
+    geom_quasirandom() +
+    facet_wrap(~`Compound Concentration (nM)`)
+ggsave(
+  "dark_vs_non_dark_gini_beeswarm.pdf", p,
+  width = 6, height = 5
+)
+
+
+```
+
+```{r}
+selectivity_t_fun <- function(df) {
+  res <- df %>%
+    transmute(
+      `DiscoveRx Gene Symbol`,
+      test = as.list(seq_len(n()))
+    )
+  for (i in seq_len(nrow(res))) {
+    t <- res$`DiscoveRx Gene Symbol`[i]
+    vals <- df %>%
+      mutate(is_target = `DiscoveRx Gene Symbol` == t)
+    test <- t.test(formula = log_inhibition ~ is_target, data = vals)
+    res[["test"]][[i]] <- test
+  }
+  res
+}
+
+selectivity_t_df <- single_dose_kinase_data %>%
+  group_by(lspci_id, hmsl_id) %>%
+  summarize(
+    data = list(selectivity_t_fun(cur_data()))
+  )
+
+```
+
+
+```{r compare_single_dose_dose_response}
+dir.create("comparison_dose_response_single_dose")
+
+okl_dose_response_raw <- syn("syn24210560") %>%
+  readxl::read_excel(na = "NA")
+
+vendor_id_map <- syn("syn26230064") %>%
+  read_csv()
+
+okl_dose_response <- okl_dose_response_raw %>%
+  left_join(
+    vendor_id_map %>%
+      distinct(lspci_id, vendor_id),
+    by = c("hmsl_id" = "vendor_id")
+  )
+
+dose_response_agg_hmsl <- dose_response_agg %>%
+  filter(
+    biochem_agg_id %in% {
+      dose_response_single %>%
+        filter(source == "hmsl") %>%
+        pull(biochem_agg_id)
+    }
+  )
+
+dose_response_vs_single <- dose_response_agg_hmsl %>%
+  inner_join(
+    single_dose %>%
+      select(
+        lspci_id,
+        `Compound Concentration (nM)`,
+        `Entrez Gene Symbol`,
+        `Percent Control`,
+        log_inhibition
+      ),
+    by = c("lspci_id", "symbol" = "Entrez Gene Symbol")
+  )
+
+p <- dose_response_vs_single %>%
+  ggplot(
+    aes(value, log_inhibition)
+  ) +
+  geom_point() +
+  facet_wrap(~`Compound Concentration (nM)`)
+
+p <- okl_dose_response %>%
+  inner_join(
+    single_dose %>%
+      select(
+        lspci_id,
+        `Compound Concentration (nM)`,
+        `Entrez Gene Symbol`,
+        `Percent Control`,
+        log_inhibition
+      ),
+    by = c("lspci_id", "target" = "Entrez Gene Symbol")
+  ) %>%
+  ggplot(
+    aes(Ki, `Percent Control`)
+  ) +
+  geom_point() +
+  facet_wrap(~`Compound Concentration (nM)`) +
+  scale_x_log10() +
+  # scale_y_log10() +
+  theme_bw() +
+  labs(x = "Ki (nM)")
+
+
+ggsave(
+  "comparison_dose_response_single_dose/Ki_vs_percent_control.pdf",
+  p, width = 6, height = 4
+)
+
+p <- okl_dose_response %>%
+  inner_join(
+    single_dose %>%
+      select(
+        lspci_id,
+        `Compound Concentration (nM)`,
+        `Entrez Gene Symbol`,
+        `Percent Control`,
+        log_inhibition
+      ),
+    by = c("lspci_id", "target" = "Entrez Gene Symbol")
+  ) %>%
+  ggplot(
+    aes(Ki, log_inhibition)
+  ) +
+  geom_point() +
+  facet_wrap(~`Compound Concentration (nM)`) +
+  scale_x_log10() +
+  # scale_y_log10() +
+  theme_bw() +
+  labs(y = "Log Inhibition", x = "Ki (nM)")
+
+ggsave(
+  "comparison_dose_response_single_dose/Ki_vs_log_inhibition.pdf",
+  p, width = 6, height = 4
+)
+
+
+okl_dose_response %>%
+  inner_join(
+    single_dose %>%
+      select(
+        lspci_id,
+        `Compound Concentration (nM)`,
+        `Entrez Gene Symbol`,
+        `Percent Control`,
+        log_inhibition
+      ),
+    by = c("lspci_id", "target" = "Entrez Gene Symbol")
+  ) %>%
+  ggplot(
+    aes(Ki, `Percent Control`, group = interaction(lspci_id, target), color = fct_inseq(as.character(`Compound Concentration (nM)`)))
+  ) +
+  geom_point() +
+  # geom_line() +
+  scale_x_log10() +
+  # scale_y_log10() +
+  theme_bw()
+
+okl_dose_response %>%
+  inner_join(
+    single_dose %>%
+      select(
+        lspci_id,
+        `Compound Concentration (nM)`,
+        `Entrez Gene Symbol`,
+        `Percent Control`,
+        log_inhibition
+      ),
+    by = c("lspci_id", "target" = "Entrez Gene Symbol")
+  ) %>%
+  drop_na(Ki) %>%
+  mutate(
+    Ki_bin = cut(Ki, c(-Inf, 1, 10, 100, 1000, Inf), labels = c("<1", "1-10", "10-100", "100-1000", ">1000"))
+  ) %>%
+  ggplot(
+    aes(`Compound Concentration (nM)`, `Percent Control`, group = interaction(lspci_id, target))
+  ) +
+  geom_point() +
+  geom_line() +
+  scale_x_log10() +
+  facet_wrap(~Ki_bin) +
+  # scale_y_log10() +
+  theme_bw()
+
+p <- okl_dose_response %>%
+  inner_join(
+    single_dose %>%
+      select(
+        lspci_id,
+        `Compound Concentration (nM)`,
+        `Entrez Gene Symbol`,
+        `Percent Control`,
+        log_inhibition
+      ),
+    by = c("lspci_id", "target" = "Entrez Gene Symbol")
+  ) %>%
+  drop_na(Ki) %>%
+  mutate(
+    Ki_bin = cut(Ki, c(-Inf, 1, 10, 100, 1000, Inf), labels = c("<1", "1-10", "10-100", "100-1000", ">1000"), ordered_result = TRUE)
+  ) %>%
+  ggplot(
+    aes(`Compound Concentration (nM)`, `Percent Control`, group = interaction(lspci_id, target), color = Ki_bin)
+  ) +
+  geom_point(size = 3) +
+  geom_line(size = 2, alpha = 0.8) +
+  scale_x_log10() +
+  scale_color_viridis_d(direction = -1) +
+  # facet_wrap(~Ki_bin) +
+  # scale_y_log10() +
+  theme_bw() +
+  labs(color = "Ki (nM)")
+
+ggsave(
+  "comparison_dose_response_single_dose/concentration_vs_percent_control_by_Ki.pdf",
+  p, width = 5, height = 4
+)
+
+
+okl_dose_response %>%
+  inner_join(
+    single_dose %>%
+      select(
+        lspci_id,
+        `Compound Concentration (nM)`,
+        `Entrez Gene Symbol`,
+        `Percent Control`,
+        log_inhibition
+      ),
+    by = c("lspci_id", "target" = "Entrez Gene Symbol")
+  ) %>%
+  drop_na(IC50) %>%
+  mutate(
+    ki_bin = cut(Ki, c(-Inf, 1, 10, 100, 1000, Inf), labels = c("<1", "1-10", "10-100", "100-1000", ">1000"), ordered_result = TRUE)
+  ) %>%
+  ggplot(
+    aes(`Compound Concentration (nM)`, `Percent Control`, group = interaction(lspci_id, target), color = ki_bin)
+  ) +
+  geom_point(size = 3) +
+  geom_line(size = 2, alpha = 0.8) +
+  scale_x_log10() +
+  # facet_wrap(~ic50_bin) +
+  # scale_y_log10() +
+  theme_bw() +
+  labs(color = "Ki")
+```
+
