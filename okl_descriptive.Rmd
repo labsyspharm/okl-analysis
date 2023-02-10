@@ -1217,9 +1217,9 @@ single_dose_classification <- single_dose_classification_res2 %>%
 write_csv(
   single_dose_classification %>%
     select(where(negate(is.list))),
-  "classification/dose_response_classification.csv"
+  "classification/okl_eurofins_classification.csv"
 )
-single_dose_classification <- read_csv("classification/dose_response_classification.csv")
+single_dose_classification <- read_csv("classification/okl_eurofins_classification.csv")
 
 single_dose_classification %>%
   group_by(classification) %>%
@@ -1266,6 +1266,44 @@ dir.create("classification")
 ggsave(
   "classification/lm_classification_waterfall.pdf", p, width = 18, height = 10
 )
+
+
+library(powerjoin)
+p <- single_dose_classification %>%
+  count(`DiscoveRx Gene Symbol`, classification) %>%
+  complete(`DiscoveRx Gene Symbol`, classification, fill = list(n = 0)) %>%
+  group_by(`DiscoveRx Gene Symbol`) %>%
+  mutate(frac = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    `DiscoveRx Gene Symbol` = factor(
+      `DiscoveRx Gene Symbol`,
+      levels = filter(., classification == "binding") %>%
+        arrange(frac) %>%
+        pull(`DiscoveRx Gene Symbol`)
+    )
+  ) %>%
+  arrange(desc(`DiscoveRx Gene Symbol`)) %>%
+  mutate(split_var = floor(seq(from = 0, to = 2.99999, length.out = n()))) %>%
+  ggplot(aes(frac, `DiscoveRx Gene Symbol`, color = classification)) +
+    geom_point() +
+    scale_color_manual(
+      values = c(
+        "binding" = "firebrick1",
+        "weakly-binding" = "darkorange",
+        "non-binding" = "black",
+        "undetermined" = "gray",
+        "discordant" = "blue"
+      )
+    ) +
+    facet_wrap(~split_var, scales = "free_y", nrow = 1) +
+    theme(strip.text = element_blank()) +
+    labs(x = "Fraction of dose-response curves", y = "Kinase")
+
+ggsave(
+  "classification/lm_classification_waterfall_kinases.pdf", p, width = 18, height = 14
+)
+
 
 library(ggbeeswarm)
 p <- single_dose_classification %>%
@@ -1360,10 +1398,41 @@ p <- single_dose_classification %>%
         mutate(name = if_else(discordant < 0.04, "", name)),
       min.segment.length = 0
     ) +
-    labs(x = "Fraction of 'binding' dose-response curves", y = "Fraction of discordant dose-response curves")
+    labs(x = "Fraction of 'binding' dose-response curves", y = "Fraction of 'discordant' dose-response curves")
 
 ggsave(
   "classification/discordant_vs_binding.pdf", p, width = 10, height = 10
+)
+
+
+p <- single_dose_classification %>%
+  count(`DiscoveRx Gene Symbol`, classification) %>%
+  complete(`DiscoveRx Gene Symbol`, classification, fill = list(n = 0)) %>%
+  group_by(`DiscoveRx Gene Symbol`) %>%
+  mutate(frac = n / sum(n)) %>%
+  ungroup() %>%
+  # mutate(
+  #   name = factor(
+  #     name,
+  #     levels = filter(., classification == "binding") %>%
+  #       arrange(frac) %>%
+  #       pull(name)
+  #   )
+  # ) %>%
+  select(`DiscoveRx Gene Symbol`, classification, frac) %>%
+  pivot_wider(names_from = classification, values_from = frac) %>%
+  ggplot(aes(binding, discordant)) +
+    geom_point() +
+    geom_text_repel(
+      aes(label = `DiscoveRx Gene Symbol`),
+      data = ~.x %>%
+        mutate(`DiscoveRx Gene Symbol` = if_else(discordant < 0.04, "", `DiscoveRx Gene Symbol`)),
+      min.segment.length = 0
+    ) +
+    labs(x = "Fraction of 'binding' dose-response curves", y = "Fraction of 'discordant' dose-response curves")
+
+ggsave(
+  "classification/discordant_vs_binding_kinases.pdf", p, width = 10, height = 10
 )
 
 ```
@@ -1417,11 +1486,20 @@ pseudo_ic50 <- pseudo_ic50_raw %>%
   mutate(
     pseudo_ic50_relation = map_chr(pseudo_ic50, "relation"),
     pseudo_ic50 = map_dbl(pseudo_ic50, "pseudo_ic50")
+  ) %>%
+  power_left_join(
+    compound_names,
+    by = "lspci_id",
+    check = check_specs(
+      duplicate_keys_right = "abort",
+      unmatched_keys_left = "abort",
+      unmatched_keys_right = "ignore"
+    )
   )
 
 write_csv(
   pseudo_ic50,
-  "classification/pseudo_ic50.csv"
+  "classification/okl_eurofins_pseudo_ic50.csv"
 )
 
 
@@ -1549,3 +1627,17 @@ pseudo_ic50_comp_left %>%
 
 ```
 
+
+```{r upload_synapse}
+synStoreMany(
+  c(
+    "classification/okl_eurofins_pseudo_ic50.csv",
+    "classification/okl_eurofins_classification.csv"
+  ),
+  parentId = "syn18508401",
+  used = unname(inputs),
+  executed = "https://github.com/labsyspharm/okl-analysis/blob/main/okl_descriptive.Rmd",
+  forceVersion = FALSE
+)
+
+```
