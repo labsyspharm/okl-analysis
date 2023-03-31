@@ -1598,7 +1598,8 @@ pseudo_ic50_comp %>%
       c(pseudo_ic50, ic50),
       list(
         # average = ~10^(mean(log10(.x))),
-        ci = ~list(10^DescTools::MeanCI(log10(.x)))
+        # ci = ~list(10^DescTools::MeanCI(log10(.x)))
+        ci = ~list(10^quantile(log10(.x), c(.05, .5, .95)))
       )
     ),
     .groups = "drop"
@@ -1625,6 +1626,70 @@ pseudo_ic50_comp_left %>%
   count(chembl_is_covered)
 
 
+```
+
+```{ic50_single_dose_comp}
+
+single_dose_comp <- single_dose_trans %>%
+  power_left_join(
+    lsp_targets %>%
+      filter(organism == "Homo sapiens") %>%
+      select(lspci_target_id, symbol),
+    by = c("Entrez Gene Symbol" = "symbol"),
+    check = check_specs(
+      duplicate_keys_left = "ignore",
+      duplicate_keys_right = "ignore",
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "ignore"
+    )
+  ) %>%
+  inner_join(
+    lsp_biochem,
+    by = c("lspci_id", "lspci_target_id")
+  )
+
+
+ps <- single_dose_comp %>%
+  mutate(
+    percent_control_zero = `Percent Control` == 0,
+    percent_control_trans = if_else(
+      percent_control_zero,
+      0.5 * min(`Percent Control`[`Percent Control` > 0]),
+      `Percent Control`
+    ),
+    value = pmin(value, 30000)
+  ) %>%
+  filter(!qpcr_miss) %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  summarize(
+    plot = list(
+      # ggplot(cur_data(), aes(value, percent_control_trans, shape = percent_control_zero)) +
+      ggplot(cur_data(), aes(value, `Percent Control`)) +
+        geom_point(alpha = 0.5) +
+        # scale_shape_manual(
+        #   values = c(`TRUE` = 25, `FALSE` = 16)
+        # ) +
+        scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000, 10000), labels = scales::label_number()) +
+        # scale_y_log10() +
+        guides(shape = "none") +
+        labs(
+          x = "IC50 ChEMBL (nM)",
+          y = "% control Eurofins",
+          title = paste("Compound concentration", cur_group()$`Compound Concentration (nM)`, "nM")
+        )
+    )
+  )
+
+pwalk(
+  ps,
+  function(`Compound Concentration (nM)`, plot, ...) {
+    ggsave(
+      paste0("plots/single_dose_vs_chembl_ic50_", `Compound Concentration (nM)`, "nM.pdf"),
+      plot,
+      width = 8, height = 8
+    )
+  }
+)
 ```
 
 
