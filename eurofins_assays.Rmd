@@ -11,6 +11,9 @@ domain or the entire kinase.
 library(tidyverse)
 library(rvest)
 library(qs)
+library(synExtra)
+
+synapser::synLogin()
 ```
 
 ```{r}
@@ -69,19 +72,101 @@ assay_datasheets_raw <- assay_datasheet_nodes %>%
     map(extract_assay_info)
 ```
 
+Include Ensembl and Entrez gene IDs and UniProt IDs for each kinase.
+
+```{r}
+library(biomaRt)
+mart <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene_symbol_to_id_map <- biomaRt::getBM(
+    attributes = c("ensembl_gene_id", "external_gene_name", "entrezgene_id", "chromosome_name"),
+    filters = "external_gene_name",
+    values = assay_table_raw$`Entrez Gene Symbol`,
+    mart = mart
+)
+setdiff(assay_table_raw$`Entrez Gene Symbol`, gene_symbol_to_id_map$external_gene_name)
+
+# figure out ambiguous mappings
+gene_symbol_to_id_map %>%
+    group_by(external_gene_name) %>%
+    filter(n() > 1) %>%
+    arrange(external_gene_name) %>%
+    print(n = Inf)
+
+gene_symbol_to_id_map_disam <- gene_symbol_to_id_map %>%
+    filter(
+        # ensembl gene id hits for some are on alternative assemblies
+        chromosome_name %in% c(as.character(1:22), "X", "Y"),
+        # this entrez gene hit is a BUB1B-PAK6 readthrough
+        !entrezgene_id %in% c(106821730)
+    )
+setdiff(assay_table_raw$`Entrez Gene Symbol`, gene_symbol_to_id_map_disam$external_gene_name) %>%
+    sort()
+
+manual_map_old_symbols <- tribble(
+  ~`Entrez Gene Symbol`, ~entrezgene_id, ~ensembl_gene_id,
+    "ADCK4", 79934, "ENSG00000123815",
+    "ADRBK1", 156, "ENSG00000173020",
+    "ADRBK2", 157, "ENSG00000100077",
+    "CABC1", 56997, "ENSG00000163050",
+    "CDC2L2", 728642, "ENSG00000008128",
+    "CDPK1", 812762, NA_character_, # Plasmodium
+    "GSG2", 83903, "ENSG00000177602",
+    "ICK", 22858, "ENSG00000112144",
+    "KIAA0999", 23387, "ENSG00000160584",
+    "MAL13P1.279", 813841, NA_character_, # Plasmodium
+    "MGC42105", 167359, "ENSG00000177453",
+    "MST4", 51765, "ENSG00000134602",
+    "PAK7", 57144, "ENSG00000101349",
+    "pknB", 887072, NA_character_, # M. tuberculosis
+    "SgK110", 100130827, "ENSG00000231274",
+    "ZAK", 51776, "ENSG00000091436"
+)
+gene_symbol_to_id_map_final <- gene_symbol_to_id_map_disam %>%
+    distinct(`Entrez Gene Symbol` = external_gene_name, entrezgene_id, ensembl_gene_id) %>%
+    bind_rows(manual_map_old_symbols)
+setdiff(assay_table_raw$`Entrez Gene Symbol`, gene_symbol_to_id_map_final$`Entrez Gene Symbol`) %>%
+    sort()
+
+```
+
 ```{r}
 assay_datasheets <- assay_table_raw %>%
     bind_cols(
         bind_rows(assay_datasheets_raw)
+    ) %>%
+    left_join(
+        gene_symbol_to_id_map_final
+    ) %>%
+    dplyr::select(
+        `DiscoveRx Gene Symbol` = `KGS ▲`,
+        `Entrez Gene Symbol`,
+        `Kinase Name`,
+        entrezgene_id,
+        ensembl_gene_id,
+        everything()
     )
+```
 
+
+```{r}
 write_csv(
     assay_datasheets %>%
-     select(where(negate(is.list))),
-    "eurofins_kinase_assays.csv"
+     dplyr::select(where(negate(is.list))),
+    "eurofins_kinase_info.csv"
 )
 qsave(
     assay_datasheets,
-    "eurofins_kinase_assays.qs"
+    "eurofins_kinase_info.qs"
+)
+
+synStoreMany(
+    c("eurofins_kinase_info.csv", "eurofins_kinase_info.qs"),
+    parent = "syn18502717",
+    activity = synapser::Activity(
+        used = c(
+            "https://www.discoverx.com/services/drug-discovery-development-services/kinase-profiling/kinomescan#kinase-assay-list"
+        ),
+        executed = "https://github.com/labsyspharm/okl-analysis/blob/main/eurofins_assays.Rmd"
+    )
 )
 ```
