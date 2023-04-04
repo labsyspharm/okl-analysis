@@ -1,0 +1,123 @@
+---
+title: "OKL single dose data wrangling"
+author: "Clemens Hug"
+date: "12/1/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(synExtra)
+library(here)
+library(fst)
+library(data.table)
+
+theme_set(theme_minimal())
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+## Load input
+
+```{r load}
+inputs <- list(
+  compound_mapping = "syn26260389",
+  exclusions = "syn26401280",
+  okl1_1 = "syn26388880",
+  okl1_2 = "syn25998856",
+  okl2 = "syn26053108",
+  kinase_info = "syn51286743"
+)
+
+input_files <- map(
+  inputs, syn
+)
+
+compound_mapping <- input_files[["compound_mapping"]] %>%
+  read_fst(as.data.table = TRUE)
+
+exclusions <- input_files[["exclusions"]] %>%
+  read_csv()
+
+single_dose_raw <- input_files %>%
+  {.[str_starts(names(.), "okl")]} %>%
+  map(syn) %>%
+  map(fread) %>%
+  rbindlist(idcol = "experiment")
+
+kinase_info <- input_files[["kinase_info"]] %>%
+  read_csv()
+```
+
+## Wrangle
+
+We ran KinomeScan assays against the entire Kinome for all compounds in the
+Optimal Kinase Library. There are three batches of experiments. Any earlier
+KinomeScan runs are not included.
+
+Furthermore, all targets assayed by KinomeScan that contain mutations are
+flagged for exclusion.
+
+Torin 1 was measured twice. Averaging measurements
+
+```{r wrangle}
+single_dose <- single_dose_raw %>%
+  # Fix deprecated HMSLID
+  mutate(`Compound Name` = recode(`Compound Name`, HMSL12274 = "HMSL11996")) %>% {
+    compound_mapping[, .(lspci_id, hmsl_id = external_id)][
+      .,
+      on = c("hmsl_id" = "Compound Name")
+    ]
+  } %>%
+  group_by(
+    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
+    `Compound Concentration (nM)`
+  ) %>%
+  summarize(
+    experiment = paste(experiment, collapse = "+"),
+    across(where(is.numeric), mean),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    exclude_target = `DiscoveRx Gene Symbol` %in% exclusions$`DiscoveRx Gene Symbol`
+  ) %>%
+  mutate(
+    tas = case_when(
+      `Compound Concentration (nM)` == 10000 & `Percent Control` >= 50 ~ 10L,
+      `Compound Concentration (nM)` == 10000 & `Percent Control` < 0.1 ~ 2L,
+      `Compound Concentration (nM)` == 1000 & `Percent Control` >= 90 ~ 10L,
+      `Compound Concentration (nM)` == 1000 & `Percent Control` < 1 ~ 2L,
+      `Compound Concentration (nM)` == 100 & `Percent Control` >= 75 ~ 10L,
+      `Compound Concentration (nM)` == 100 & `Percent Control` < 25 ~ 2L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  inner_join(
+    kinase_info %>%
+      select(`DiscoveRx Gene Symbol`, entrezgene_id, ensembl_gene_id),
+    by = "DiscoveRx Gene Symbol"
+  ) %>%
+  select(
+    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`, entrezgene_id, ensembl_gene_id,
+    everything()
+  )
+
+fwrite(single_dose, here("data", "okl_single_dose.csv.gz"))
+```
+
+## Upload to Synapse
+
+```{r synapse}
+activity <- synapser::Activity(
+  name = "Wrangle OKL KinomeScan data",
+  used = unname(inputs)
+)
+
+c(
+  here("data", "okl_single_dose.csv.gz")
+) %>%
+  synStoreMany(parentId = "syn18508401", activity = activity)
+```
