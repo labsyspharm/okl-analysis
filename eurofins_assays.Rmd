@@ -1,0 +1,87 @@
+
+## Scrape Eurofins kinase assay datasheets
+
+Eurofins doesn't make information about the kinases they measure available in a
+machine-readable format. This is a quick and dirty script to scrape the
+datasheets for each target and extract whether the target is mutated,
+phosphorylated, and what form the kinase is assayed in. E.g. only a
+domain or the entire kinase.
+
+```{r}
+library(tidyverse)
+library(rvest)
+library(qs)
+```
+
+```{r}
+assay_index <- read_html("https://www.discoverx.com/services/drug-discovery-development-services/kinase-profiling/kinomescan#kinase-assay-list")
+
+assay_table_node <- assay_index %>%
+    html_elements("table") %>%
+    magrittr::extract2(3)
+
+assay_table_raw <- html_table(assay_table_node, header = TRUE)
+```
+
+
+```{r}
+assay_links <- assay_table_node %>%
+    html_elements("td a") %>%
+    html_attr("href") %>%
+    str_subset("kinase-data-sheets") %>%
+    str_replace(fixed("../../.."), "https://www.discoverx.com")
+
+length(assay_links) == nrow(assay_table_raw)
+
+assay_datasheet_nodes <- map(assay_links, read_html)
+
+
+```
+
+Fetch each datasheet and extract the assay information. Put reference compound
+information in a separate column (not particularly interesting).
+
+```{r}
+extract_assay_info <- function(datasheet_node) {
+    vals_raw <- tibble(
+        name = datasheet_node %>%
+            html_nodes("dt") %>%
+            html_text(),
+        value = datasheet_node %>%
+            html_nodes("dd") %>%
+            html_text()
+    )
+    if ("Compound" %in% vals_raw$name) {
+        cmpd_info <- vals_raw %>%
+            slice(which(vals_raw$name == "Compound") + 1:nrow(vals_raw)) %>%
+            magrittr::set_colnames(c("Compound", "Kd"))
+        vals <- vals_raw %>%
+            slice(1:(which(vals_raw$name == "Compound") - 1)) %>%
+            pivot_wider(names_from = name, values_from = value) %>%
+            mutate(Compounds = list(cmpd_info))
+    } else
+        vals <- vals_raw %>%
+        pivot_wider(names_from = name, values_from = value)
+    vals
+}
+
+assay_datasheets_raw <- assay_datasheet_nodes %>%
+    map(extract_assay_info)
+```
+
+```{r}
+assay_datasheets <- assay_table_raw %>%
+    bind_cols(
+        bind_rows(assay_datasheets_raw)
+    )
+
+write_csv(
+    assay_datasheets %>%
+     select(where(negate(is.list))),
+    "eurofins_kinase_assays.csv"
+)
+qsave(
+    assay_datasheets,
+    "eurofins_kinase_assays.qs"
+)
+```
