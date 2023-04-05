@@ -1,0 +1,168 @@
+
+```{r}
+library(tidyverse)
+library(synExtra)
+library(fst)
+library(data.table)
+library(powerjoin)
+
+synapser::synLogin()
+
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+```{r}
+compound_dict <- syn("syn26260332") %>%
+  read_fst()
+
+compound_names <- syn("syn26260347") %>%
+  read_fst(as.data.table = TRUE)
+
+canonical_names <- compound_names[
+  !is.na(name), .(lspci_id, name)
+][
+  , head(.SD, n = 1), by = .(lspci_id)
+]
+
+compound_mapping <- syn("syn26260389") %>%
+  read_fst(as.data.table = TRUE)
+```
+
+Extracting IC50s from Klaeger data:
+
+"Kinobeads Drugmatrix detailed"
+	Column	Description
+	Gene name	Gene name or Uniprot Accession of the target.
+	Abemaciclib	This and all subsequent columns contain the apparent Kds [nM] of the respective inhibitors.
+
+	Cell content:
+	123	This protein-drug interaction was classified as "high-confidence" target (see Supplementary Information for details).
+	(123)	This protein-drug interaction was classified as "low-confidence" target (see Supplementary Information for details).
+	n.i.	Protein was identified and quantified but the dose-response curve did not suggest a dose-dependent effect and is thus annotated as "not inhibited".
+	n.d.	Protein was either not identified or not quantified in this profiling, thus no statement about its inhibition can be made ("not defined").
+
+A protein was considered a high-confidence target if the binding curve showed a sigmoidal shape with a dose-dependent decrease in binding to the Kinobeads.
+
+So confidence here is in the data quality, not in how strongly the compound binds.
+
+```{r}
+klaeger_ic50s_raw <- syn("syn51288788") %>%
+    readxl::read_excel(sheet = "Kinobeads Drugmatrix detailed")
+
+klaeger_ic50s <- klaeger_ic50s_raw %>%
+    pivot_longer(
+        -c(Name, Kinase, `Direct binder`),
+        names_to = "Compound",
+        values_to = "IC50_raw"
+    ) %>%
+    mutate(
+        IC50 = case_when(
+            str_detect(IC50_raw, "[0-9]+") ~ as.double(str_extract(IC50_raw, "[0-9]+")),
+            IC50_raw == "n.i." ~ 5e4,
+            TRUE ~ NA_real_
+        ) %>%
+            pmin(5e4),
+        IC50_relation = case_when(
+            IC50 >= 5e4 ~ ">",
+            IC50 < 5e4 ~ "=",
+            TRUE ~ NA_character_
+        ),
+        IC50_quality = case_when(
+            !str_detect(IC50_raw, "[0-9]+") ~ NA_character_,
+            str_detect(IC50_raw, "\\(") ~ "low",
+            TRUE ~ "high"
+        )
+    )
+
+klaeger_single_dose_raw <- syn("syn51288926") %>%
+    readxl::read_excel(sheet = "Kinobeads")
+
+
+setdiff(klaeger_ic50s$Compound, compound_names$name)
+
+setdiff(
+  str_replace(klaeger_ic50s$Compound, fixed("-"), ""),
+  str_replace(compound_names$name, fixed("-"), "")
+)
+
+klaeger_mapping <- klaeger_ic50s %>%
+  distinct(Compound) %>%
+  mutate(name_join = str_replace(Compound, fixed("-"), "") %>% str_to_lower())
+
+klaeger_mapping %>%
+  arrange(name_join) %>%
+  group_by(name_join) %>%
+  filter(n() > 1)
+
+klaeger_mapping <- klaeger_mapping %>%
+  power_left_join(
+    compound_names %>%
+      drop_na(name) %>%
+      mutate(name = str_replace(name, fixed("-"), "") %>% str_to_lower()) %>%
+      filter(name %in% klaeger_mapping$name_join) %>%
+      distinct() %>%
+      group_by(name) %>%
+      filter(if (any(priority == "primary")) priority == "primary" else TRUE) %>%
+      arrange(lspci_id) %>%
+      slice_head(n = 1) %>%
+      ungroup() %>%
+      distinct(lspci_id, name),
+    by = c("name_join" = "name"),
+    check = check_specs(
+      duplicate_keys_left = "abort",
+      duplicate_keys_right = "abort"
+    )
+  ) %>%
+  power_left_join(
+    compound_dict %>%
+      select(lspci_id, hmsl_id, chembl_id),
+    by = c("lspci_id"),
+    check = check_specs(
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "abort"
+    ),
+    na_matches = "never"
+  )
+
+klaeger_ic50s_matched <- klaeger_ic50s %>%
+  power_left_join(
+    klaeger_mapping %>%
+      select(Compound, lspci_id, hmsl_id, chembl_id),
+    by = "Compound",
+    check = check_specs(
+      duplicate_keys_right = "abort",
+      unmatched_keys_right = "abort"
+    )
+  ) %>%
+  select(Compound, lspci_id, hmsl_id, chembl_id, everything())
+
+write_csv(
+    klaeger_ic50s_matched,
+    file.path("data", "klaeger_ic50s.csv.gz")
+)
+synStoreMany(
+    file.path("data", "klaeger_ic50s.csv.gz"),
+    parentId = "syn45321440",
+    forceVersion = FALSE
+)
+
+
+klaeger_single <- klaeger %>%
+  select(Drug, lspci_id, hmsl_id, chembl_id, `Gene Name`, starts_with("Relative Intensity ")) %>%
+  pivot_longer(
+    starts_with("Relative Intensity "),
+    names_pattern = "Relative Intensity ([0-9]+) nM",
+    names_to = "Concentration", values_to = "Relative Intensity"
+  ) %>%
+  # DMSO
+  drop_na(Concentration, `Relative Intensity`) %>%
+  mutate(across(Concentration, as.double))
+
+klaeger_single %>%
+  filter(Drug == "ACTB-1003", `Gene Name` == "BCR") %>%
+  ggplot(aes(Concentration, `Relative Intensity`)) +
+    geom_point() +
+    geom_line() +
+    scale_x_log10()
+```
+

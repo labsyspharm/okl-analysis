@@ -113,7 +113,8 @@ fwrite(single_dose, here("data", "okl_single_dose.csv.gz"))
 ```{r synapse}
 activity <- synapser::Activity(
   name = "Wrangle OKL KinomeScan data",
-  used = unname(inputs)
+  used = unname(inputs),
+  executed = "https://github.com/labsyspharm/okl-analysis/blob/main/wrangle_data.Rmd"
 )
 
 c(
