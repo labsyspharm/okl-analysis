@@ -1,7 +1,7 @@
 ---
 title: "Descriptive analysis of OKL affinity data"
 output: html_document
-editor_options: 
+editor_options:
   chunk_output_type: console
 ---
 
@@ -24,7 +24,8 @@ inputs <- list(
   okl_single_dose = "syn26486828",
   # hmsl_single_dose = "syn26260430",
   # hmsl_single_dose_agg = "syn26260426",
-  compound_dictionary = "syn26260332"
+  compound_dictionary = "syn26260332",
+  kinase_info = "syn51286743"
   # references = "syn26260402",
   # target_mapping = "syn26260398",
   # target_dictionary = "syn26260394",
@@ -53,70 +54,8 @@ compound_names <- compound_dictionary %>%
 qpcr_misses <- syn("syn33531640") %>%
   readxl::read_excel()
 
-# 
-# single_dose_data <- input_files[["hmsl_single_dose"]] %>%
-#   read_fst(as.data.table = TRUE)
-# 
-# single_dose_data_agg <- input_files[["hmsl_single_dose_agg"]] %>%
-#   read_fst(as.data.table = TRUE)
-# 
-# references <- input_files[["references"]] %>%
-#   read_fst(as.data.table = TRUE)
-# 
-# target_mapping <- input_files[["target_mapping"]] %>%
-#   read_fst(as.data.table = TRUE)
-# 
-# target_dictionary <- input_files[["target_dictionary"]] %>%
-#   read_fst(as.data.table = TRUE)
-# 
-# compound_mapping <- input_files[["compound_mapping"]] %>%
-#   read_fst(as.data.table = TRUE)
-```
-
-<!-- ## Wrangling -->
-
-<!-- ```{r wrangling} -->
-<!-- data_sources_map <- tribble( -->
-<!--   ~experiment, ~synapse_id, -->
-<!--   "hmsl_single_dose_okl_1", "syn25998856", -->
-<!--   "hmsl_single_dose_okl_2", "syn26053108", -->
-<!--   "hmsl_single_dose_okl_3", "syn26388880" -->
-<!-- ) -->
-
-<!-- single_dose_data_raw <- single_dose_data %>% -->
-<!--   left_join(references) %>% -->
-<!--   left_join(data_sources_map, by = c("reference_value" = "synapse_id")) %>% -->
-<!--   semi_join( -->
-<!--     target_dictionary[organism == "Homo sapiens"] -->
-<!--   ) -->
-<!-- ``` -->
-
-<!-- ```{r repeat_measurements} -->
-<!-- repeats <- single_dose_data_raw[ -->
-<!--   !is.na(experiment) -->
-<!-- ][ -->
-<!--   , if (.N > 1) copy(.SD)[ -->
-<!--     , `:=`("replicate", as.ordered(seq_len(.N))) -->
-<!--   ], -->
-<!--   keyby = .(lspci_id, description, concentration) -->
-<!-- ] -->
-<!-- ``` -->
-
-<!-- ```{r} -->
-<!-- library(ggbeeswarm) -->
-<!-- repeats %>% -->
-<!--   ggplot(aes(description, percent_control, color = replicate)) + -->
-<!--     geom_quasirandom(groupOnX = TRUE) + -->
-<!--   facet_wrap(~concentration, ncol = 1) -->
-
-<!-- ``` -->
-
-```{r}
-p <- single_dose %>%
-  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
-  ggplot(aes(as.factor(`lspci_id`), `Percent Control`)) +
-    geom_violin() +
-    facet_wrap(~`Compound Concentration (nM)`, scales = "free_x")
+kinase_info <- input_files[["kinase_info"]] %>%
+  read_csv()
 ```
 
 ```{r}
@@ -128,6 +67,7 @@ p <- single_dose %>%
     labs(color = "Concentration")
 ggsave("all_combs_percent_control_hist.pdf", p, width = 5, height = 3)
 ```
+
 
 ```{r}
 single_dose %>%
@@ -193,14 +133,9 @@ ggsave(
 ```
 
 ```{r}
-p <- 
-
-```
-
-```{r}
 p <- per_conc %>%
   drop_na(`100`, `10000`) %>%
-  plotly::plot_ly(x = ~`100`, y = ~`10000`) %>%
+  plotly::plot_ly(x = ~`100`, y = ~`10000`) %>%®
   add_rasterly_heatmap(scaling = "log")
 ```
 
@@ -318,9 +253,15 @@ p <- binding_stats %>%
 ggsave("rank_frac_below_50.pdf", p, width = 5, height = 3)
 ```
 
+### Heatmaps
 
 ```{r}
 percent_remaining_mats <- single_dose %>%
+  inner_join(
+    kinase_info %>%
+      select(`DiscoveRx Gene Symbol`, `Kinase Form`)
+  ) %>%
+  # filter(`Kinase Form` == "Wild Type") %>%
   group_nest(`Compound Concentration (nM)`) %>%
   crossing(trans = c("log", "lin")) %>%
   mutate(
@@ -342,21 +283,38 @@ percent_remaining_mats <- single_dose %>%
   filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000))
 
 library(pheatmap)
+library(seriation)
+viridis_map <- viridis::viridis(100)
 percent_remaining_heatmaps <- percent_remaining_mats %>%
   mutate(
     heatmap = map(
       mat,
-      pheatmap,
-      show_rownames = FALSE, show_colnames = FALSE,
-      color = rev(viridis_map)
+      function(mat) {
+        set.seed(42)
+        mat <- t(mat)
+        dr <- dist(mat, method = "euclidean")
+        dc <- dist(t(mat), method = "euclidean")
+        cr <- hclust(dr, method = "average") %>%
+          reorder(dr, method = "olo")
+        cc <- hclust(dc, method = "average") %>%
+          reorder(dc, method = "olo")
+        pheatmap(
+          mat,
+          show_rownames = FALSE, show_colnames = FALSE,
+          color = rev(viridis_map),
+          cluster_rows = cr, cluster_cols = cc,
+          treeheight_row = 20, treeheight_col = 20
+        )
+      }
     )
   )
 
+dir.create("heatmaps", showWarnings = FALSE)
 pwalk(
   percent_remaining_heatmaps,
   function(heatmap, `Compound Concentration (nM)`, trans, ...) {
     ggsave(
-      paste0("heatmap_", `Compound Concentration (nM)`, "_", trans, ".pdf"),
+      paste0("heatmaps/heatmap_all_", `Compound Concentration (nM)`, "_", trans, ".pdf"),
       heatmap, width = 5, height = 3
     )
   }
@@ -396,7 +354,7 @@ p <- single_dose %>%
 ggsave(
   "dose_response_scatter_log_AZD1480.pdf",
   p, width = 4, height = 2.5
-) 
+)
 ```
 
 ```{r}
@@ -584,7 +542,7 @@ n_flagged %>%
     frac = n / n(),
     .groups = "drop"
   )
-  
+
 
 n_flagged %>%
   group_by(any_active) %>%
@@ -615,7 +573,7 @@ n_flagged %>%
       select(., -Freq), freq=.$Freq
     )
   }
-  
+
 
 ```
 
@@ -759,7 +717,7 @@ random_bad <- between_doses %>%
   mutate(
     measurement_name = paste(pref_name, "-", `DiscoveRx Gene Symbol`)
   )
-  
+
 
 p <- random_bad %>%
   mutate(
@@ -783,6 +741,7 @@ ggsave(
 )
 ```
 
+### asdfasdf
 
 ```{r}
 p <- largest_inconsistency %>%
@@ -845,7 +804,7 @@ n_inconsistent_per_target <- largest_inconsistency %>%
     n_bad_norm = sum(largest_increase_bad) / sum(max_inhib < 0.5),
     # Normalize by number of active targets
     frac_bad = n_bad / n(),
-    # Only take into account bad 
+    # Only take into account bad
     mean_largest_increase = mean(largest_increase),
     # badness_score = sum(largest_increase) + sum(max_inhib),
     .groups = "drop"
@@ -1004,7 +963,7 @@ binary_between_doses <- single_dose_trans %>%
   ) %>%
   summarize(
     across(
-      c(`Percent Control`, log_inhibition), 
+      c(`Percent Control`, log_inhibition),
       ~if (!all(qpcr_miss))
         mean(.x[!qpcr_miss])
       else
@@ -1057,7 +1016,7 @@ n_flagged_binary %>%
     frac = n / n(),
     .groups = "drop"
   )
-  
+
 
 n_flagged_binary %>%
   group_by(any_active) %>%
@@ -1105,7 +1064,7 @@ n_flagged_binary %>%
     frac = n / n(),
     .groups = "drop"
   )
-  
+
 
 n_flagged_binary %>%
   group_by(any_active) %>%
@@ -1124,7 +1083,7 @@ single_dose_trans_agg <- single_dose_trans %>%
   ) %>%
   summarize(
     across(
-      c(`Percent Control`, log_inhibition), 
+      c(`Percent Control`, log_inhibition),
       ~if (!all(qpcr_miss))
         mean(.x[!qpcr_miss])
       else
@@ -1352,7 +1311,7 @@ p <- single_dose_classification %>%
     # geom_custom(
     #   data = ~.x %>%
     #     distinct(binding_name, classification),
-    #   mapping = aes(fill = classification), 
+    #   mapping = aes(fill = classification),
     #   grob_fun = function(x) rectGrob(gp=gpar(fill=fill,col=NA, alpha=0.5)),
     #   inherit.aes = TRUE
     # ) +
@@ -1557,7 +1516,7 @@ pseudo_ic50_comp <- pseudo_ic50_class %>%
 
 p <- pseudo_ic50_comp %>%
   filter(
-    pseudo_ic50_relation == "=",
+    # pseudo_ic50_relation == "=",
     classification != "discordant"
   ) %>%
   ggplot(
@@ -1568,9 +1527,14 @@ p <- pseudo_ic50_comp %>%
   scale_x_log10() +
   scale_y_log10() +
   labs(
-    x = "IC50 ChEMBL",
-    y = "pseudo IC50 Eurofins"
+    x = "IC50 (ChEMBL)",
+    y = "Pseudo-IC50 (KINOMEscan)"
   )
+
+ggsave(
+    "plots/chembl_ic50_vs_kinomescan_pseudo_ic50.pdf", p,
+    width = 10, height = 7
+)
 
 library(ggbeeswarm)
 p <- pseudo_ic50_comp %>%
@@ -1628,7 +1592,7 @@ pseudo_ic50_comp_left %>%
 
 ```
 
-```{ic50_single_dose_comp}
+```{r ic50_single_dose_comp}
 
 single_dose_comp <- single_dose_trans %>%
   power_left_join(
