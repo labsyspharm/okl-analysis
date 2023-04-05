@@ -1,0 +1,33 @@
+
+```{r}
+library(tidyverse)
+library(synExtra)
+library(fst)
+library(data.table)
+library(powerjoin)
+
+synapser::synLogin()
+
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+```{r}
+klaeger_ic50s <- syn("syn51288931") %>%
+    read_csv()
+
+kinomescan_pseudo_ic50s <- syn("syn51080578") %>%
+    read_csv()
+
+kinomescan_classes <- syn("syn51080579") %>%
+    read_csv()
+
+kinomescan_kinase_info <- syn("syn51286743") %>%
+    read_csv()
+```
+
+```{r}
+
+
+```
+
+
