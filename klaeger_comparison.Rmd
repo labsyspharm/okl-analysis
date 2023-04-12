@@ -23,11 +23,185 @@ kinomescan_classes <- syn("syn51080579") %>%
 
 kinomescan_kinase_info <- syn("syn51286743") %>%
     read_csv()
+
+single_dose <- syn("syn26486828") %>%
+    read_csv()
 ```
 
 ```{r}
+compounds_fully_profiled <- single_dose %>%
+    group_by(lspci_id) %>%
+    filter(uniqueN(`Compound Concentration (nM)`) >= 4) %>%
+    ungroup() %>%
+    distinct(lspci_id)
 
+kinomescan_pseudo_ic50s_comp <- kinomescan_pseudo_ic50s %>%
+    semi_join(
+        compounds_fully_profiled
+    ) %>%
+    inner_join(
+        kinomescan_kinase_info
+    ) %>%
+    inner_join(
+        kinomescan_classes
+    ) %>%
+    filter(`Kinase Form` == "Wild Type", classification != "discordant") %>%
+    select(lspci_id, name, Symbol = `Entrez Gene Symbol`, pseudo_ic50, classification)
+
+klaeger_ic50_comp <- klaeger_ic50s %>%
+    semi_join(
+        compounds_fully_profiled
+    ) %>%
+    select(lspci_id, Symbol = Name, IC50) %>%
+    inner_join(
+        kinomescan_pseudo_ic50s_comp
+    )
+
+p <- klaeger_ic50_comp %>%
+  ggplot(
+    # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
+    aes(IC50, pseudo_ic50, color = classification)
+  ) +
+  geom_point(alpha = 0.5) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    x = "IC50 Klaeger",
+    y = "pseudo IC50 Eurofins"
+  )
+ggsave(
+    "plots/klaeger_ic50_vs_kinomescan_pseudo_ic50.pdf", p,
+    width = 8, height = 6
+)
 
 ```
 
+Make venn diagram of overlap assayed compounds that we have information for
+between Klaeger and Kinomescan
 
+```{r}
+library(ggvenn)
+p <- bind_rows(
+    klaeger = klaeger_ic50s %>%
+        select(lspci_id),
+    kinomescan = kinomescan_pseudo_ic50s %>%
+        select(lspci_id),
+    .id = "source"
+) %>%
+    distinct() %>%
+    split(.$source) %>%
+    map("lspci_id") %>%
+    ggvenn(auto_scale = TRUE)
+p
+```
+
+Check if there are any compounds that are particularly different between
+Klaeger and Kinomescan
+
+Also, label false positives (compared to Klaeger) and false negatives
+separately
+
+```{r}
+klaeger_ic50_comp_stats <- klaeger_ic50_comp %>%
+    mutate(
+        IC50 = pmax(IC50, min(na.omit(IC50) %>% .[. > 0]) * 0.5),
+        log10_ic50 = log10(IC50),
+        log10_pseudo_ic50 = log10(pseudo_ic50),
+        log_ic50_diff = log10_ic50 - log10_pseudo_ic50,
+        diff_greater_than_1 = abs(log_ic50_diff) > 1,
+        difference_class = case_when(
+            log_ic50_diff > 1 ~ "FP",
+            log_ic50_diff < -1 ~ "FN",
+            TRUE ~ "concordant"
+        )
+    )
+```
+
+
+```{r}
+stats_per_group <- function(grouped_df) {
+    grouped_df %>%
+    summarise(
+        n = n(),
+        n_binding_class = sum(classification == "binding"),
+        frac_binding_class = n_binding_class / n,
+        n_diff_greater_than_1 = sum(diff_greater_than_1, na.rm = TRUE),
+        frac_diff_greater_than_1 = n_diff_greater_than_1 / n,
+        mean_log_ic50_diff = mean(log_ic50_diff, na.rm = TRUE),
+        sd_log_ic50_diff = sd(log_ic50_diff, na.rm = TRUE),
+        n_false_positives = sum(difference_class == "FP", na.rm = TRUE),
+        n_false_negatives = sum(difference_class == "FN", na.rm = TRUE),
+        frac_false_positives = n_false_positives / n,
+        frac_false_negatives = n_false_negatives / n,
+        .groups = "drop"
+    )
+}
+
+klaeger_ic50_comp_stats_per_compound <- klaeger_ic50_comp_stats %>%
+    group_by(lspci_id, name) %>%
+    stats_per_group()
+```
+
+```{r}
+library(ggrepel)
+p <- klaeger_ic50_comp_stats_per_compound %>%
+  ggplot(aes(frac_binding_class, frac_diff_greater_than_1, text = name)) +
+    geom_point() +
+    # geom_text_repel(
+    #   aes(label = name),
+    #   data = ~.x %>%
+    #     mutate(name = if_else(discordant < 0.04, "", name)),
+    #   min.segment.length = 0
+    # ) +
+    labs(
+        x = "Fraction of 'binding' dose-response curves",
+        y = "Fraction of pseudo IC50s with >10x difference",
+        title = "Per compound"
+    )
+
+plotly::ggplotly(p)
+
+ggsave(
+    "plots/klaeger_ic50_vs_kinomescan_pseudo_ic50_differences_per_compound.pdf", p,
+    width = 6, height = 4
+)
+```
+
+Now do the same per kinase
+
+```{r}
+
+klaeger_ic50_comp_stats_per_kinase <- klaeger_ic50_comp_stats %>%
+    group_by(Symbol) %>%
+    summarise(
+        n = n(),
+        n_binding_class = sum(classification == "binding"),
+        frac_binding_class = n_binding_class / n,
+        n_diff_greater_than_1 = sum(diff_greater_than_1, na.rm = TRUE),
+        fract_diff_greater_than_1 = n_diff_greater_than_1 / n,
+        mean_log_ic50_diff = mean(log_ic50_diff, na.rm = TRUE),
+        sd_log_ic50_diff = sd(log_ic50_diff, na.rm = TRUE),
+        .groups = "drop"
+    )
+```
+
+```{r}
+p <- klaeger_ic50_comp_stats_per_kinase %>%
+  ggplot(aes(frac_binding_class, fract_diff_greater_than_1, text = Symbol)) +
+    geom_point() +
+    # geom_text_repel(
+    #   aes(label = name),
+    #   data = ~.x %>%
+    #     mutate(name = if_else(discordant < 0.04, "", name)),
+    #   min.segment.length = 0
+    # ) +
+    labs(
+        x = "Fraction of 'binding' dose-response curves",
+        y = "Fraction of pseudo IC50s with >10x difference",
+        title = "Per kinase"
+    )
+ggsave(
+    "plots/klaeger_ic50_vs_kinomescan_pseudo_ic50_differences_per_kinase.pdf", p,
+    width = 6, height = 4
+)
+```
