@@ -13,7 +13,7 @@ syn <- synDownloader("~/data", .cache = TRUE)
 
 ```{r}
 compound_dict <- syn("syn26260332") %>%
-  read_fst()
+  read_fst(as.data.table = TRUE)
 
 compound_names <- syn("syn26260347") %>%
   read_fst(as.data.table = TRUE)
@@ -49,6 +49,73 @@ So confidence here is in the data quality, not in how strongly the compound bind
 klaeger_ic50s_raw <- syn("syn51288788") %>%
     readxl::read_excel(sheet = "Kinobeads Drugmatrix detailed")
 
+klaeger_compounds <- syn("syn51306954") %>%
+  readxl::read_excel(sheet = "Inhibitor annotation")
+
+klaeger_mapping_chembl <- klaeger_compounds %>%
+  distinct(Drug, `ChEMBL ID`) %>%
+  left_join(
+    compound_mapping[source == "chembl"],
+    by = c("ChEMBL ID" = "external_id")
+  )
+
+klaeger_mapping_name_raw <- klaeger_mapping_chembl %>%
+  filter(is.na(lspci_id)) %>%
+  distinct(Drug) %>%
+  mutate(
+    name_join = str_replace_all(Drug, "[^a-zA-Z0-9]", "") %>% str_to_lower()
+  ) %>%
+  left_join(
+    compound_names %>%
+      drop_na(name) %>%
+      mutate(name_join = str_replace(name, "[^a-zA-Z0-9]", "") %>% str_to_lower()) %>%
+      distinct()
+  )
+
+klaeger_mapping_name <- klaeger_mapping_name_raw %>%
+  filter(!is.na(lspci_id)) %>%
+  group_by(Drug) %>%
+  filter(uniqueN(lspci_id) == 1) %>%
+  ungroup() %>%
+  distinct(Drug, lspci_id)
+
+klaeger_compounds %>%
+  distinct(Drug) %>%
+  anti_join(
+    klaeger_mapping_chembl %>%
+      drop_na(lspci_id)
+  ) %>%
+  anti_join(
+    klaeger_mapping_name %>%
+      drop_na(lspci_id)
+  )
+
+
+klaeger_mapping_manual <- tribble(
+  ~Drug, ~lspci_id,
+  "ARRY-380", 1639463L,
+  "ONO-4059 analogue", 133097L,
+  "P-276-00", 21815076L
+)
+
+klaeger_mapping <- bind_rows(
+  klaeger_mapping_chembl,
+  klaeger_mapping_name,
+  klaeger_mapping_manual
+) %>%
+  drop_na(lspci_id) %>%
+  distinct(Drug, lspci_id) %>%
+  arrange(Drug) %>%
+  inner_join(
+    compound_dict %>%
+      select(lspci_id, hmsl_id, chembl_id),
+    by = "lspci_id"
+  )
+```
+
+
+```{r}
+
 klaeger_ic50s <- klaeger_ic50s_raw %>%
     pivot_longer(
         -c(Name, Kinase, `Direct binder`),
@@ -74,60 +141,11 @@ klaeger_ic50s <- klaeger_ic50s_raw %>%
         )
     )
 
-klaeger_single_dose_raw <- syn("syn51288926") %>%
-    readxl::read_excel(sheet = "Kinobeads")
-
-
-setdiff(klaeger_ic50s$Compound, compound_names$name)
-
-setdiff(
-  str_replace(klaeger_ic50s$Compound, fixed("-"), ""),
-  str_replace(compound_names$name, fixed("-"), "")
-)
-
-klaeger_mapping <- klaeger_ic50s %>%
-  distinct(Compound) %>%
-  mutate(name_join = str_replace(Compound, fixed("-"), "") %>% str_to_lower())
-
-klaeger_mapping %>%
-  arrange(name_join) %>%
-  group_by(name_join) %>%
-  filter(n() > 1)
-
-klaeger_mapping <- klaeger_mapping %>%
-  power_left_join(
-    compound_names %>%
-      drop_na(name) %>%
-      mutate(name = str_replace(name, fixed("-"), "") %>% str_to_lower()) %>%
-      filter(name %in% klaeger_mapping$name_join) %>%
-      distinct() %>%
-      group_by(name) %>%
-      filter(if (any(priority == "primary")) priority == "primary" else TRUE) %>%
-      arrange(lspci_id) %>%
-      slice_head(n = 1) %>%
-      ungroup() %>%
-      distinct(lspci_id, name),
-    by = c("name_join" = "name"),
-    check = check_specs(
-      duplicate_keys_left = "abort",
-      duplicate_keys_right = "abort"
-    )
-  ) %>%
-  power_left_join(
-    compound_dict %>%
-      select(lspci_id, hmsl_id, chembl_id),
-    by = c("lspci_id"),
-    check = check_specs(
-      duplicate_keys_left = "warn",
-      duplicate_keys_right = "abort"
-    ),
-    na_matches = "never"
-  )
 
 klaeger_ic50s_matched <- klaeger_ic50s %>%
   power_left_join(
     klaeger_mapping %>%
-      select(Compound, lspci_id, hmsl_id, chembl_id),
+      select(Compound = Drug, lspci_id, hmsl_id, chembl_id),
     by = "Compound",
     check = check_specs(
       duplicate_keys_right = "abort",
@@ -164,5 +182,10 @@ klaeger_single %>%
     geom_point() +
     geom_line() +
     scale_x_log10()
+```
+
+```{r}
+klaeger_single_dose_raw <- syn("syn51288926") %>%
+    readxl::read_excel(sheet = "Kinobeads")
 ```
 
