@@ -97,11 +97,11 @@ single_dose <- single_dose_raw %>%
   ) %>%
   inner_join(
     kinase_info %>%
-      select(`DiscoveRx Gene Symbol`, entrezgene_id, ensembl_gene_id),
+      select(`DiscoveRx Gene Symbol`, entrezgene_id, ensembl_gene_id, hgnc_symbol),
     by = "DiscoveRx Gene Symbol"
   ) %>%
   select(
-    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`, entrezgene_id, ensembl_gene_id,
+    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`, entrezgene_id, ensembl_gene_id, hgnc_symbol,
     everything()
   )
 
@@ -120,5 +120,5 @@ activity <- synapser::Activity(
 c(
   here("data", "okl_single_dose.csv.gz")
 ) %>%
-  synStoreMany(parentId = "syn18508401", activity = activity)
+  synStoreMany(parentId = "syn18508401", activity = activity, forceVersion = FALSE)
 ```
