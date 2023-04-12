@@ -1,0 +1,135 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(synExtra)
+library(here)
+library(fst)
+library(data.table)
+library(powerjoin)
+
+theme_set(theme_minimal())
+
+synapser::synLogin()
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+Use TAS values based on ChEMBL v27 because that didn't include TAS
+values derived from our own Kinomescan data
+
+```{r}
+tas_table <- syn("syn25173510") %>%
+    read_fst(as.data.table = TRUE)
+lsp_target_dictionary <- syn("syn25173506") %>%
+    read_fst(as.data.table = TRUE)
+single_dose <- syn("syn26486828") %>%
+    read_csv()
+```
+
+```{r}
+kinomescan_reduced <- single_dose %>%
+    select(lspci_id, `DiscoveRx Gene Symbol`, hgnc_symbol, `Compound Concentration (nM)`, `Percent Control`) %>%
+    group_by(lspci_id, hgnc_symbol, `Compound Concentration (nM)`) %>%
+    summarize(`Percent Control` = min(`Percent Control`), .groups = "drop") %>%
+    semi_join(
+        tas_table %>%
+            semi_join(
+                lsp_target_dictionary %>%
+                    filter(organism == "Homo sapiens"),
+                by = "lspci_target_id"
+            ),
+        by = c("lspci_id", "hgnc_symbol" = "symbol")
+    )
+
+tas_reduced <- tas_table %>%
+    semi_join(
+        lsp_target_dictionary %>%
+            filter(organism == "Homo sapiens"),
+        by = "lspci_target_id"
+    ) %>%
+    semi_join(
+        single_dose,
+        by = c("lspci_id", "symbol" = "hgnc_symbol")
+    )
+
+tas_reduced %>%
+    group_by(lspci_id, symbol) %>%
+    arrange(lspci_id, symbol) %>%
+    filter(n() > 1) %>%
+    print(n = Inf)
+```
+
+Produce clustered heatmap of TAS values that were available for the
+OKL before we did Kinomescan.
+
+```{r}
+library(seriation)
+library(impute)
+
+tas_colors <- c(`1` = "#b2182b", `2` = "#ef8a62", `3` = "#fddbc7", `10` = "#d9d9d9")
+
+cluster_df <- function(df, row_var, col_var, value_var) {
+    mat <- df %>%
+        distinct({{row_var}}, {{col_var}}, {{value_var}}) %>%
+        pivot_wider(names_from = {{col_var}}, values_from = {{value_var}}) %>%
+        column_to_rownames(rlang::as_name(rlang::enquo(row_var)))
+    mat_imp <- impute.knn(
+        t(mat), colmax = 0.9999
+    ) %>%
+        chuck("data") %>%
+        t()
+    dist_rows <- dist(mat_imp, method = "euclidian")
+    dist_cols <- dist(t(mat_imp), method = "euclidian")
+    clust_rows <- hclust(dist_rows, method = "average") %>%
+        reorder(dist_rows, method = "olo")
+    clust_cols <- hclust(dist_cols, method = "average") %>%
+        reorder(dist_cols, method = "olo")
+    df %>%
+        mutate(
+            "{{row_var}}" := factor({{row_var}}, levels = clust_rows$labels[clust_rows$order]),
+            "{{col_var}}" := factor({{col_var}}, levels = clust_cols$labels[clust_cols$order])
+        )
+}
+
+tas_heatmap <- function(df, row_var, col_var, value_var) {
+    df %>%
+        ggplot(aes({{col_var}}, {{row_var}})) +
+        geom_raster(aes(fill = {{value_var}})) +
+        scale_fill_manual(values = tas_colors, na.value = "white") +
+        theme_minimal()
+}
+
+tas_reduced_clustered <- cluster_df(tas_reduced, lspci_id, symbol, tas) %>%
+    mutate(tas = as.factor(tas))
+p <- tas_heatmap(tas_reduced_clustered, lspci_id, symbol, tas) +
+    labs(x = "Kinase", y = "Compound", fill = "TAS") +
+    coord_equal() +
+    theme_bw() +
+    theme(
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()
+    )
+
+ggsave(
+    "plots/tas_heatmap.pdf",
+    p, width = 7, height = 3.5
+)
+```
+
+How many kinases were assayed for each compound before we did Kinomescan?
+
+```{r}
+p <- tas_reduced %>%
+    group_by(lspci_id) %>%
+    summarize(n_kinases = n_distinct(symbol), ..groups = "drop") %>%
+    ggplot(aes(n_kinases)) +
+    geom_histogram() +
+    labs(x = "Number of kinases assayed", y = "Number of compounds", title = "Initital TAS") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+```
+
