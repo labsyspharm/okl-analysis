@@ -78,7 +78,7 @@ Include Ensembl and Entrez gene IDs and UniProt IDs for each kinase.
 library(biomaRt)
 mart <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl")
 gene_symbol_to_id_map <- biomaRt::getBM(
-    attributes = c("ensembl_gene_id", "external_gene_name", "entrezgene_id", "chromosome_name"),
+    attributes = c("ensembl_gene_id", "external_gene_name", "entrezgene_id", "chromosome_name", "hgnc_symbol"),
     filters = "external_gene_name",
     values = assay_table_raw$`Entrez Gene Symbol`,
     mart = mart
@@ -102,6 +102,13 @@ gene_symbol_to_id_map_disam <- gene_symbol_to_id_map %>%
 setdiff(assay_table_raw$`Entrez Gene Symbol`, gene_symbol_to_id_map_disam$external_gene_name) %>%
     sort()
 
+gene_symbol_to_id_map_disam %>%
+    group_by(external_gene_name) %>%
+    filter(n() > 1) %>%
+    arrange(external_gene_name) %>%
+    print(n = Inf)
+# Make sure this is zero
+
 manual_map_old_symbols <- tribble(
   ~`Entrez Gene Symbol`, ~entrezgene_id, ~ensembl_gene_id,
     "ADCK4", 79934, "ENSG00000123815",
@@ -120,9 +127,19 @@ manual_map_old_symbols <- tribble(
     "pknB", 887072, NA_character_, # M. tuberculosis
     "SgK110", 100130827, "ENSG00000231274",
     "ZAK", 51776, "ENSG00000091436"
-)
+) %>%
+    left_join(
+        biomaRt::getBM(
+            attributes = c("ensembl_gene_id", "entrezgene_id", "hgnc_symbol"),
+            filters = "entrezgene_id",
+            values = .$entrezgene_id,
+            mart = mart
+        )
+    )
+
+
 gene_symbol_to_id_map_final <- gene_symbol_to_id_map_disam %>%
-    distinct(`Entrez Gene Symbol` = external_gene_name, entrezgene_id, ensembl_gene_id) %>%
+    distinct(`Entrez Gene Symbol` = external_gene_name, entrezgene_id, ensembl_gene_id, hgnc_symbol) %>%
     bind_rows(manual_map_old_symbols)
 setdiff(assay_table_raw$`Entrez Gene Symbol`, gene_symbol_to_id_map_final$`Entrez Gene Symbol`) %>%
     sort()
@@ -143,6 +160,7 @@ assay_datasheets <- assay_table_raw %>%
         `Kinase Name`,
         entrezgene_id,
         ensembl_gene_id,
+        hgnc_symbol,
         everything()
     )
 ```
@@ -167,6 +185,7 @@ synStoreMany(
             "https://www.discoverx.com/services/drug-discovery-development-services/kinase-profiling/kinomescan#kinase-assay-list"
         ),
         executed = "https://github.com/labsyspharm/okl-analysis/blob/main/eurofins_assays.Rmd"
-    )
+    ),
+    forceVersion = FALSE
 )
 ```
