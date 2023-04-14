@@ -25,11 +25,11 @@ inputs <- list(
   # hmsl_single_dose = "syn26260430",
   # hmsl_single_dose_agg = "syn26260426",
   compound_dictionary = "syn26260332",
-  kinase_info = "syn51286743"
+  kinase_info = "syn51286743",
   # references = "syn26260402",
   # target_mapping = "syn26260398",
   # target_dictionary = "syn26260394",
-  # compound_mapping = "syn26260389"
+  compound_mapping = "syn26260389"
 )
 
 input_files <- map(
@@ -42,6 +42,9 @@ single_dose <- input_files[["okl_single_dose"]] %>%
 compound_dictionary <- input_files[["compound_dictionary"]] %>%
   read_fst(as.data.table = TRUE)
 
+compound_mapping <- input_files[["compound_mapping"]] %>%
+  read_fst(as.data.table = TRUE)
+
 compound_names <- compound_dictionary %>%
   select(lspci_id, name = pref_name) %>%
   drop_na() %>%
@@ -52,7 +55,12 @@ compound_names <- compound_dictionary %>%
   # as_tibble()
 
 qpcr_misses <- syn("syn33531640") %>%
-  readxl::read_excel()
+  readxl::read_excel() %>%
+  left_join(
+    compound_mapping[, .(lspci_id, external_id)] %>%
+      unique(),
+    by = c("Compound Name" = "external_id")
+  )
 
 kinase_info <- input_files[["kinase_info"]] %>%
   read_csv()
@@ -931,16 +939,24 @@ plot_single_drug <- function(drug, target) {
     compound_dictionary[pref_name == drug][["lspci_id"]][1, 1]
   df <- single_dose %>%
     filter(lspci_id == .env$lspci_id, str_detect(`DiscoveRx Gene Symbol`, target))
+  misses <- qpcr_misses %>%
+    rename(
+      `DiscoveRx Gene Symbol` = `Ambit Gene Symbol`,
+      `Compound Concentration (nM)` = `Compound Conc`
+    ) %>%
+    filter(lspci_id == .env$lspci_id, str_detect(`DiscoveRx Gene Symbol`, target))
   p <- df %>%
     ggplot(aes(as.ordered(`Compound Concentration (nM)`), `Percent Control`)) +
-      geom_quasirandom(groupOnX = TRUE)
+      geom_quasirandom(groupOnX = TRUE) +
+      geom_point(data = misses, y = 100, color = "red", size = 3, shape = 8)
   if (length(unique(df$`DiscoveRx Gene Symbol`)) > 1)
     p <- p +
       facet_wrap(~`DiscoveRx Gene Symbol`)
   p
 }
 
-plot_single_drug("HMSL10004", "TYK2")
+p <- plot_single_drug("HMSL10004", "TYK2")
+p
 
 p <- plot_heatmap_single_drug("HMSL10139")
 withr::with_pdf(
@@ -1412,29 +1428,42 @@ pseudo_ic50_raw <- single_dose_trans %>%
   summarize(
     pseudo_ic50 = list(
       if (length(unique(below_50)) == 2 && !below_50[1]) {
-        over_under_idx <- which(below_50)[1] + c(-1, 0)
-        mdl_data <- cur_data()[over_under_idx, ]
+        over_under_50_idx <- which(below_50)[1] + c(-1, 0)
+        mdl_data <- cur_data()[over_under_50_idx, ]
         if (nrow(mdl_data) == 1)
           browser()
         mdl <- lm(`Percent Control` ~ log_conc, data = mdl_data)
         list(
           pseudo_ic50 = 10^(chemCal::inverse.predict(mdl, 50)$Prediction),
-          relation = "="
+          pseudo_ic50_relation = "=",
+          # Make sure all values beyond the IC50 value are below 50
+          # otherwise label as discordant
+          pseudo_ic50_concordant = if (
+            over_under_50_idx[2] == n() ||
+            all(tail(`Percent Control`, -over_under_50_idx[2]) < 50)
+          ) {
+            "concordant"
+          } else {
+            "discordant"
+          }
         )
       } else if (all(below_50)) {
         list(
           pseudo_ic50 = min(`Compound Concentration (nM)`),
-          relation= "<"
+          pseudo_ic50_relation= "<",
+          pseudo_ic50_concordant = "concordant"
         )
       } else if (!any(below_50)) {
         list(
           pseudo_ic50 = max(`Compound Concentration (nM)`),
-          relation= ">"
+          pseudo_ic50_relation= ">",
+          pseudo_ic50_concordant = "concordant"
         )
       } else {
         list(
           pseudo_ic50 = NA_real_,
-          relation = NA_character_
+          pseudo_ic50_relation = NA_character_,
+          pseudo_ic50_concordant = NA_character_
         )
       }
     ),
@@ -1442,9 +1471,8 @@ pseudo_ic50_raw <- single_dose_trans %>%
   )
 
 pseudo_ic50 <- pseudo_ic50_raw %>%
-  mutate(
-    pseudo_ic50_relation = map_chr(pseudo_ic50, "relation"),
-    pseudo_ic50 = map_dbl(pseudo_ic50, "pseudo_ic50")
+  unnest_wider(
+    pseudo_ic50
   ) %>%
   power_left_join(
     compound_names,
@@ -1464,3 +1492,17 @@ write_csv(
 
 ```
 
+
+```{r upload_synapse}
+synStoreMany(
+  c(
+    "classification/okl_eurofins_pseudo_ic50.csv",
+    "classification/okl_eurofins_classification.csv"
+  ),
+  parentId = "syn18508401",
+  used = unname(inputs),
+  executed = "https://github.com/labsyspharm/okl-analysis/blob/main/okl_descriptive.Rmd",
+  forceVersion = FALSE
+)
+
+```
