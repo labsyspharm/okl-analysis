@@ -76,47 +76,136 @@ pseudo_ic50_comp <- pseudo_ic50_class %>%
     by = c("lspci_id", "lspci_target_id")
   )
 
-p <- pseudo_ic50_comp %>%
+
+```
+
+Check weird cases where we have pseudo IC50 < 1000 uM but binding
+is classified as non-binding. Probably results mostly of cases
+where entire binding curve is between 50-35% control so the 35% threshold
+is never triggered but the 50% threshold for IC50 is.
+
+```{r}
+pseudo_ic50_class %>%
+    filter(pseudo_ic50 < 1000, classification == "non-binding", pseudo_ic50_concordant == "concordant")
+
+```
+
+
+```{r}
+
+class_colors <- c(
+    "binding" = "firebrick1",
+    "weakly-binding" = "darkorange",
+    "non-binding" = "black",
+    "undetermined" = "gray",
+    "discordant" = "blue"
+)
+
+p_scatter <- pseudo_ic50_comp %>%
+  drop_na(pseudo_ic50) %>%
   filter(
     # pseudo_ic50_relation == "=",
+    pseudo_ic50_concordant == "concordant",
     classification != "discordant"
   ) %>%
   ggplot(
     # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
     aes(value, pseudo_ic50, color = classification)
   ) +
-  geom_point(alpha = 0.5) +
-  scale_x_log10() +
-  scale_y_log10() +
+  scale_color_manual(values = class_colors) +
+  geom_point(alpha = 0.5, shape = 16, size = 1) +
+  scale_x_log10(labels = scales::label_number(big.mark = "")) +
+  scale_y_log10(labels = scales::label_number(big.mark = "")) +
+  coord_equal() +
   labs(
     x = "IC50 (ChEMBL)",
     y = "Pseudo-IC50 (KINOMEscan)"
   )
 
 ggsave(
-    "plots/chembl_ic50_vs_kinomescan_pseudo_ic50.pdf", p,
-    width = 10, height = 7
+    "plots/chembl_ic50_vs_kinomescan_pseudo_ic50.pdf", p_scatter,
+    width = 8, height = 3
 )
 
 library(ggbeeswarm)
-p <- pseudo_ic50_comp %>%
+library(ggtext)
+library(glue)
+
+class_labels <- glue_data(
+  distinct(pseudo_ic50_comp, classification) %>%
+    filter(classification != "discordant"),
+  "<span style='color: {class_colors[classification]}'>{classification}</span>"
+) %>%
+  set_names(
+    distinct(pseudo_ic50_comp, classification) %>%
+      filter(classification != "discordant") %>%
+      pull(classification)
+  )
+
+p_beeswarm <- pseudo_ic50_comp %>%
   filter(
+    pseudo_ic50_concordant == "concordant",
     # pseudo_ic50_relation == "=",
     classification != "discordant"
   ) %>%
   ggplot(
     aes(value, classification, color = classification)
   ) +
-  geom_quasirandom(groupOnX = FALSE) +
+  geom_quasirandom(groupOnX = FALSE, shape = 16, size = 1) +
   geom_boxplot(fill = NA) +
-  scale_x_log10() +
+  scale_x_log10(labels = scales::label_number(big.mark = "")) +
+  scale_y_discrete(labels = class_labels) +
+  theme(axis.text.y = element_markdown(hjust = 1)) +
   labs(x = "IC50 (ChEMBL)", y = NULL)
 
 ggsave(
-    "plots/chembl_ic50_by_kinomescan_class_beeswarm.pdf", p,
+    "plots/chembl_ic50_by_kinomescan_class_beeswarm.pdf", p_beeswarm,
     width = 7, height = 3
 )
 
+library(patchwork)
+# p_combined <- wrap_plots(
+#     p_scatter +
+#         labs(x = NULL) +
+#         theme(
+#             axis.text.x = element_blank(),
+#             plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
+#         ),
+#     p_beeswarm +
+#         guides(color = "none") +
+#         theme(
+#             plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm")
+#         ),
+#     ncol = 1,
+#     nrow = 2,
+#     heights = c(2, 1),
+#     guides = "collect"
+# )
+p_combined <- egg::ggarrange(
+    p_scatter +
+        labs(x = NULL) +
+        guides(color = "none") +
+        theme(
+            axis.text.x = element_blank(),
+            plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
+        ),
+    p_beeswarm +
+        coord_fixed(ratio = .2) +
+        theme(
+            plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm"),
+            legend.position = "bottom"
+        ),
+    nrow = 2,
+    heights = c(2, 1)
+)
+
+ggsave(
+    "plots/chembl_ic50_by_comparison_combined.pdf", p_combined,
+    width = 8, height = 5
+)
+```
+
+```{r}
 pseudo_ic50_comp %>%
   filter(
     pseudo_ic50_relation == "=",
@@ -221,19 +310,4 @@ pwalk(
     )
   }
 )
-```
-
-
-```{r upload_synapse}
-synStoreMany(
-  c(
-    "classification/okl_eurofins_pseudo_ic50.csv",
-    "classification/okl_eurofins_classification.csv"
-  ),
-  parentId = "syn18508401",
-  used = unname(inputs),
-  executed = "https://github.com/labsyspharm/okl-analysis/blob/main/okl_descriptive.Rmd",
-  forceVersion = FALSE
-)
-
 ```
