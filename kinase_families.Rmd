@@ -1,0 +1,279 @@
+
+```{r}
+library(tidyverse)
+library(synExtra)
+library(fst)
+library(data.table)
+library(powerjoin)
+
+synapser::synLogin()
+
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+```{r}
+kinomescan_pseudo_ic50s <- syn("syn51080578") %>%
+  read_csv()
+
+kinomescan_classes <- syn("syn51080579") %>%
+  read_csv()
+
+kinomescan_kinase_info <- syn("syn51286743") %>%
+  read_csv()
+
+single_dose <- syn("syn26486828") %>%
+  fread()
+
+download.file("https://github.com/sorgerlab/famplex/raw/43732660e42fd1746c2d1e61552bda0a90cbd664/relations.csv", destfile = "~/data/famplex_relations.csv")
+famplex_relations <- read_csv("~/data/famplex_relations.csv", col_names = c("namespace", "id", "relation", "family_namespace", "family"))
+```
+
+Extract the kinases from the famplex relations.
+
+Use list of preselected family kinases
+
+```{r}
+famplex_kinases <- famplex_relations %>%
+  filter(
+    relation == "isa",
+    id %in% kinomescan_kinase_info$hgnc_symbol,
+    family %in% c(
+      "AKT", "AMPK_alpha", "CDK", "CSNK1",
+      "ERK", "FGFR", "GSK3", "PDGFR", "ERBB",
+      "JAK", "P90RSK", "MAP3K", "TAOK", "MAP2K",
+      "PAK", "ROCK", "p38", "ADRBK", "DDR", "EPHA",
+      "EPHB", "GRK", "IKK_family", "JNK", "NTRK",
+      "PKC", "SRC", "VEGFR", "PIM", "SIK", "DYRK",
+      "RSTK1", "RSTK2", "DAPK", "CLK", "RIPK", "PKN", "LATS"
+    )
+  ) %>%
+  distinct(hgnc_symbol = id, family) %>%
+  # manually add HIP kinases
+  bind_rows(
+    tibble(
+      hgnc_symbol = c("HIPK1", "HIPK2", "HIPK3", "HIPK4"),
+      family = "HIP"
+    )
+  )
+```
+
+Clean pseudo IC50s by retaining only concordant values and dose-response curves
+that are not discordant.
+
+```{r}
+pseudo_ic50s_clean <- kinomescan_pseudo_ic50s %>%
+  # filter(
+  #   pseudo_ic50_concordant == "concordant"
+  # ) %>%
+  inner_join(
+    kinomescan_classes %>%
+      filter(
+        classification != "discordant"
+      ) %>%
+      select(lspci_id, `DiscoveRx Gene Symbol`, classification)
+  ) %>%
+  # Remove any mutants
+  inner_join(
+    kinomescan_kinase_info %>%
+      filter(`Kinase Form` == "Wild Type") %>%
+      select(`DiscoveRx Gene Symbol`, hgnc_symbol)
+  ) %>%
+  # Select kinase form (complex or PTM) with the strongest inhibition
+  filter(
+    `DiscoveRx Gene Symbol` %in% {
+      group_by(., `DiscoveRx Gene Symbol`, hgnc_symbol) %>%
+        summarize(
+          frac_binding = sum(classification == "binding") / n(),
+          .groups = "drop"
+        ) %>%
+        group_by(hgnc_symbol) %>%
+        arrange(desc(frac_binding)) %>%
+        slice_head(n = 1) %>%
+        pull(`DiscoveRx Gene Symbol`)
+    }
+  ) %>%
+  # group_by(lspci_id, name, hgnc_symbol, `Entrez Gene Symbol`) %>%
+  # arrange(classification == "binding", pseudo_ic50) %>%
+  # slice_head(n = 1) %>%
+  # ungroup() %>%
+  power_inner_join(
+    famplex_kinases %>%
+      select(hgnc_symbol, family),
+    check = check_specs(
+      duplicate_keys_right = "warn"
+    )
+  )
+```
+
+Compute number of compounds inhibiting each kinase
+
+```{r}
+kinase_stats <- pseudo_ic50s_clean %>%
+  group_by(hgnc_symbol, family, `DiscoveRx Gene Symbol`) %>%
+  summarize(
+    n_binding = sum(classification == "binding"),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_binding))
+```
+
+Group kinases by family and compute some summary stats for each family member,
+like the number of compounds inhibiting it
+
+```{r}
+kinase_stats_by_family <- kinase_stats %>%
+  mutate(
+    across(c(hgnc_symbol, `DiscoveRx Gene Symbol`), fct_inorder),
+    family = factor(
+      family,
+      levels = group_by(., family) %>%
+        summarize(max_spread = max(n_binding) - min(n_binding), .groups = "drop") %>%
+        arrange(desc(max_spread)) %>%
+        pull(family)
+    )
+  )
+
+library(ggpattern)
+library(ggrastr)
+p <- kinase_stats_by_family %>%
+  inner_join(
+    kinomescan_kinase_info %>%
+      select(`DiscoveRx Gene Symbol`, `Expression System`, `Kinase Construct`) %>%
+      mutate(across(`DiscoveRx Gene Symbol`, factor, levels = kinase_stats$`DiscoveRx Gene Symbol`))
+  ) %>%
+  mutate(
+    across(c(`Kinase Construct`, `Expression System`), factor),
+  ) %>%
+  ggplot(
+    aes(
+      x = `DiscoveRx Gene Symbol`,
+      y = n_binding,
+      fill = `Expression System`,
+      pattern = `Kinase Construct`
+    )
+  ) +
+    coord_flip() +
+    # geom_col() +
+    geom_col_pattern(color = "black") +
+    scale_pattern_manual(values = c("Full Length" = "none", "Partial Length" = "circle")) +
+    facet_wrap(~family, scales = "free") +
+    theme_minimal() +
+    theme(legend.key.size = unit(1, "cm")) +
+    labs(x = "Kinase", y = "Number of compounds inhibiting kinase")
+
+ggsave(
+  "plots/kinase_families_n_binding.pdf", p,
+  width = 16,
+  height = 12,
+)
+```
+
+```{r}
+library(seriation)
+co_cluster_mats <- function(mats) {
+  set.seed(42)
+  dms <- map(mats, dist, method = "euclidean")
+  dm <- reduce(dms, `+`)
+  cr <- hclust(dm, method = "average") %>%
+    reorder(dm, method = "olo")
+  cr
+}
+
+cluster_mat <- function(mat) {
+  set.seed(42)
+  dr <- dist(mat, method = "euclidean")
+  cr <- hclust(dr, method = "average") %>%
+    reorder(dr, method = "olo")
+  cr
+}
+
+library(pheatmap)
+plot_mat <- function(mat, cr = NULL, cc = NULL) {
+  viridis_map <- viridis::plasma(100)
+  pheatmap::pheatmap(
+    mat,
+    show_rownames = FALSE, show_colnames = TRUE,
+    color = rev(viridis_map),
+    cluster_rows = if (is.null(cr)) cluster_mat(mat) else cr,
+    cluster_cols = if (is.null(cc)) cluster_mat(t(mat)) else cc,
+    treeheight_row = 20, treeheight_col = 20,
+    silent = TRUE
+  )
+}
+
+generate_mat <- function(targets) {
+  all_doses <- single_dose %>%
+    filter(
+      `DiscoveRx Gene Symbol` %in% targets
+    ) %>%
+    select(
+      lspci_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`, `Percent Control`
+    ) %>%
+    arrange(lspci_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`) %>%
+    group_by(`Compound Concentration (nM)`) %>%
+    filter(n() > 10) %>%
+    ungroup()
+  measured_in_all <- all_doses %>%
+    group_by(lspci_id) %>%
+    summarize(
+      n = n(),
+      .groups = "drop"
+    ) %>%
+    filter(n == max(n)) %>%
+    pull(lspci_id)
+  all_doses_mats <- all_doses %>%
+    mutate(across(`Compound Concentration (nM)`, ~factor(as.character(.x), levels = as.character(sort(unique(.x)))))) %>%
+    mutate(
+      across(`Compound Concentration (nM)`, fct_relabel, paste0, " nM")
+    ) %>%
+    filter(lspci_id %in% measured_in_all) %>%
+    group_by(`Compound Concentration (nM)`) %>%
+    filter(n() > 10) %>%
+    summarize(
+      mat = cur_data() %>%
+        pivot_wider(names_from = `DiscoveRx Gene Symbol`, values_from = `Percent Control`) %>%
+        column_to_rownames("lspci_id") %>%
+        as.matrix() %>%
+        list(),
+      .groups = "drop"
+    ) %>% {
+      set_names(.$mat, .$`Compound Concentration (nM)`)
+    }
+  # all_doses_mats
+  heatmaps <- map(all_doses_mats, plot_mat, cr = co_cluster_mats(all_doses_mats), cc = co_cluster_mats(map(all_doses_mats, t)))
+  # patchwork::wrap_plots(map(heatmaps, "gtable"))
+  # egg::ggarrange(
+  #   plots = map(heatmaps, "gtable"),
+  #   labels = names(heatmaps)
+  # )
+  cowplot::plot_grid(
+    plotlist = map(heatmaps, "gtable"),
+    labels = names(heatmaps)
+  )
+  # do.call(gridExtra::grid.arrange, heatmaps)
+  # heatmaps
+}
+```
+
+
+```{r}
+heatmaps <- generate_mat(
+  kinase_stats %>%
+    filter(family == "HIP") %>%
+    pull(`DiscoveRx Gene Symbol`)
+)
+
+dir.create("plots/kinase_families_heatmaps", showWarnings = FALSE)
+walk(
+  kinase_stats$family %>%
+    unique(),
+    ~ggsave(
+      paste0("plots/kinase_families_heatmaps/", .x, ".pdf"),
+      generate_mat(
+        kinase_stats %>%
+          filter(family == .x) %>%
+          pull(`DiscoveRx Gene Symbol`)
+      )
+    )
+)
+```
