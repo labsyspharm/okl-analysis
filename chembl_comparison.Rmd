@@ -18,11 +18,22 @@ kinomescan_pseudo_ic50s <- syn("syn51080578") %>%
 kinomescan_classes <- syn("syn51080579") %>%
     read_csv()
 
-# kinomescan_kinase_info <- syn("syn51286743") %>%
-#     read_csv()
+kinomescan_kinase_info <- syn("syn51286743") %>%
+    read_csv()
 
-# single_dose <- syn("syn26486828") %>%
-#     read_csv()
+single_dose <- syn("syn26486828") %>%
+    read_csv()
+
+compound_mapping <- syn("syn26260389") %>%
+  read_fst(as.data.table = TRUE)
+
+qpcr_misses <- syn("syn33531640") %>%
+  readxl::read_excel() %>%
+  left_join(
+    compound_mapping[, .(lspci_id, external_id)] %>%
+      unique(),
+    by = c("Compound Name" = "external_id")
+  )
 
 lsp_biochem <- syn("syn25173511") %>%
   read_fst()
@@ -134,7 +145,7 @@ library(glue)
 class_labels <- glue_data(
   distinct(pseudo_ic50_comp, classification) %>%
     filter(classification != "discordant"),
-  "<span style='color: {class_colors[classification]}'>{classification}</span>"
+  "<span style='font-weight: bold; color: {class_colors[classification]}'>{classification}</span>"
 ) %>%
   set_names(
     distinct(pseudo_ic50_comp, classification) %>%
@@ -148,14 +159,23 @@ p_beeswarm <- pseudo_ic50_comp %>%
     # pseudo_ic50_relation == "=",
     classification != "discordant"
   ) %>%
+  mutate(
+    classification = factor(
+      classification,
+      levels = c("binding", "weakly-binding", "undetermined", "non-binding") %>%
+        rev()
+    )
+  ) %>%
   ggplot(
     aes(value, classification, color = classification)
   ) +
-  geom_quasirandom(groupOnX = FALSE, shape = 16, size = 1) +
-  geom_boxplot(fill = NA) +
+  geom_quasirandom(groupOnX = FALSE, shape = 16, size = 1, alpha = 0.5) +
+  geom_boxplot(fill = NA, outlier.shape = NA) +
+  scale_color_manual(values = class_colors) +
+  guides(color = "none") +
   scale_x_log10(labels = scales::label_number(big.mark = "")) +
   scale_y_discrete(labels = class_labels) +
-  theme(axis.text.y = element_markdown(hjust = 1)) +
+  theme(axis.text.y = element_markdown()) +
   labs(x = "IC50 (ChEMBL)", y = NULL)
 
 ggsave(
@@ -190,25 +210,26 @@ p_combined <- egg::ggarrange(
             plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
         ),
     p_beeswarm +
-        coord_fixed(ratio = .2) +
+        coord_fixed(ratio = .32) +
         theme(
             plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm"),
             legend.position = "bottom"
         ),
     nrow = 2,
-    heights = c(2, 1)
+    heights = c(2, 1.2)
 )
 
 ggsave(
     "plots/chembl_ic50_by_comparison_combined.pdf", p_combined,
-    width = 8, height = 5
+    width = 8, height = 4.5
 )
 ```
 
 ```{r}
 pseudo_ic50_comp %>%
   filter(
-    pseudo_ic50_relation == "=",
+    pseudo_ic50_concordant == "concordant",
+    # pseudo_ic50_relation == "=",
     classification != "discordant"
   ) %>%
   group_by(classification) %>%
@@ -219,7 +240,7 @@ pseudo_ic50_comp %>%
       list(
         # average = ~10^(mean(log10(.x))),
         # ci = ~list(10^DescTools::MeanCI(log10(.x)))
-        ci = ~list(10^quantile(log10(.x), c(.05, .5, .95)))
+        ci = ~list(10^quantile(log10(.x), c(.05, .5, .95), na.rm = TRUE))
       )
     ),
     .groups = "drop"
@@ -249,6 +270,23 @@ pseudo_ic50_comp_left %>%
 ```
 
 ```{r ic50_single_dose_comp}
+single_dose_trans <- single_dose %>%
+  left_join(
+    qpcr_misses %>%
+      transmute(
+        hmsl_id = `Compound Name`,
+        `DiscoveRx Gene Symbol` = `Ambit Gene Symbol`,
+        `Compound Conc`,
+        qpcr_miss = TRUE
+      ),
+    by = c("hmsl_id", "DiscoveRx Gene Symbol", "Compound Concentration (nM)" = "Compound Conc")
+  ) %>%
+  mutate(
+    log_inhibition = log10(`Percent Control` + 0.01),
+    qpcr_miss = replace_na(qpcr_miss, FALSE)
+  ) %>%
+  as_tibble()
+
 
 single_dose_comp <- single_dose_trans %>%
   power_left_join(
@@ -266,7 +304,99 @@ single_dose_comp <- single_dose_trans %>%
   inner_join(
     lsp_biochem,
     by = c("lspci_id", "lspci_target_id")
+  ) %>%
+  power_left_join(
+    kinomescan_classes %>%
+      distinct(lspci_id, `DiscoveRx Gene Symbol`, classification) %>%
+      mutate(across(classification, factor, levels = names(class_colors))),
+    by = c("lspci_id", "DiscoveRx Gene Symbol"),
+    check = check_specs(
+      duplicate_keys_left = "ignore",
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn"
+    )
   )
+
+p <- single_dose_comp %>%
+  mutate(
+    percent_control_zero = `Percent Control` == 0,
+    percent_control_trans = if_else(
+      percent_control_zero,
+      0.5 * min(`Percent Control`[`Percent Control` > 0]),
+      `Percent Control`
+    ),
+    value = pmin(value, 30000)
+  ) %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  filter(n() > 1000) %>%
+  ungroup() %>%
+  filter(
+    !qpcr_miss
+  ) %>%
+  ggplot(
+    aes(value, `Percent Control`)
+  ) +
+  # ggrastr::rasterize(geom_point(alpha = 0.5)) +
+  ggrastr::rasterize(
+    ggpointdensity::geom_pointdensity(alpha = 0.5, shape = 16, adjust = 2),
+    dev = "ragg",
+    dpi = 300
+  ) +
+  # scale_shape_manual(values = c(`TRUE` = 4, `FALSE` = 16)) +
+  scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000, 10000), labels = scales::label_number()) +
+  scale_color_viridis_c(trans = scales::log10_trans(), option = "magma") +
+  facet_grid(classification ~ `Compound Concentration (nM)`)
+
+ggsave(
+  "plots/single_dose_vs_chembl_ic50_all_doses.pdf", p,
+  width = 10, height = 10
+)
+
+ps <- single_dose_comp %>%
+  mutate(
+    percent_control_zero = `Percent Control` == 0,
+    percent_control_trans = if_else(
+      percent_control_zero,
+      0.5 * min(`Percent Control`[`Percent Control` > 0]),
+      `Percent Control`
+    ),
+    value = pmin(value, 30000)
+  ) %>%
+  filter(
+    !qpcr_miss
+  ) %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  summarize(
+    plot = list(
+      # ggplot(cur_data(), aes(value, percent_control_trans, shape = percent_control_zero)) +
+      ggplot(cur_data(), aes(value, `Percent Control`, color = classification)) +
+        geom_point(alpha = 0.5, shape = 16) +
+        scale_color_manual(values = class_colors) +
+        # scale_shape_manual(
+        #   values = c(`TRUE` = 25, `FALSE` = 16)
+        # ) +
+        scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000, 10000), labels = scales::label_number()) +
+        # scale_y_log10() +
+        guides(shape = "none") +
+        labs(
+          x = "IC50 ChEMBL (nM)",
+          y = "% control Eurofins",
+          title = paste("Compound concentration", cur_group()$`Compound Concentration (nM)`, "nM")
+        )
+    )
+  )
+
+pwalk(
+  ps,
+  function(`Compound Concentration (nM)`, plot, ...) {
+    ggsave(
+      paste0("plots/single_dose_vs_chembl_ic50_", `Compound Concentration (nM)`, "nM_with_class.pdf"),
+      plot,
+      width = 8, height = 6
+    )
+  }
+)
 
 
 ps <- single_dose_comp %>%
@@ -279,7 +409,9 @@ ps <- single_dose_comp %>%
     ),
     value = pmin(value, 30000)
   ) %>%
-  filter(!qpcr_miss) %>%
+  filter(
+    !qpcr_miss
+  ) %>%
   group_by(`Compound Concentration (nM)`) %>%
   summarize(
     plot = list(
@@ -311,3 +443,209 @@ pwalk(
   }
 )
 ```
+
+Testing if there are any kinases or compounds that are particularly discordant
+compared to the ChEBML data.
+
+First, establishing the Percent Control thresholds necessary to ensure a 95%
+probability that the ChEMBL IC50 is below 5000 nM.
+
+To do that, first plot for each possible Percent Control threshold what proportion
+of IC50s is below 5000 nM.
+
+
+```{r}
+percent_control_threshold_plotting_data <- single_dose_comp %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  filter(n() > 1000) %>%
+  ungroup() %>%
+  filter(
+    classification != "discordant",
+    !qpcr_miss
+  ) %>%
+  # crossing(ic_50_threshold = 10**seq(2, 4, length.out = 6)) %>%
+  crossing(ic_50_threshold = c(100, 200, 500, 1000, 5000, 10000)) %>%
+  group_by(`Compound Concentration (nM)`, ic_50_threshold) %>%
+  arrange(`Percent Control`) %>%
+  mutate(
+    cumsum_below_threshold = cumsum(value < ic_50_threshold),
+    frac_below_threshold = cumsum_below_threshold / seq_len(n())
+  ) %>%
+  ungroup() %>%
+  group_by(`Compound Concentration (nM)`, `Percent Control`, ic_50_threshold) %>%
+  slice_tail(n = 1) %>%
+  ungroup()
+
+p <- percent_control_threshold_plotting_data %>%
+  mutate(across(c(ic_50_threshold, `Compound Concentration (nM)`), ~as.character(.x) %>% fct_inseq(ordered = TRUE))) %>%
+  ggplot(aes(`Percent Control`, frac_below_threshold, color = `Compound Concentration (nM)`)) +
+  geom_line() +
+  # geom_point() +
+  facet_wrap(~ic_50_threshold) +
+  labs(y = "Fraction of measurements below IC50 threshold")
+
+ggsave(
+  "plots/percent_control_below_ic50_threshold_no_discordant.pdf", p,
+  width = 8, height = 4
+)
+
+```
+
+
+```{r}
+pseudo_ic50_comp_stats <- pseudo_ic50_comp %>%
+  drop_na(pseudo_ic50) %>%
+  filter(classification != "discordant") %>%
+  mutate(
+      log10_ic50 = log10(value),
+      log10_pseudo_ic50 = log10(pseudo_ic50),
+      log_ic50_diff = log10_ic50 - log10_pseudo_ic50,
+      diff_greater_than_1 = abs(log_ic50_diff) > 1,
+      difference_class = case_when(
+          log_ic50_diff > 1 ~ "FP",
+          log_ic50_diff < -1 ~ "FN",
+          TRUE ~ "concordant"
+      )
+  )
+```
+
+
+```{r}
+stats_per_group <- function(grouped_df) {
+    grouped_df %>%
+    summarize(
+        n = n(),
+        n_binding_class = sum(classification == "binding"),
+        frac_binding_class = n_binding_class / n,
+        n_diff_greater_than_1 = sum(diff_greater_than_1, na.rm = TRUE),
+        frac_diff_greater_than_1 = n_diff_greater_than_1 / n,
+        mean_log_ic50_diff = mean(log_ic50_diff, na.rm = TRUE),
+        sd_log_ic50_diff = sd(log_ic50_diff, na.rm = TRUE),
+        n_false_positives = sum(difference_class == "FP", na.rm = TRUE),
+        n_false_negatives = sum(difference_class == "FN", na.rm = TRUE),
+        frac_false_positives = n_false_positives / n,
+        frac_false_negatives = n_false_negatives / n,
+        .groups = "drop"
+    )
+}
+
+pseudo_ic50_comp_stats_per_compound <- pseudo_ic50_comp_stats %>%
+    group_by(lspci_id, name) %>%
+    filter(n() > 10) %>%
+    stats_per_group()
+```
+
+```{r}
+library(ggrepel)
+p <- pseudo_ic50_comp_stats_per_compound %>%
+  mutate(
+    outside_prediction_interval = {
+      mdl <- lm(
+        frac_diff_greater_than_1 ~ frac_binding_class,
+        data = .
+      )
+      pred_interval <- predict(mdl, interval = "prediction", level = 0.8)
+      frac_diff_greater_than_1 < pred_interval[, "lwr"] | frac_diff_greater_than_1 > pred_interval[, "upr"]
+    }
+  ) %>%
+  ggplot(
+    aes(
+      frac_binding_class, frac_diff_greater_than_1,
+      text = name
+    )
+  ) +
+    geom_point(shape = 16) +
+    geom_text_repel(
+      aes(label = name),
+      data = ~.x %>%
+        mutate(name = if_else(!outside_prediction_interval, "", name)),
+      # min.segment.length = 0,
+      max.overlaps = Inf,
+    ) +
+    guides(color = "none") +
+    labs(
+        x = "Fraction of 'binding' dose-response curves",
+        y = "Fraction of pseudo IC50s with >10x difference",
+        title = "Per compound"
+    )
+
+
+plotly::ggplotly(p)
+
+ggsave(
+    "plots/eurofins_ic50_vs_kinomescan_pseudo_ic50_differences_per_compound.pdf", p,
+    width = 10, height = 7
+)
+```
+
+Now do the same per kinase
+
+```{r}
+
+pseudo_ic50_comp_stats_per_kinase <- pseudo_ic50_comp_stats %>%
+    group_by(`DiscoveRx Gene Symbol`) %>%
+    filter(n() > 10) %>%
+    stats_per_group() %>%
+    inner_join(
+      kinomescan_kinase_info
+    )
+```
+
+```{r}
+lm(
+  frac_diff_greater_than_1 ~ frac_binding_class,
+  data = pseudo_ic50_comp_stats_per_kinase
+) %>%
+  summary()
+
+cor.test(
+  ~frac_diff_greater_than_1 + frac_binding_class,
+  data = pseudo_ic50_comp_stats_per_kinase
+)
+
+p <- pseudo_ic50_comp_stats_per_kinase %>%
+  mutate(
+    outside_prediction_interval = {
+      mdl <- lm(
+        frac_diff_greater_than_1 ~ frac_binding_class,
+        data = .
+      )
+      pred_interval <- predict(mdl, interval = "prediction", level = 0.8)
+      frac_diff_greater_than_1 < pred_interval[, "lwr"] | frac_diff_greater_than_1 > pred_interval[, "upr"]
+    }
+  ) %>%
+  ggplot(
+    aes(
+      frac_binding_class, frac_diff_greater_than_1,
+      color = `Kinase Form` == "Wild Type",
+      text = `DiscoveRx Gene Symbol`
+    )
+  ) +
+    geom_point(shape = 16) +
+    geom_text_repel(
+      aes(label = `DiscoveRx Gene Symbol`),
+      data = ~.x %>%
+        mutate(`DiscoveRx Gene Symbol` = if_else(!outside_prediction_interval, "", `DiscoveRx Gene Symbol`)),
+      # min.segment.length = 0,
+      max.overlaps = Inf,
+      box.padding = 0.5,
+      max.iter = 50000, max.time = 50,
+      force = 1.5,
+      seed = 42
+    ) +
+    guides(color = "none") +
+    labs(
+        x = "Fraction of 'binding' dose-response curves",
+        y = "Fraction of pseudo IC50s with >10x difference",
+        title = "Per kinase"
+    )
+
+plotly::ggplotly(p)
+
+ggsave(
+    "plots/eurofins_ic50_vs_kinomescan_pseudo_ic50_differences_per_kinase.pdf", p,
+    width = 10, height = 7
+)
+```
+
+
