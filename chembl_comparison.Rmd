@@ -300,11 +300,7 @@ single_dose_comp <- single_dose_trans %>%
       unmatched_keys_left = "warn",
       unmatched_keys_right = "ignore"
     )
-  ) %>%
-  inner_join(
-    lsp_biochem,
-    by = c("lspci_id", "lspci_target_id")
-  ) %>%
+  )  %>%
   power_left_join(
     kinomescan_classes %>%
       distinct(lspci_id, `DiscoveRx Gene Symbol`, classification) %>%
@@ -316,6 +312,10 @@ single_dose_comp <- single_dose_trans %>%
       unmatched_keys_left = "warn",
       unmatched_keys_right = "warn"
     )
+  ) %>%
+  inner_join(
+    lsp_biochem,
+    by = c("lspci_id", "lspci_target_id")
   )
 
 p <- single_dose_comp %>%
@@ -648,4 +648,535 @@ ggsave(
 )
 ```
 
+Establish confidence intervals for IC50 values given the Eurofins data
+
+Doing it in bins of %control values as well as cumulatively
+
+```{r}
+single_dose_comp_binned <- single_dose_comp %>%
+  mutate(
+    percent_control_bin = cut(
+      `Percent Control`,
+      breaks = c(-Inf, seq(from = 10, to = 90, by = 10), Inf)
+    ),
+    ic_50_bin = cut(
+      value,
+      breaks = c(-Inf, 10**seq(-1, 4), Inf)
+    )
+  )
+
+percent_control_ic50_ci <- single_dose_comp_binned %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  filter(n() > 1000) %>%
+  ungroup() %>%
+  filter(
+    classification != "discordant",
+    !qpcr_miss
+  ) %>%
+  group_by(`Compound Concentration (nM)`, percent_control_bin) %>%
+  summarize(
+    n = n(),
+    ci = quantile(value, probs = c(0.05, .5, 0.95)) %>%
+      enframe("quantile", "value") %>%
+      # pivot_wider(names_from = quantile, values_from = value, names_prefix = "ci_") %>%
+      list(),
+    .groups = "drop"
+  ) %>%
+  unnest(ci)
+
+p <- percent_control_ic50_ci %>%
+  ggplot(
+    aes(percent_control_bin, value, color = quantile, group = quantile)
+  ) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~`Compound Concentration (nM)`) +
+  scale_y_log10()
+
+percent_control_ic50_ci_ic50 <- single_dose_comp_binned %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  filter(n() > 1000) %>%
+  ungroup() %>%
+  filter(
+    classification != "discordant",
+    !qpcr_miss
+  ) %>%
+  group_by(`Compound Concentration (nM)`, ic_50_bin) %>%
+  summarize(
+    n = n(),
+    ci = quantile(`Percent Control`, probs = c(0.05, .25, .5, .75, 0.95)) %>%
+      enframe("quantile", "value") %>%
+      # pivot_wider(names_from = quantile, values_from = value, names_prefix = "ci_") %>%
+      list(),
+    .groups = "drop"
+  ) %>%
+  unnest(ci)
+
+p <- percent_control_ic50_ci_ic50 %>%
+  ggplot(
+    aes(ic_50_bin, value, color = quantile, group = quantile)
+  ) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~`Compound Concentration (nM)`) +
+  scale_y_log10()
+
+p <- single_dose_comp_binned %>%
+  ggplot(
+    aes(ic_50_bin, value)
+  ) +
+  ggrastr::rasterize(geom_beeswarm()) +
+  facet_wrap(~`Compound Concentration (nM)`) +
+  scale_y_log10()
+
+
+p <- single_dose_comp_binned %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  filter(n() > 1000) %>%
+  ungroup() %>%
+  mutate(
+    across(
+      `Compound Concentration (nM)`,
+      ~ordered(
+        .x,
+        levels = sort(unique(.x)),
+        labels = paste0(sort(unique(.x)), " nM")
+      )
+    )
+  ) %>%
+  filter(
+    classification != "discordant",
+    !qpcr_miss
+  ) %>%
+  ggplot(
+    aes(
+      `Percent Control`, value,
+      color = after_stat(quantile) %>% {
+        factor(
+          .,
+          levels = sort(unique(.)),
+          labels = scales::label_percent()(sort(unique(.)))
+        )
+      }
+      # color = fct_inseq(as.character(after_stat(quantile)), ordered = TRUE)
+    )
+  ) +
+  geom_quantile(
+    method = "rqss",
+    quantiles = c(.05, .25, .5, .75, .95),
+    lambda = 10
+  ) +
+  # geom_point() +
+  # geom_smooth(method = "lm", se = FALSE) +
+  scale_y_log10(
+    breaks = 10**(0:4)
+  ) +
+  scale_color_manual(
+    values = c(
+      "5%" = "red",
+      "25%" = "orange",
+      "50%" = "black",
+      "75%" = "orange",
+      "95%" = "red"
+    )
+  ) +
+  labs(
+    x = "% control (Eurofins)",
+    y = "IC50 (ChEMBL)",
+    color = "Quantile"
+  ) +
+  facet_wrap(~`Compound Concentration (nM)`)
+
+ggsave(
+  "plots/percent_control_ic50_ci_quantile_plot.pdf",
+  p, width = 8, height = 6
+)
+
+p <- single_dose_comp_binned %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  filter(n() > 1000) %>%
+  ungroup() %>%
+  mutate(
+    across(
+      `Compound Concentration (nM)`,
+      ~ordered(
+        .x,
+        levels = sort(unique(.x)),
+        labels = paste0(sort(unique(.x)), " nM")
+      )
+    )
+  ) %>%
+  filter(
+    classification != "discordant",
+    !qpcr_miss
+  ) %>%
+  ggplot(
+    aes(
+      value, `Percent Control`,
+      color = after_stat(quantile) %>% {
+        factor(
+          .,
+          levels = sort(unique(.)),
+          labels = scales::label_percent()(sort(unique(.)))
+        )
+      }
+      # color = fct_inseq(as.character(after_stat(quantile)), ordered = TRUE)
+    )
+  ) +
+  geom_quantile(
+    method = "rqss",
+    quantiles = c(.05, .25, .5, .75, .95),
+    lambda = 10
+  ) +
+  # geom_point() +
+  # geom_smooth(method = "lm", se = FALSE) +
+  scale_x_log10(
+    breaks = 10**(0:4)
+  ) +
+  scale_color_manual(
+    values = c(
+      "5%" = "red",
+      "25%" = "orange",
+      "50%" = "black",
+      "75%" = "orange",
+      "95%" = "red"
+    )
+  ) +
+  labs(
+    x = "IC50 (ChEMBL)",
+    y = "% control (Eurofins)",
+    color = "Quantile"
+  ) +
+  facet_wrap(~`Compound Concentration (nM)`)
+
+ggsave(
+  "plots/percent_control_ic50_ci_quantile_plot_reverse.pdf",
+  p, width = 8, height = 6
+)
+```
+
+```{r}
+IC50_THRESHOLDS <- c(100, 1000, 5000)
+library(ROCit)
+
+single_dose_comp_binned_filtered <- single_dose_comp_binned %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  filter(n() > 1000) %>%
+  ungroup() %>%
+  mutate(
+    across(
+      `Compound Concentration (nM)`,
+      ~ordered(
+        .x,
+        levels = sort(unique(.x)),
+        labels = paste0(sort(unique(.x)), " nM")
+      )
+    )
+  ) %>%
+  filter(
+    classification != "discordant",
+    !qpcr_miss
+  )
+
+single_dose_comp_rocs <- single_dose_comp_binned_filtered %>%
+  crossing(
+    ic50_threshold = IC50_THRESHOLDS
+  ) %>%
+  group_by(`Compound Concentration (nM)`, ic50_threshold) %>%
+  summarize(
+    roc = rocit(
+      100 - `Percent Control`,
+      value < cur_group()$ic50_threshold,
+      method = "empirical"
+    ) %>%
+      list(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # roc_ci = map(roc, ciROC),
+    roc_measures = map(
+      roc,
+      ~measureit(.x, measure = c("SENS", "SPEC", "PREC")) %>%
+        unclass() %>%
+        as_tibble()
+    )
+  )
+
+
+single_dose_comp_roc_values <- single_dose_comp_rocs %>%
+  transmute(
+    `Compound Concentration (nM)`,
+    ic50_threshold = fct_inorder(
+      paste(ic50_threshold, "nM")
+    ),
+    roc_values = map(roc, plot)
+  )
+
+single_dose_comp_roc_values_optimal <- single_dose_comp_roc_values %>%
+  mutate(
+    across(
+      roc_values,
+      map,
+      ~.x$`optimal Youden Index point` %>%
+        as.list() %>%
+        as_tibble()
+    )
+  ) %>%
+  unnest(roc_values) %>%
+  transmute(
+    `Compound Concentration (nM)`,
+    ic50_threshold,
+    `Cutoff` = 100 - cutoff,
+    `FPR/1-Specificity` = FPR,
+    `TPR/Sensitivity/Recall` = TPR
+  )
+
+
+pwalk(
+  single_dose_comp_rocs,
+  function(`Compound Concentration (nM)`, ic50_threshold, roc, ...) {
+    withr::with_pdf(
+      paste0("plots/percent_control_ic50_roc_threshold_", ic50_threshold, "_", `Compound Concentration (nM)`, ".pdf"),
+      plot(roc)
+    )
+  }
+)
+
+pwalk(
+  single_dose_comp_rocs,
+  function(`Compound Concentration (nM)`, ic50_threshold, roc, ...) {
+    withr::with_pdf(
+      paste0("plots/percent_control_ic50_ks_threshold_", ic50_threshold, "_", `Compound Concentration (nM)`, ".pdf"),
+      ksplot(roc)
+    )
+  }
+)
+
+```
+
+Table with FP, FN, AUC for each compound concentration and threshold
+highlighted best and worst screening concentration for each
+
+```{r}
+confusion_tables <- single_dose_comp_binned_filtered %>%
+  inner_join(
+    single_dose_comp_roc_values_optimal %>%
+      select(
+        `Compound Concentration (nM)`,
+        ic50_threshold,
+        `Cutoff`
+      ),
+    by = "Compound Concentration (nM)",
+    relationship = "many-to-many"
+  ) %>%
+  group_by(`Compound Concentration (nM)`, ic50_threshold) %>%
+  summarize(
+    confusion_table = list(
+      table(
+        chembl_ic50_below = value < as.double(str_replace(ic50_threshold, " nM", "")),
+        eurofins_below = `Percent Control` < `Cutoff`
+      )
+    ),
+    .groups = "drop"
+  )
+
+library(cvms)
+
+# p <- plot_confusion_matrix(
+#   confusion_tables$confusion_table[[1]] %>%
+#   as_tibble(), 
+#   target_col = "chembl_ic50_below", 
+#   prediction_col = "eurofins_below",
+#   counts_col = "n"
+# )
+# ggsave(
+#   "test.pdf", p, width = 2.5, height = 2.5
+# )
+
+dir.create("plots/percent_control_ic50_roc_confusion_tables", showWarnings = FALSE)
+pwalk(
+  confusion_tables,
+  function(`Compound Concentration (nM)`, ic50_threshold, confusion_table, ...) {
+    p <- plot_confusion_matrix(
+      confusion_table %>%
+        as_tibble(), 
+      target_col = "chembl_ic50_below", 
+      prediction_col = "eurofins_below",
+      counts_col = "n"
+    ) +
+      labs(
+        subtitle = paste("Predicting IC50 <", ic50_threshold, "\nat", `Compound Concentration (nM)`)
+      ) +
+      theme(
+        plot.subtitle = element_text(size = 8)
+      )
+    ggsave(
+      paste0("plots/percent_control_ic50_roc_confusion_tables/confusion_table_", ic50_threshold, "_", `Compound Concentration (nM)`, ".pdf"),
+      p, width = 2.5, height = 3
+    )
+  }
+)
+
+
+
+```
+
+Plot precision-recall curves
+
+```{r}
+
+library(ggrepel)
+single_dose_comp_pr_plots <- single_dose_comp_rocs %>%
+  transmute(
+    `Compound Concentration (nM)`,
+    ic50_threshold = fct_inorder(
+      paste(ic50_threshold, "nM")
+    ),
+    roc_measures
+  ) %>%
+  unnest(roc_measures) %>%
+  mutate(across(Cutoff, ~100 - .x)) %>%
+  ggplot(
+    aes(
+      SENS, PREC,
+      color = fct_inorder(
+        as.character(`Compound Concentration (nM)`)
+      )
+    )
+  ) +
+  geom_line() +
+  geom_point(
+    data = ~.x %>%
+      filter(
+        Cutoff %in% seq(from = 0, to = 100, by = 25)
+      ) %>%
+      bind_rows(
+        inner_join(
+          .x,
+          single_dose_comp_roc_values_optimal
+        )
+      ),
+    show.legend = FALSE
+  ) +
+  geom_text_repel(
+    aes(label = Cutoff),
+    data = ~.x %>%
+      mutate(
+        Cutoff = if_else(
+          Cutoff %in% seq(from = 25, to = 75, by = 25),
+          as.character(Cutoff),
+          ""
+        )
+      ) %>%
+      anti_join(
+        single_dose_comp_roc_values_optimal %>%
+          mutate(across(Cutoff, as.character))
+      ) %>%
+      bind_rows(
+        inner_join(
+          .x,
+          single_dose_comp_roc_values_optimal
+        ) %>%
+        mutate(
+          across(Cutoff, ~paste0(.x, "*"))
+        )
+      ),
+    box.padding = 0.5,
+    show.legend = FALSE,
+    max.iter = 50000,
+    max.time = 2,
+    force = 3,
+    seed = 42,
+    max.overlaps = Inf
+  ) +
+  labs(
+    x = "Recall TP / (TP + FN)",
+    y = "Precision TP / (TP + FP)",
+    color = "Assay concentration",
+    title = "Precision-recall curves for prediction of IC50 < threshold"
+  ) +
+  facet_wrap(~ic50_threshold) +
+  coord_cartesian(xlim = c(0, 1.1))
+
+ggsave(
+  "plots/percent_control_ic50_pr.pdf",
+  single_dose_comp_pr_plots,
+  width = 10, height = 4
+)
+
+single_dose_comp_roc_plot <- single_dose_comp_roc_values %>%
+  mutate(
+    across(
+      roc_values,
+      map,
+      ~.x[c("FPR/1-Specificity", "TPR/Sensitivity/Recall", "Cutoff")] %>%
+        as_tibble()
+    )
+  ) %>%
+  unnest(roc_values) %>%
+  mutate(across(Cutoff, ~100 - .x)) %>%
+  ggplot(
+    aes(
+      `FPR/1-Specificity`, `TPR/Sensitivity/Recall`,
+      color = fct_inorder(
+        as.character(`Compound Concentration (nM)`)
+      )
+    )
+  ) +
+  geom_line() +
+  geom_point(
+    data = ~.x %>%
+      filter(
+        Cutoff %in% seq(from = 0, to = 100, by = 25)
+      ) %>%
+      bind_rows(
+        single_dose_comp_roc_values_optimal
+      ),
+    show.legend = FALSE
+  ) +
+  geom_text_repel(
+    aes(label = Cutoff),
+    data = ~.x %>%
+      mutate(
+        Cutoff = if_else(
+          Cutoff %in% seq(from = 25, to = 75, by = 25),
+          as.character(Cutoff),
+          ""
+        )
+      ) %>%
+      # If optimal value is equal to one of the plotted
+      # values don't repeat it
+      anti_join(
+        single_dose_comp_roc_values_optimal %>%
+          mutate(across(Cutoff, as.character))
+      ) %>%
+      bind_rows(
+        single_dose_comp_roc_values_optimal %>%
+          mutate(across(Cutoff, ~paste0(.x, "*")))
+      ),
+    # point.padding = unit(20, "pt"),
+    # min.segment.length = 0,
+    box.padding = 0.5,
+    show.legend = FALSE,
+    max.iter = 50000,
+    max.time = 2,
+    force = 3,
+    seed = 42,
+    max.overlaps = Inf
+  ) +
+  labs(
+    x = "1 - Specificity TN / (TN + FP)",
+    y = "Sensitivity TP / (TP + FN)",
+    color = "Assay concentration",
+    title = "ROC curve for predicting an IC50 below threshold"
+  ) +
+  facet_wrap(~ic50_threshold) +
+  coord_cartesian(xlim = c(-0.1, 1), ylim = c(0, 1.1))
+
+ggsave(
+  "plots/percent_control_ic50_roc.pdf",
+  single_dose_comp_roc_plot,
+  width = 12, height = 4
+)
+```
 
