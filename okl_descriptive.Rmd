@@ -11,6 +11,7 @@ library(synExtra)
 library(here)
 library(fst)
 library(data.table)
+library(powerjoin)
 # library(dtplyr)
 
 theme_set(theme_minimal())
@@ -42,7 +43,7 @@ single_dose <- input_files[["okl_single_dose"]] %>%
 compound_dictionary <- input_files[["compound_dictionary"]] %>%
   read_fst(as.data.table = TRUE)
 
-compound_mapping <- input_files[["compound_mapping"]] %>%
+#compound_mapping <- input_files[["compound_mapping"]] %>%
   read_fst(as.data.table = TRUE)
 
 compound_names <- compound_dictionary %>%
@@ -53,14 +54,6 @@ compound_names <- compound_dictionary %>%
   slice_head(n = 1) %>%
   ungroup()
   # as_tibble()
-
-qpcr_misses <- syn("syn33531640") %>%
-  readxl::read_excel() %>%
-  left_join(
-    compound_mapping[, .(lspci_id, external_id)] %>%
-      unique(),
-    by = c("Compound Name" = "external_id")
-  )
 
 kinase_info <- input_files[["kinase_info"]] %>%
   read_csv()
@@ -367,24 +360,18 @@ ggsave(
 
 ```{r}
 single_dose_trans <- single_dose %>%
-  left_join(
-    qpcr_misses %>%
-      transmute(
-        hmsl_id = `Compound Name`,
-        `DiscoveRx Gene Symbol` = `Ambit Gene Symbol`,
-        `Compound Conc`,
-        qpcr_miss = TRUE
-      ),
-    by = c("hmsl_id", "DiscoveRx Gene Symbol", "Compound Concentration (nM)" = "Compound Conc")
-  ) %>%
   mutate(
     log_inhibition = log10(`Percent Control` + 0.01),
-    qpcr_miss = replace_na(qpcr_miss, FALSE)
+    log_conc = log10(`Compound Concentration (nM)`),
+    inhib_hit = `Percent Control` <= 35 & !qpcr_miss
   ) %>%
   as_tibble()
 
 single_dose_trans %>%
   count(qpcr_miss)
+
+single_dose_trans %>%
+  count(superseded)
 
 largest_inconsistency <- single_dose %>%
   mutate(across(`Percent Control`, ~log10(.x + 0.01))) %>%
@@ -1092,56 +1079,57 @@ n_flagged_binary %>%
 ```
 
 ```{r}
-single_dose_trans_agg <- single_dose_trans %>%
-  group_by(
-    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
-    `Compound Concentration (nM)`
+single_dose_groups <- single_dose_trans %>%
+  distinct(lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`, superseded) %>%
+  nest_join(
+    single_dose_trans,
+    keep = TRUE,
+    name = "data",
+    by = c("lspci_id", "hmsl_id", "DiscoveRx Gene Symbol")
   ) %>%
-  summarize(
-    across(
-      c(`Percent Control`, log_inhibition),
-      ~if (!all(qpcr_miss))
-        mean(.x[!qpcr_miss])
-      else
-        mean(.x)
-    ),
-    qpcr_miss = all(qpcr_miss),
-    .groups = "drop"
-  ) %>%
-  arrange(`Compound Concentration (nM)`)
-
-single_dose_hits <- single_dose_trans %>%
   mutate(
-    inhib_hit = `Percent Control` <= 35 & !qpcr_miss,
-    log_conc = log10(`Compound Concentration (nM)`)
-  ) %>%
-  group_by(
-    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`
-  ) %>%
-  summarize(
-    data = list(cur_data()),
-    lin_mod = list(
-      lm(`Percent Control` ~ log_conc, data = cur_data())
-    ),
-    # inhib_concordant = {
-    #   !any((inhib_hit[-1] - head(inhib_hit, -1)) < 0)
-    # },
-    inhib_concordant = if (any(inhib_hit)) {
-      cg <- cur_group()
-      # if (cg[["Entrez Gene Symbol"]] == "MKNK1" && cg[["lspci_id"]] == 17778) browser()
-      inhib_idx <- which(inhib_hit)[1]
-      if (inhib_idx == length(inhib_hit))
-        TRUE
-      else {
-        after <- tail(`Percent Control`, -inhib_idx)
-        x <- !any((after > 35) & (after > (2 * `Percent Control`[inhib_idx])))
-        # if (x) browser()
-        x
+    data = map2(
+      data,
+      superseded,
+      \(df, sup) {
+        if (sup) {
+          df <- df %>%
+            filter(!str_detect(experiment, "repeat"))
+        } else {
+          df <- df %>%
+            filter(!superseded)
+        }
+        df %>%
+          filter(!qpcr_miss) %>%
+          arrange(`Compound Concentration (nM)`)
       }
-    } else {
-        TRUE
-    },
-    .groups = "drop"
+    )
+  )
+
+single_dose_hits <- single_dose_groups %>%
+  mutate(
+    lin_mod = map(
+      data,
+      ~lm(`Percent Control` ~ log_conc, data = .x)
+    ),
+    inhib_concordant = map_lgl(
+      data,
+      \(df) {
+        if (any(df$inhib_hit)) {
+          inhib_idx <- which(df$inhib_hit)[1]
+          if (inhib_idx == length(df$inhib_hit))
+            TRUE
+          else {
+            after <- tail(df$`Percent Control`, -inhib_idx)
+            x <- !any((after > 35) & (after > (2 * df$`Percent Control`[inhib_idx])))
+            # if (x) browser()
+            x
+          }
+        } else {
+            TRUE
+        }
+      }
+    )
   )
 
 library(broom)
@@ -1189,15 +1177,24 @@ single_dose_classification <- single_dose_classification_res2 %>%
     lspci_id, name, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`, classification, everything()
   )
 
+library(qs)
+qsave(
+  single_dose_classification,
+  file.path("classification", "okl_eurofins_classification_raw.qs")
+)
+# single_dose_classification <- qread(
+#   file.path("classification", "okl_eurofins_classification_raw.qs")
+# )
+
 write_csv(
   single_dose_classification %>%
     select(where(negate(is.list))),
   "classification/okl_eurofins_classification.csv"
 )
-single_dose_classification <- read_csv("classification/okl_eurofins_classification.csv")
+# single_dose_classification <- read_csv("classification/okl_eurofins_classification.csv")
 
 single_dose_classification %>%
-  group_by(classification) %>%
+  group_by(classification, superseded) %>%
   summarize(
     n = n(),
     frac_total = n() / nrow(.),
@@ -1371,12 +1368,22 @@ p <- single_dose_classification %>%
       aes(label = name),
       data = ~.x %>%
         mutate(name = if_else(discordant < 0.04, "", name)),
-      min.segment.length = 0
+      min.segment.length = 0.2,
+      max.overlaps = Inf,
+      max.iter = 50000,
+      max.time = 2,
+      size = 3
     ) +
-    labs(x = "Fraction of 'binding' dose-response curves", y = "Fraction of 'discordant' dose-response curves")
+    labs(
+      x = "Proportion of binding dose-response curves",
+      y = "Proportion of discordant dose-response curves",
+      title = "Discordant vs binding per compound"
+    ) +
+    scale_x_continuous(labels = scales::percent) +
+    scale_y_continuous(labels = scales::percent)
 
 ggsave(
-  "classification/discordant_vs_binding.pdf", p, width = 10, height = 10
+  "classification/discordant_vs_binding.pdf", p, width = 7, height = 7
 )
 
 
@@ -1401,87 +1408,85 @@ p <- single_dose_classification %>%
     geom_text_repel(
       aes(label = `DiscoveRx Gene Symbol`),
       data = ~.x %>%
-        mutate(`DiscoveRx Gene Symbol` = if_else(discordant < 0.04, "", `DiscoveRx Gene Symbol`)),
-      min.segment.length = 0
+        mutate(`DiscoveRx Gene Symbol` = if_else(discordant < 0.08, "", `DiscoveRx Gene Symbol`)),
+      min.segment.length = 0.2,
+      max.overlaps = Inf,
+      max.iter = 50000,
+      max.time = 2,
+      size = 3
     ) +
-    labs(x = "Fraction of 'binding' dose-response curves", y = "Fraction of 'discordant' dose-response curves")
+    labs(
+      x = "Proportion of binding dose-response curves",
+      y = "Proportion of discordant dose-response curves",
+      title = "Discordant vs binding per kinase"
+    ) +
+    scale_x_continuous(labels = scales::percent) +
+    scale_y_continuous(labels = scales::percent)
 
 ggsave(
-  "classification/discordant_vs_binding_kinases.pdf", p, width = 10, height = 10
+  "classification/discordant_vs_binding_kinases.pdf", p, width = 7, height = 7
 )
 
 ```
 
 ```{r pseudo_ic_50}
-library(chemCal)
-pseudo_ic50_raw <- single_dose_trans %>%
-  filter(!qpcr_miss) %>%
-  group_by(
-    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`, `Compound Concentration (nM)`
-  ) %>%
-  summarize(`Percent Control` = mean(`Percent Control`), .groups = "drop") %>%
-  group_by(
-    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`
-  ) %>%
-  arrange(`Compound Concentration (nM)`) %>%
-  mutate(below_50 = `Percent Control` < 50, log_conc = log10(`Compound Concentration (nM)`)) %>%
-  summarize(
-    pseudo_ic50 = list(
-      if (length(unique(below_50)) == 2 && !below_50[1]) {
-        over_under_50_idx <- which(below_50)[1] + c(-1, 0)
-        mdl_data <- cur_data()[over_under_50_idx, ]
-        if (nrow(mdl_data) == 1)
-          browser()
-        mdl <- lm(`Percent Control` ~ log_conc, data = mdl_data)
-        list(
-          pseudo_ic50 = 10^(chemCal::inverse.predict(mdl, 50)$Prediction),
-          pseudo_ic50_relation = "=",
-          # Make sure all values beyond the IC50 value are below 50
-          # otherwise label as discordant
-          pseudo_ic50_concordant = if (
-            over_under_50_idx[2] == n() ||
-            all(tail(`Percent Control`, -over_under_50_idx[2]) < 50)
-          ) {
-            "concordant"
-          } else {
-            "discordant"
-          }
-        )
-      } else if (all(below_50)) {
-        list(
-          pseudo_ic50 = min(`Compound Concentration (nM)`),
-          pseudo_ic50_relation= "<",
-          pseudo_ic50_concordant = "concordant"
-        )
-      } else if (!any(below_50)) {
-        list(
-          pseudo_ic50 = max(`Compound Concentration (nM)`),
-          pseudo_ic50_relation= ">",
-          pseudo_ic50_concordant = "concordant"
-        )
+compute_pseudo_ic50 <- function(df) {
+  df <- df %>%
+    mutate(below_50 = `Percent Control` < 50)
+  if (length(unique(df$below_50)) == 2 && !df$below_50[1]) {
+    over_under_50_idx <- which(df$below_50)[1] + c(-1, 0)
+    mdl_data <- df[over_under_50_idx, ]
+    if (nrow(mdl_data) == 1)
+      browser()
+    mdl <- lm(`Percent Control` ~ log_conc, data = mdl_data)
+    list(
+      pseudo_ic50 = 10^(chemCal::inverse.predict(mdl, 50)$Prediction),
+      pseudo_ic50_relation = "=",
+      # Make sure all values beyond the IC50 value are below 50
+      # otherwise label as discordant
+      pseudo_ic50_concordant = if (
+        over_under_50_idx[2] == nrow(df) ||
+        all(tail(df$`Percent Control`, -over_under_50_idx[2]) < 50)
+      ) {
+        "concordant"
       } else {
-        list(
-          pseudo_ic50 = NA_real_,
-          pseudo_ic50_relation = NA_character_,
-          pseudo_ic50_concordant = NA_character_
-        )
+        "discordant"
       }
-    ),
-    .groups = "drop"
+    )
+  } else if (all(df$below_50)) {
+    list(
+      pseudo_ic50 = min(df$`Compound Concentration (nM)`),
+      pseudo_ic50_relation= "<",
+      pseudo_ic50_concordant = "concordant"
+    )
+  } else if (!any(df$below_50)) {
+    list(
+      pseudo_ic50 = max(df$`Compound Concentration (nM)`),
+      pseudo_ic50_relation= ">",
+      pseudo_ic50_concordant = "concordant"
+    )
+  } else {
+    list(
+      pseudo_ic50 = NA_real_,
+      pseudo_ic50_relation = NA_character_,
+      pseudo_ic50_concordant = NA_character_
+    )
+  }
+}
+
+
+library(chemCal)
+pseudo_ic50_raw <- single_dose_classification %>%
+  mutate(
+    pseudo_ic50 = map(
+      data,
+      compute_pseudo_ic50
+    )
   )
 
 pseudo_ic50 <- pseudo_ic50_raw %>%
   unnest_wider(
     pseudo_ic50
-  ) %>%
-  power_left_join(
-    compound_names,
-    by = "lspci_id",
-    check = check_specs(
-      duplicate_keys_right = "abort",
-      unmatched_keys_left = "abort",
-      unmatched_keys_right = "ignore"
-    )
   )
 
 write_csv(
@@ -1497,7 +1502,8 @@ write_csv(
 synStoreMany(
   c(
     "classification/okl_eurofins_pseudo_ic50.csv",
-    "classification/okl_eurofins_classification.csv"
+    "classification/okl_eurofins_classification.csv",
+    "classification/okl_eurofins_classification_raw.qs"
   ),
   parentId = "syn18508401",
   used = unname(inputs),
