@@ -29,6 +29,8 @@ inputs <- list(
   okl1_1 = "syn26388880",
   okl1_2 = "syn25998856",
   okl2 = "syn26053108",
+  okl2_repeat1 = "syn52223890",
+  okl2_repeat2 = "syn52223891",
   kinase_info = "syn51286743"
 )
 
@@ -41,6 +43,14 @@ compound_mapping <- input_files[["compound_mapping"]] %>%
 
 exclusions <- input_files[["exclusions"]] %>%
   read_csv()
+
+qpcr_misses <- syn("syn33531640") %>%
+  readxl::read_excel() %>%
+  left_join(
+    compound_mapping[, .(lspci_id, external_id)] %>%
+      unique(),
+    by = c("Compound Name" = "external_id")
+  )
 
 single_dose_raw <- input_files %>%
   {.[str_starts(names(.), "okl")]} %>%
@@ -64,25 +74,51 @@ flagged for exclusion.
 Torin 1 was measured twice. Averaging measurements
 
 ```{r wrangle}
-single_dose <- single_dose_raw %>%
+single_dose_lspci_id <- single_dose_raw %>%
   # Fix deprecated HMSLID
   mutate(`Compound Name` = recode(`Compound Name`, HMSL12274 = "HMSL11996")) %>% {
     compound_mapping[, .(lspci_id, hmsl_id = external_id)][
       .,
       on = c("hmsl_id" = "Compound Name")
     ]
-  } %>%
+  }
+
+single_dose_lspci_id_repeat <- single_dose_lspci_id %>%
+  filter(str_detect(experiment, "repeat"))
+
+single_dose_lspci_id_repeat %>%
+  dplyr::count(lspci_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`) %>%
+  dplyr::count(n)
+
+single_dose <- single_dose_lspci_id %>%
+  left_join(
+    qpcr_misses %>%
+      transmute(
+        lspci_id, `Ambit Gene Symbol`, `Compound Conc`,
+        qpcr_miss = TRUE
+      ),
+    by = c("lspci_id", "DiscoveRx Gene Symbol" = "Ambit Gene Symbol", "Compound Concentration (nM)" = "Compound Conc")
+  ) %>%
+  replace_na(list(qpcr_miss = FALSE)) %>%
+  mutate(
+    exclude_target = `DiscoveRx Gene Symbol` %in% exclusions$`DiscoveRx Gene Symbol`
+  ) %>%
+  left_join(
+    single_dose_lspci_id_repeat %>%
+      distinct(lspci_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`) %>%
+      mutate(superseded = TRUE)
+  ) %>%
+  mutate(
+    superseded = if_else(str_detect(experiment, "repeat"), FALSE, replace_na(superseded, FALSE))
+  ) %>%
   group_by(
     lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
-    `Compound Concentration (nM)`
+    `Compound Concentration (nM)`, qpcr_miss, exclude_target, superseded
   ) %>%
   summarize(
     experiment = paste(experiment, collapse = "+"),
-    across(where(is.numeric), mean),
+    across(`Percent Control`, mean),
     .groups = "drop"
-  ) %>%
-  mutate(
-    exclude_target = `DiscoveRx Gene Symbol` %in% exclusions$`DiscoveRx Gene Symbol`
   ) %>%
   mutate(
     tas = case_when(
