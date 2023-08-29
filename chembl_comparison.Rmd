@@ -35,12 +35,34 @@ qpcr_misses <- syn("syn33531640") %>%
     by = c("Compound Name" = "external_id")
   )
 
-lsp_biochem <- syn("syn25173511") %>%
-  read_fst()
+# lsp_biochem <- syn("syn25173511") %>%
+#   read_fst()
 lsp_targets <- syn("syn25173506") %>%
+  read_fst()
+
+lsp_biochem_single <- syn("syn25173513") %>%
   read_fst()
 ```
 
+Aggregate single-dose data to get IC50s. Remove any ChEMBL Kd values that 
+have relation that is not "=" unless the relation is ">" or ">=" and the value
+is greater than 9000. This is to avoid underestimating IC50s for cases where
+people just didn't assay higher concentrations.
+
+```{r}
+chembl_kd_raw <- fread("data/kds_raw.csv.gz")
+
+lsp_biochem <- lsp_biochem_single %>%
+  filter(
+    value_relation == "=" |
+      (value_relation %in% c(">=", ">") & value > 9000)
+  ) %>%
+  group_by(lspci_id, lspci_target_id) %>%
+  summarize(
+    value = quantile(value, 0.25, na.rm = TRUE, names = FALSE),
+    .groups = "drop"
+  )
+```
 
 ```{r pseudo_ic50_plots}
 
@@ -63,10 +85,21 @@ pseudo_ic50_class <- kinomescan_pseudo_ic50s %>%
     )
   ) %>%
   power_left_join(
+    kinomescan_kinase_info %>%
+      select(`DiscoveRx Gene Symbol`, hgnc_symbol),
+    by = "DiscoveRx Gene Symbol",
+    check = check_specs(
+      duplicate_keys_left = "ignore",
+      duplicate_keys_right = "abort",
+      unmatched_keys_left = "abort",
+      unmatched_keys_right = "ignore"
+    )
+  ) %>%
+  power_left_join(
     lsp_targets %>%
       filter(organism == "Homo sapiens") %>%
       select(lspci_target_id, symbol),
-    by = c("Entrez Gene Symbol" = "symbol"),
+    by = c("hgnc_symbol" = "symbol"),
     check = check_specs(
       duplicate_keys_left = "ignore",
       duplicate_keys_right = "ignore",
@@ -74,11 +107,14 @@ pseudo_ic50_class <- kinomescan_pseudo_ic50s %>%
       unmatched_keys_right = "ignore"
     )
   )
+# NA ok. Comes from P. falciparum genes
 
 pseudo_ic50_comp <- pseudo_ic50_class %>%
   group_by(
-    lspci_id, hmsl_id, `Entrez Gene Symbol`, lspci_target_id
+    lspci_id, name, hmsl_id, `Entrez Gene Symbol`, lspci_target_id
   ) %>%
+  # Select representative for each gene among all
+  # mutants etc by favoring concordant measurements and low pseudo IC50s
   arrange(classification == "discordant", pseudo_ic50_relation != "=", pseudo_ic50) %>%
   slice_head(n = 1) %>%
   ungroup() %>%
@@ -101,6 +137,9 @@ pseudo_ic50_class %>%
 
 ```
 
+Make scatterplot of ChEMBL IC50 vs KINOMEscan pseudo-IC50
+Also show distribution of pseudo-IC50 values for each binding class as
+beeswarm plot.
 
 ```{r}
 
@@ -223,6 +262,218 @@ ggsave(
     "plots/chembl_ic50_by_comparison_combined.pdf", p_combined,
     width = 8, height = 4.5
 )
+```
+
+Now load the ChEMBL Kd only data and compare to KINOMEscan pseudo-IC50
+
+Remove any ChEMBL Kd values that have relation that is not "=" unless
+the relation is ">" or ">=" and the value is greater than 9000.
+
+
+```{r}
+chembl_kd_raw <- fread("data/kds_raw.csv.gz")
+
+chembl_kd <- chembl_kd_raw %>%
+  mutate(across(standard_value, as.numeric)) %>%
+  filter(
+    standard_relation == "=" |
+      (standard_relation %in% c(">=", ">") & standard_value > 9000)
+  ) %>%
+  inner_join(
+    compound_mapping %>%
+      select(lspci_id, chembl_id_compound = external_id),
+    by = "chembl_id_compound"
+  ) %>%
+  group_by(gene_symbol, lspci_id) %>%
+  summarize(
+    chembl_kd = quantile(standard_value, 0.25, na.rm = TRUE, names = FALSE),
+    .groups = "drop"
+  ) %>%
+  inner_join(
+    kinomescan_kinase_info %>%
+      distinct(hgnc_symbol, `DiscoveRx Gene Symbol`),
+    by = c("gene_symbol" = "hgnc_symbol")
+  )
+
+pseudo_ic50_kd_comp <- pseudo_ic50_class %>%
+  group_by(
+    lspci_id, hmsl_id, name, `Entrez Gene Symbol`, lspci_target_id
+  ) %>%
+  arrange(classification == "discordant", pseudo_ic50_relation != "=", pseudo_ic50) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  inner_join(
+    chembl_kd,
+    by = c("lspci_id", "DiscoveRx Gene Symbol")
+  )
+
+p_scatter <- pseudo_ic50_kd_comp %>%
+  drop_na(pseudo_ic50) %>%
+  filter(
+    # pseudo_ic50_relation == "=",
+    pseudo_ic50_concordant == "concordant",
+    classification != "discordant"
+  ) %>%
+  ggplot(
+    # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
+    aes(chembl_kd, pseudo_ic50, color = classification)
+  ) +
+  scale_color_manual(values = class_colors) +
+  geom_point(alpha = 0.5, shape = 16, size = 1) +
+  # Limiting to between 1 and 10000 because barely any data outside this range
+  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, 10000)) +
+  scale_y_log10(labels = scales::label_number(big.mark = "")) +
+  coord_equal() +
+  labs(
+    x = "Kd (ChEMBL)",
+    y = "Pseudo-IC50 (KINOMEscan)"
+  )
+
+ggsave(
+    "plots/chembl_kd_vs_kinomescan_pseudo_ic50.pdf", p_scatter,
+    width = 8, height = 4
+)
+
+p_beeswarm <- pseudo_ic50_kd_comp %>%
+  filter(
+    pseudo_ic50_concordant == "concordant",
+    # pseudo_ic50_relation == "=",
+    classification != "discordant"
+  ) %>%
+  mutate(
+    classification = factor(
+      classification,
+      levels = c("binding", "weakly-binding", "undetermined", "non-binding") %>%
+        rev()
+    )
+  ) %>%
+  ggplot(
+    aes(chembl_kd, classification, color = classification)
+  ) +
+  geom_quasirandom(orientation = "y", shape = 16, size = 1, alpha = 0.5, width = 0.3) +
+  geom_boxplot(fill = NA, outlier.shape = NA) +
+  scale_color_manual(values = class_colors) +
+  guides(color = "none") +
+  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, 10000)) +
+  scale_y_discrete(labels = class_labels) +
+  theme(axis.text.y = element_markdown()) +
+  labs(x = "Kd (ChEMBL)", y = NULL)
+
+ggsave(
+    "plots/chembl_kd_by_kinomescan_class_beeswarm.pdf", p_beeswarm,
+    width = 7, height = 3
+)
+
+p_combined <- egg::ggarrange(
+    p_scatter +
+        labs(x = NULL) +
+        guides(color = "none") +
+        theme(
+            axis.text.x = element_blank(),
+            plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
+        ),
+    p_beeswarm +
+        coord_fixed(ratio = .32) +
+        theme(
+            plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm"),
+            legend.position = "bottom"
+        ),
+    nrow = 2,
+    heights = c(2, 1.2)
+)
+
+ggsave(
+    "plots/chembl_kd_by_comparison_combined.pdf", p_combined,
+    width = 6, height = 4.5
+)
+```
+
+Compute correlation coefficients between the ChEMBL IC50s / Kds and the KINOMEscan pseudo-IC50s.
+
+Using Fisher r-to-z transformation to test for significant difference between the correlations.
+
+```{r}
+two_cor_test <- function(r1, r2, n1, n2) {
+  (.5*log((1+r1)/(1-r1)) - .5*log((1+r2)/(1-r2))) /
+    sqrt(1/(n1-3) + 1/(n2-3))
+}
+
+pseudo_ic50_comp_both <- bind_rows(
+  ic50 = pseudo_ic50_comp %>%
+    filter(
+      pseudo_ic50_concordant == "concordant",
+      # pseudo_ic50_relation == "=",
+      classification != "discordant"
+    ) %>%
+    select(lspci_id, `DiscoveRx Gene Symbol`, gene_symbol = hgnc_symbol, value, pseudo_ic50, classification),
+  kd = pseudo_ic50_kd_comp %>%
+    filter(
+      pseudo_ic50_concordant == "concordant",
+      # pseudo_ic50_relation == "=",
+      classification != "discordant"
+    ) %>%
+    select(lspci_id, `DiscoveRx Gene Symbol`, gene_symbol, value = chembl_kd, pseudo_ic50, classification),
+  .id = "chembl_type"
+)
+
+pseudo_ic50_comp_cor_res <- pseudo_ic50_comp_both %>%
+  group_by(chembl_type) %>%
+  summarize(
+    res = cor.test(
+      ~value + pseudo_ic50, data = cur_data()
+    ) %>%
+      broom::tidy() %>%
+      list(),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  unnest(res)
+
+pseudo_ic50_comp_cor_res
+
+pseudo_ic50_comp_cor_res %>%
+  select(chembl_type, estimate, n) %>%
+  pivot_wider(names_from = chembl_type, values_from = c(estimate, n)) %>%
+  with(
+    two_cor_test(
+      estimate_ic50, estimate_kd,
+      n_ic50, n_kd
+    )
+  ) %>%
+
+```
+
+Check false negatives and false positives. Any particular compounds or
+targets that are consistently discordant?
+
+Use Kd data
+
+```{r}
+pseudo_ic50_comp_false_class <- pseudo_ic50_comp_both %>%
+  mutate(
+    false_class = case_when(
+      value > (10 * pseudo_ic50) ~ "false positive",
+      value < (0.1 * pseudo_ic50) ~ "false negative",
+      TRUE ~ "concordant"
+    )
+  )
+
+pseudo_ic50_comp_false_class %>%
+  count(chembl_type, false_class)
+
+pseudo_ic50_comp_false_class_by_compound <- pseudo_ic50_comp_false_class %>%
+  count(chembl_type, lspci_id, false_class) %>%
+  group_by(chembl_type, lspci_id) %>%
+  mutate(
+    prop = n / sum(n)
+  )
+
+pseudo_ic50_comp_false_class_by_kinase <- pseudo_ic50_comp_false_class %>%
+  count(chembl_type, `DiscoveRx Gene Symbol`, false_class) %>%
+  group_by(chembl_type, `DiscoveRx Gene Symbol`) %>%
+  mutate(
+    prop = n / sum(n)
+  )
 ```
 
 ```{r}
