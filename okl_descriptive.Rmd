@@ -1081,6 +1081,10 @@ n_flagged_binary %>%
 ```{r}
 single_dose_groups <- single_dose_trans %>%
   distinct(lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`, superseded) %>%
+  mutate(
+    dataset_version = if_else(superseded, "original", "repeat")
+  ) %>%
+  select(-superseded) %>%
   nest_join(
     single_dose_trans,
     keep = TRUE,
@@ -1090,9 +1094,9 @@ single_dose_groups <- single_dose_trans %>%
   mutate(
     data = map2(
       data,
-      superseded,
-      \(df, sup) {
-        if (sup) {
+      dataset_version,
+      \(df, version) {
+        if (version == "original") {
           df <- df %>%
             filter(!str_detect(experiment, "repeat"))
         } else {
@@ -1194,13 +1198,28 @@ write_csv(
 # single_dose_classification <- read_csv("classification/okl_eurofins_classification.csv")
 
 single_dose_classification %>%
-  group_by(classification, superseded) %>%
+filter(`DiscoveRx Gene Symbol` == "LATS1") %>%
+  mutate(
+    dataset = if_else(superseded, "original", "repeat")
+  ) %>%
+  group_by(classification, dataset) %>%
   summarize(
     n = n(),
     frac_total = n() / nrow(.),
     frac_binding = n() / sum(map_lgl(.$data, ~any(.x$inhib_hit))),
     .groups = "drop"
-  )
+  ) %>%
+  group_by(dataset) %>%
+  summarize(n_total = sum(n))
+
+single_dose_classification %>%
+  filter(`DiscoveRx Gene Symbol` == "LATS1") %>%
+  mutate(
+    dataset = if_else(superseded, "original", "repeat")
+  ) %>%
+  group_by(classification, dataset) %>%
+  ggplot(aes(classification, fill = dataset)) +
+    geom_bar(position = "dodge")
 
 library(powerjoin)
 p <- single_dose_classification %>%
@@ -1493,6 +1512,7 @@ write_csv(
   pseudo_ic50,
   "classification/okl_eurofins_pseudo_ic50.csv"
 )
+pseudo_ic50 <- fread("classification/okl_eurofins_pseudo_ic50.csv")
 
 
 ```
@@ -1512,3 +1532,96 @@ synStoreMany(
 )
 
 ```
+
+
+```{r}
+of_interest <- c(
+  "ERLOTINIB",
+  "TIVOZANIB",
+  "BARICITINIB"
+)
+
+single_dose_classification_of_interest <- single_dose_classification %>%
+  filter(name %in% of_interest)
+
+library(ComplexHeatmap)
+library(seriation)
+cluster_fun <- function(x) {
+  d <- dist(x)
+  #   d <- as.dist(1 - cor(t(x)))
+  # browser()
+  clust <- hclust(d, method = "average")
+  reorder(clust, dist = d, method = "olo")
+}
+
+make_hm <- function(df_new, df_old) {
+  df_old <- bind_rows(
+    df_old,
+    df_new %>%
+      anti_join(
+        distinct(df_old, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`)
+      )
+  )
+  mat_old <- df_old %>%
+    mutate(
+      across(`Compound Concentration (nM)`, ~fct_inseq(as.character(.x)))
+    ) %>%
+    select(`DiscoveRx Gene Symbol`, `Compound Concentration (nM)`, `Percent Control`) %>%
+    pivot_wider(names_from = `Compound Concentration (nM)`, values_from = `Percent Control`) %>%
+    column_to_rownames("DiscoveRx Gene Symbol") %>%
+    as.matrix()
+  mat_new <- df_new %>%
+    mutate(
+      across(`Compound Concentration (nM)`, ~fct_inseq(as.character(.x)))
+    ) %>%
+    select(`DiscoveRx Gene Symbol`, `Compound Concentration (nM)`, `Percent Control`) %>%
+    pivot_wider(names_from = `Compound Concentration (nM)`, values_from = `Percent Control`) %>%
+    column_to_rownames("DiscoveRx Gene Symbol") %>%
+    as.matrix()
+  mat_new <- mat_new[rownames(mat_old), colnames(mat_old)]
+  clust_new_rows <- cluster_fun(mat_new)
+  # clust_new_cols <- cluster_fun(t(mat_new))
+  list(
+    hm_new = Heatmap(
+      mat_new,
+      cluster_rows = clust_new_rows,
+      cluster_columns = FALSE,
+      col = rev(viridisLite::plasma(100))
+    ),
+    hm_old = Heatmap(
+      mat_old,
+      cluster_rows = clust_new_rows,
+      cluster_columns = FALSE,
+      col = rev(viridisLite::plasma(100))
+    )
+  )
+}
+
+single_dose_classification_of_interest_hms <- single_dose_classification_of_interest %>%
+  select(lspci_id, name, `DiscoveRx Gene Symbol`, superseded, data) %>%
+  pivot_wider(names_from = superseded, values_from = data) %>%
+  group_by(lspci_id, name) %>%
+  summarize(
+    across(c(`FALSE`, `TRUE`), ~list(bind_rows(.x))),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    hms = map2(`FALSE`, `TRUE`, make_hm)
+  )
+
+pwalk(
+  single_dose_classification_of_interest_hms,
+  function(name, hms, ...) {
+    withr::with_pdf(
+      paste0("classification/", name, "_hm_new.pdf"),
+      draw(hms$hm_new), width = 6, height = 10
+    )
+    withr::with_pdf(
+      paste0("classification/", name, "_hm_old.pdf"),
+      draw(hms$hm_old), width = 6, height = 10
+    )
+  }
+)
+```
+
+
