@@ -13,6 +13,7 @@ library(synExtra)
 library(here)
 library(fst)
 library(data.table)
+library(powerjoin)
 
 theme_set(theme_minimal())
 
@@ -22,21 +23,130 @@ syn <- synDownloader("~/data", .cache = TRUE)
 
 ## Load input
 
+Trying to find previous Kinomescan runs of OKL compounds.
+
 ```{r load}
-inputs <- list(
+kinomescan_plan <- syn("syn52433757") %>%
+  readxl::read_excel(sheet = "plate_map_metadata_single_dose_") %>%
+  dplyr::rename(library = ...1) %>%
+  fill(library, .direction = "down")
+
+hmsl_id_cols <- c(
+  "HMSLID",
+  "HMS ID",
+  "Compound Name",
+  "Small Molecule HMS LINCS ID"
+)
+
+all_kinomescan <- synGlob("syn18502717", "*.csv") %>%
+  {.[setdiff(names(.), c("eurofins_kinase_info.csv", "compound_id.csv", "DER009-01-p-00001_SScores Report.csv"))]} %>%
+  map(syn) %>%
+  map(read_csv)
+
+all_kinomescan_ids <- all_kinomescan %>%
+  map(
+    \(df) {
+      id_col <- hmsl_id_cols[hmsl_id_cols %in% names(df)][1]
+      id_col_sym <- sym(id_col)
+      df %>%
+        mutate(
+          hmsl_id_clean = str_replace_all(!!id_col_sym, fixed("-"), "") %>%
+          {if_else(!str_starts(., "HMSL"), paste0("HMSL", .), .)}
+        ) %>%
+        distinct(!!id_col_sym, hmsl_id_clean)
+    }
+  )
+
+all_kinomescan_ids_overlap <- all_kinomescan_ids %>%
+  imap(
+    \(df, file) {
+      df %>%
+        filter(hmsl_id_clean %in% kinomescan_plan$hmsl_id) %>%
+        inner_join(all_kinomescan[[file]])
+    }
+  ) %>%
+  keep(\(df) nrow(df) > 0)
+
+all_kinomescan_ids_overlap_long <- all_kinomescan_ids_overlap %>%
+  bind_rows(.id = "file")
+
+all_kinomescan_ids_overlap_long %>%
+  distinct(hmsl_id_clean, `DiscoveRx Gene Symbol`, `Percent Control`, `Compound Concentration (nM)`)
+
+all_kinomescan_ids_overlap[["SCANmax_results_2.csv"]][["Compound Name"]] %>%
+  unique() %>%
+  paste(collapse = ", ")
+```
+
+"$SCANmax_results_2.csv" (syn18502769) and "DER009-01-p-00001_Data Report.csv"
+contain exactly the same results. They contain data for 10 of the pre-OKL
+compounds. The remaining 6 are in syn18502768, but are referred to only by their
+name.
+
+Updating syn18502768 to also include HMSL id using mapping provided by Caitlin.
+
+```{r}
+scanmax1_mapping <- syn("syn18502757") %>%
+  read_csv()
+scanmax1_raw <- syn("syn18502768") %>%
+  read_csv()
+
+scanmax1_mapped <- scanmax1_raw %>%
+  power_inner_join(
+    scanmax1_mapping %>%
+      select(`Compound Name` = `Name`, HMSLID = `HMS ID`),
+    by = "Compound Name",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  select(-`Gray ID`)
+
+fwrite(
+  scanmax1_mapped,
+  here("data", "SCANmax_results_1.csv")
+)
+
+synStoreMany(
+  here("data", "SCANmax_results_1.csv"),
+  "syn18502717",
+  forceVersion = FALSE
+)
+```
+
+```{r}
+inputs <- c(
   compound_mapping = "syn26260389",
   exclusions = "syn26401280",
+  pre_okl1 = "syn18502768",
+  pre_okl2 = "syn18502769",
   okl1_1 = "syn26388880",
   okl1_2 = "syn25998856",
   okl2 = "syn26053108",
   okl2_repeat1 = "syn52223890",
   okl2_repeat2 = "syn52223891",
-  kinase_info = "syn51286743"
+  kinase_info = "syn51286743",
+  compound_dictionary = "syn26260332",
+  kinomescan_plan = "syn52433757"
 )
 
 input_files <- map(
   inputs, syn
 )
+
+compound_dictionary <- input_files[["compound_dictionary"]] %>%
+  read_fst(as.data.table = TRUE)
+
+compound_names <- compound_dictionary %>%
+  select(lspci_id, name = pref_name) %>%
+  drop_na() %>%
+  # lazy_dt() %>%
+  group_by(lspci_id) %>%
+  slice_head(n = 1) %>%
+  ungroup()
+  # as_tibble()
 
 compound_mapping <- input_files[["compound_mapping"]] %>%
   read_fst(as.data.table = TRUE)
@@ -52,73 +162,230 @@ qpcr_misses <- syn("syn33531640") %>%
     by = c("Compound Name" = "external_id")
   )
 
-single_dose_raw <- input_files %>%
+okl_single_dose_raw <- input_files %>%
   {.[str_starts(names(.), "okl")]} %>%
   map(syn) %>%
   map(fread) %>%
   rbindlist(idcol = "experiment")
 
+pre_okl_single_dose_raw <- input_files %>%
+  {.[str_starts(names(.), "pre_okl")]} %>%
+  map(syn) %>%
+  map(fread) %>%
+  rbindlist(idcol = "experiment", fill = TRUE)
+
 kinase_info <- input_files[["kinase_info"]] %>%
   read_csv()
+```
+
+Map HMSL IDs to lspci IDs
+
+```{r}
+hmsl_lspci_id_map <- tibble(
+  hmsl_id = c(
+    okl_single_dose_raw$`Compound Name`,
+    pre_okl_single_dose_raw$HMSLID,
+    "HMSL11996" # HMSL12274 is deprecated in favor of HMSL11996
+  ) %>%
+    unique()
+) %>%
+  power_left_join(
+    compound_mapping[, .(lspci_id, hmsl_id = external_id)],
+    by = "hmsl_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+    )
+  )
 ```
 
 ## Wrangle
 
 We ran KinomeScan assays against the entire Kinome for all compounds in the
-Optimal Kinase Library. There are three batches of experiments. Any earlier
-KinomeScan runs are not included.
+Optimal Kinase Library. Experiments were performed in multiple rounds. Some of
+the OKL compounds were already run in 2019 before OKL was conceived and thus
+were not run again in the main OKL experiments.
 
-Furthermore, all targets assayed by KinomeScan that contain mutations are
-flagged for exclusion.
+Some compounds in these runs were also not part of the OKL. These were
+JAK inhibitors or other compounds ran at the same time. Adding a `library` column
+to distinguish compounds from these different sources.
 
-Torin 1 was measured twice. Averaging measurements
+Some data that was generated in the main round of OKL experiments turned out to
+be bad and was repeated.
 
 ```{r wrangle}
-single_dose_lspci_id <- single_dose_raw %>%
-  # Fix deprecated HMSLID
-  mutate(`Compound Name` = recode(`Compound Name`, HMSL12274 = "HMSL11996")) %>% {
-    compound_mapping[, .(lspci_id, hmsl_id = external_id)][
-      .,
-      on = c("hmsl_id" = "Compound Name")
-    ]
-  }
+compound_library_map <- kinomescan_plan %>%
+  drop_na(hmsl_id) %>%
+  distinct(library, hmsl_id) %>%
+  mutate(
+    library = if_else(str_detect(library, fixed("OKL")), "OKL", "JAKi")
+  ) %>%
+  bind_rows(
+    tibble(
+      hmsl_id = setdiff(hmsl_lspci_id_map$hmsl_id, .$hmsl_id),
+      library = "other"
+    )
+  )
 
+single_dose_lspci_id <- bind_rows(
+  pre_okl_single_dose_raw %>%
+    select(-`Compound Name`) %>%
+    dplyr::rename(hmsl_id = HMSLID),
+  okl_single_dose_raw %>%
+    dplyr::rename(hmsl_id = `Compound Name`)
+) %>%
+  # Fix deprecated HMSLID
+  mutate(hmsl_id = recode(hmsl_id, HMSL12274 = "HMSL11996")) %>%
+  power_left_join(
+    hmsl_lspci_id_map,
+    by = "hmsl_id",
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  power_left_join(
+    compound_names,
+    by = "lspci_id",
+    check = check_specs(
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  as_tibble() %>%
+  power_left_join(
+    compound_library_map,
+    by = "hmsl_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+```
+
+Check and visualize how often each compound was measured at each concentration.
+
+```{r}
+single_dose_lspci_id %>%
+  dplyr::count(experiment, lspci_id, `Compound Concentration (nM)`) %>%
+  dplyr::count(experiment, n)
+```
+     experiment   n  nn
+1:       okl1_1 468 368
+2:       okl1_2 468 368
+3:         okl2 468  48
+4: okl2_repeat1   7 736
+5: okl2_repeat2 468   2
+6:     pre_okl1 468  23
+7:     pre_okl2 468  26
+
+For stats, remove experiment where seven compounds were measured only against
+subset of kinases.
+
+```{r}
+compound_stats <- single_dose_lspci_id %>%
+  filter(experiment != "okl2_repeat1") %>%
+  group_by(library, lspci_id, name, `Compound Concentration (nM)`) %>%
+  summarize(
+    n_measured = n() / 468L,
+    .groups = "drop"
+  )
+
+compound_stats %>%
+  dplyr::count(n_measured)
+
+p <- compound_stats %>%
+  filter(
+    `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000),
+    library != "other"
+  ) %>%
+  mutate(
+    across(
+      c(lspci_id, `Compound Concentration (nM)`),
+      \(x) fct_inseq(as.character(x))
+    )
+  ) %>%
+  complete(fill = list(n_measured = 0)) %>%
+  ggplot(
+    aes(x = `Compound Concentration (nM)`, y = name, fill = n_measured)
+  ) +
+  geom_tile()
+
+ggsave(
+  "plots/compounds_n_measured.pdf", p,
+  width = 6, height = 20
+)
+```
+
+Checking which compounds were measured multiple times at the same concentration
+
+```{r}
 single_dose_lspci_id_repeat <- single_dose_lspci_id %>%
   filter(str_detect(experiment, "repeat"))
 
 single_dose_lspci_id_repeat %>%
-  dplyr::count(lspci_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`) %>%
-  dplyr::count(n)
+  group_by(lspci_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`) %>%
+  filter(n() > 1)
+```
 
-single_dose <- single_dose_lspci_id %>%
-  left_join(
-    qpcr_misses %>%
-      transmute(
-        lspci_id, `Ambit Gene Symbol`, `Compound Conc`,
-        qpcr_miss = TRUE
-      ),
-    by = c("lspci_id", "DiscoveRx Gene Symbol" = "Ambit Gene Symbol", "Compound Concentration (nM)" = "Compound Conc")
-  ) %>%
+Erlotinib has some duplicate data values because it was measured twice. Once
+in the experiment where it was measured against all kinases and then in the
+experiment where certain kinases where measured against all compounds.
+
+Averaging measurements.
+
+```{r}
+single_dose_lspci_id_no_repeat <- single_dose_lspci_id %>%
+  filter(!str_detect(experiment, "repeat"))
+
+single_dose_lspci_id_no_repeat %>%
+  group_by(lspci_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`) %>%
+  filter(n() > 1)
+
+single_dose_lspci_id_no_repeat %>%
+  group_by(lspci_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`) %>%
+  filter(n() > 1) %>% ungroup() %>% dplyr::count(experiment, name)
+```
+
+Tofacitinib and Torin-1 were measured twice. Averaging measurements.
+
+Before averaging, flagging measurements for exclusion for multiple reasons.
+
+QPCR misses and mutations are flagged for exclusion.
+
+```{r}
+single_dose_processed <- bind_rows(
+  single_dose_lspci_id_no_repeat %>%
+    filter(str_detect(experiment, "pre_okl")),
+  single_dose_lspci_id_no_repeat %>%
+    filter(!str_detect(experiment, "pre_okl")) %>%
+    left_join(
+      qpcr_misses %>%
+        transmute(
+          lspci_id, `Ambit Gene Symbol`, `Compound Conc`,
+          qpcr_miss = TRUE
+        ),
+      by = c("lspci_id", "DiscoveRx Gene Symbol" = "Ambit Gene Symbol", "Compound Concentration (nM)" = "Compound Conc")
+    ),
+  single_dose_lspci_id_repeat
+) %>%
   replace_na(list(qpcr_miss = FALSE)) %>%
   mutate(
-    exclude_target = `DiscoveRx Gene Symbol` %in% exclusions$`DiscoveRx Gene Symbol`
-  ) %>%
-  left_join(
-    single_dose_lspci_id_repeat %>%
-      distinct(lspci_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`) %>%
-      mutate(superseded = TRUE)
-  ) %>%
-  mutate(
-    superseded = if_else(str_detect(experiment, "repeat"), FALSE, replace_na(superseded, FALSE))
+    experiment_group = if_else(
+      str_detect(experiment, "repeat"),
+      "repeat",
+      "original"
+    )
   ) %>%
   group_by(
-    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
-    `Compound Concentration (nM)`, qpcr_miss, exclude_target, superseded
+    experiment_group, lspci_id, hmsl_id, name, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
+    `Compound Concentration (nM)`
   ) %>%
   summarize(
     experiment = paste(experiment, collapse = "+"),
-    across(`Percent Control`, mean),
+    library = unique(library),
+    `Percent Control` = mean(`Percent Control`[if (all(qpcr_miss)) TRUE else !qpcr_miss]),
     .groups = "drop"
+  ) %>%
+  mutate(
+    exclude_target = `DiscoveRx Gene Symbol` %in% exclusions$`DiscoveRx Gene Symbol`
   ) %>%
   mutate(
     tas = case_when(
@@ -131,30 +398,77 @@ single_dose <- single_dose_lspci_id %>%
       TRUE ~ NA_integer_
     )
   ) %>%
-  inner_join(
+  power_left_join(
     kinase_info %>%
       select(`DiscoveRx Gene Symbol`, entrezgene_id, ensembl_gene_id, hgnc_symbol),
-    by = "DiscoveRx Gene Symbol"
+    by = "DiscoveRx Gene Symbol",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
   ) %>%
   select(
-    lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`, entrezgene_id, ensembl_gene_id, hgnc_symbol,
-    everything()
+    lspci_id, hmsl_id, library, name,
+    `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
+    entrezgene_id, ensembl_gene_id, hgnc_symbol, exclude_target,
+    experiment_group, experiment, everything()
   )
 
-fwrite(single_dose, here("data", "okl_single_dose.csv.gz"))
+fwrite(single_dose_processed, here("data", "okl_single_dose.csv.gz"))
+```
+
+Making two complete datasets:
+
+1. Measurements before the repeat experiment but not including the repeat
+  experiments.
+2. All measurements, but excluding measurements that were repeated in the
+  repeat experiment.
+
+This way it should be easy to compare these two complete datasets in follow-up
+analysis.
+
+```{r}
+single_dose_datasets <- bind_rows(
+  only_original = single_dose_processed %>%
+    filter(experiment_group == "original"),
+  original_repeat_replaced = single_dose_processed %>%
+    filter(experiment_group == "original") %>%
+    anti_join(
+      single_dose_processed %>%
+        filter(experiment_group == "repeat"),
+      by = c(
+        "lspci_id", "hmsl_id", "DiscoveRx Gene Symbol", "Entrez Gene Symbol",
+        "Compound Concentration (nM)"
+      )
+    ) %>%
+    bind_rows(
+      single_dose_processed %>%
+        filter(experiment_group == "repeat")
+    ),
+  .id = "dataset"
+)
+
+fwrite(single_dose_datasets, here("data", "okl_single_dose_datasets.csv.gz"))
 ```
 
 ## Upload to Synapse
 
 ```{r synapse}
-activity <- synapser::Activity(
-  name = "Wrangle OKL KinomeScan data",
-  used = unname(inputs),
-  executed = "https://github.com/labsyspharm/okl-analysis/blob/main/wrangle_data.Rmd"
-)
+# activity <- synapser::Activity(
+#   name = "Wrangle OKL KinomeScan data",
+#   used = unname(inputs),
+#   executed = "https://github.com/labsyspharm/okl-analysis/blob/main/wrangle_data.Rmd"
+# )
 
 c(
-  here("data", "okl_single_dose.csv.gz")
+  here("data", "okl_single_dose.csv.gz"),
+  here("data", "okl_single_dose_datasets.csv.gz")
 ) %>%
-  synStoreMany(parentId = "syn18508401", activity = activity, forceVersion = FALSE)
+  synStoreMany(
+    parentId = "syn18508401",
+    activityName = "Wrangle OKL KinomeScan data",
+    used = unname(inputs),
+    executed = "https://github.com/labsyspharm/okl-analysis/blob/main/wrangle_data.Rmd",
+    forceVersion = FALSE
+  )
 ```
