@@ -23,14 +23,16 @@ syn <- synDownloader("~/data/", .cache = TRUE)
 ```{r loading}
 inputs <- list(
   okl_single_dose = "syn26486828",
+  okl_single_dose_datasets = "syn52504516",
+  okl_single_dose_no_agg = "syn52505898",
   # hmsl_single_dose = "syn26260430",
   # hmsl_single_dose_agg = "syn26260426",
-  compound_dictionary = "syn26260332",
-  kinase_info = "syn51286743",
+  # compound_dictionary = "syn26260332",
+  kinase_info = "syn51286743"
   # references = "syn26260402",
   # target_mapping = "syn26260398",
   # target_dictionary = "syn26260394",
-  compound_mapping = "syn26260389"
+  # compound_mapping = "syn26260389"
 )
 
 input_files <- map(
@@ -40,20 +42,26 @@ input_files <- map(
 single_dose <- input_files[["okl_single_dose"]] %>%
   fread()
 
-compound_dictionary <- input_files[["compound_dictionary"]] %>%
-  read_fst(as.data.table = TRUE)
+single_dose_datasets <- input_files[["okl_single_dose_datasets"]] %>%
+  fread()
 
-#compound_mapping <- input_files[["compound_mapping"]] %>%
-  read_fst(as.data.table = TRUE)
+single_dose_no_agg <- input_files[["okl_single_dose_no_agg"]] %>%
+  fread()
 
-compound_names <- compound_dictionary %>%
-  select(lspci_id, name = pref_name) %>%
-  drop_na() %>%
-  # lazy_dt() %>%
-  group_by(lspci_id) %>%
-  slice_head(n = 1) %>%
-  ungroup()
-  # as_tibble()
+# compound_dictionary <- input_files[["compound_dictionary"]] %>%
+#   read_fst(as.data.table = TRUE)
+
+# #compound_mapping <- input_files[["compound_mapping"]] %>%
+#   read_fst(as.data.table = TRUE)
+
+# compound_names <- compound_dictionary %>%
+#   select(lspci_id, name = pref_name) %>%
+#   drop_na() %>%
+#   # lazy_dt() %>%
+#   group_by(lspci_id) %>%
+#   slice_head(n = 1) %>%
+#   ungroup()
+#   # as_tibble()
 
 kinase_info <- input_files[["kinase_info"]] %>%
   read_csv()
@@ -68,14 +76,6 @@ p <- single_dose %>%
     labs(color = "Concentration")
 ggsave("all_combs_percent_control_hist.pdf", p, width = 5, height = 3)
 ```
-
-
-```{r}
-single_dose %>%
-  count(hmsl_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`, `Percent Control`) %>%
-  count(n)
-```
-
 
 ```{r}
 per_conc <- single_dose %>%
@@ -366,6 +366,9 @@ single_dose_trans <- single_dose %>%
     inhib_hit = `Percent Control` <= 35 & !qpcr_miss
   ) %>%
   as_tibble()
+```
+
+```{r}
 
 single_dose_trans %>%
   count(qpcr_miss)
@@ -865,6 +868,19 @@ ggsave(
 ```
 
 ```{r}
+filter_drug <- function(name, data) {
+  data_filtered <- if (is.numeric(name))
+    data %>%
+      filter(lspci_id == .env$name)
+  else if (str_starts(name, "HMSL"))
+    data %>%
+      filter(hmsl_id == .env$name)
+  else
+    data %>%
+      filter(name == .env$name)
+  data_filtered
+}
+
 plot_beeswarm_single_drug <- function(name) {
   library(ggbeeswarm)
   lspci_id <- if (is.numeric(name))
@@ -879,25 +895,31 @@ plot_beeswarm_single_drug <- function(name) {
       geom_quasirandom()
 }
 
-plot_heatmap_single_drug <- function(name) {
+library(seriation)
+cluster_fun <- function(x) {
+  d <- dist(x)
+  #   d <- as.dist(1 - cor(t(x)))
+  # browser()
+  clust <- hclust(d, method = "average")
+  reorder(clust, dist = d, method = "olo")
+}
+
+viridis_map <- viridis::viridis(100)
+
+plot_heatmap_single_drug <- function(name, data) {
   library(ggbeeswarm)
-  lspci_id <- if (is.numeric(name))
-    name
-  else if (str_starts(name, "HMSL"))
-    compound_mapping[external_id == name][["lspci_id"]][1]
-  else
-    compound_dictionary[pref_name == name][["lspci_id"]][1, 1]
-  d <- single_dose %>%
-    filter(lspci_id == .env$lspci_id) %>%
-    mutate(across(`Compound Concentration (nM)`, . %>% as.factor() %>% fct_inseq())) %>%
+  data_filtered <- filter_drug(name, data)
+  d <- data_filtered %>%
+    mutate(across(`Compound Concentration (nM)`, ~fct_inseq(as.character(.x)))) %>%
+    arrange(`Compound Concentration (nM)`) %>%
     select(`DiscoveRx Gene Symbol`, `Compound Concentration (nM)`, `Percent Control`) %>%
-    pivot_wider(names_from = `DiscoveRx Gene Symbol`, values_from = `Percent Control`) %>%
-    column_to_rownames("Compound Concentration (nM)")
+    pivot_wider(names_from = `Compound Concentration (nM)`, values_from = `Percent Control`) %>%
+    column_to_rownames("DiscoveRx Gene Symbol")
   ComplexHeatmap::Heatmap(
     as.matrix(d),
-    show_column_names = FALSE,
-    cluster_rows = FALSE,
-    row_order = order(as.double(rownames(d))),
+    show_column_names = TRUE,
+    cluster_columns = FALSE,
+    cluster_rows = cluster_fun,
     col = rev(viridis_map)
   )
   # pheatmap(
@@ -916,33 +938,51 @@ plot_heatmap_single_drug <- function(name) {
     # scale_fill_viridis_c(direction = -1)
 }
 
-plot_single_drug <- function(drug, target) {
+plot_heatmap_single_drug(
+  "ERLOTINIB",
+  single_dose_datasets %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000), dataset == "only_original")
+)
+
+plot_single_drug <- function(drug, target, data, point_aes = NULL) {
   library(ggbeeswarm)
-  lspci_id <- if (is.numeric(drug))
-    drug
-  else if (str_starts(drug, "HMSL"))
-    compound_mapping[external_id == drug][["lspci_id"]][1]
-  else
-    compound_dictionary[pref_name == drug][["lspci_id"]][1, 1]
-  df <- single_dose %>%
-    filter(lspci_id == .env$lspci_id, str_detect(`DiscoveRx Gene Symbol`, target))
-  misses <- qpcr_misses %>%
-    rename(
-      `DiscoveRx Gene Symbol` = `Ambit Gene Symbol`,
-      `Compound Concentration (nM)` = `Compound Conc`
-    ) %>%
-    filter(lspci_id == .env$lspci_id, str_detect(`DiscoveRx Gene Symbol`, target))
-  p <- df %>%
+  data_filtered <- filter_drug(drug, data) %>%
+    filter(str_detect(`DiscoveRx Gene Symbol`, target))
+  p <- data_filtered %>%
     ggplot(aes(as.ordered(`Compound Concentration (nM)`), `Percent Control`)) +
-      geom_quasirandom(groupOnX = TRUE) +
-      geom_point(data = misses, y = 100, color = "red", size = 3, shape = 8)
-  if (length(unique(df$`DiscoveRx Gene Symbol`)) > 1)
+      geom_quasirandom(
+        mapping = point_aes,
+        groupOnX = TRUE,
+        data = ~filter(.x, !qpcr_miss)
+      ) +
+      geom_point(
+        data = ~filter(.x, qpcr_miss),
+        y = 100, color = "red", size = 3, shape = 8
+      )
+  if (length(unique(data_filtered$`DiscoveRx Gene Symbol`)) > 1)
     p <- p +
       facet_wrap(~`DiscoveRx Gene Symbol`)
   p
 }
 
-p <- plot_single_drug("HMSL10004", "TYK2")
+p <- plot_single_drug(
+  "TOFACITINIB", "TYK2",
+  single_dose_no_agg %>%
+  filter(
+    `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)
+  ),
+  point_aes = aes(color = experiment)
+)
+p
+
+p <- plot_single_drug(
+  "TOFACITINIB", "TYK2",
+  single_dose_datasets %>%
+    filter(
+      `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000),
+      dataset == "original_repeat_replaced"
+    )
+)
 p
 
 p <- plot_heatmap_single_drug("HMSL10139")
@@ -1079,35 +1119,21 @@ n_flagged_binary %>%
 ```
 
 ```{r}
-single_dose_groups <- single_dose_trans %>%
-  distinct(lspci_id, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`, superseded) %>%
+single_dose_datasets_trans <- single_dose_datasets %>%
   mutate(
-    dataset_version = if_else(superseded, "original", "repeat")
+    log_inhibition = log10(`Percent Control` + 0.01),
+    log_conc = log10(`Compound Concentration (nM)`),
+    inhib_hit = `Percent Control` <= 35 & !qpcr_miss
   ) %>%
-  select(-superseded) %>%
-  nest_join(
-    single_dose_trans,
-    keep = TRUE,
-    name = "data",
-    by = c("lspci_id", "hmsl_id", "DiscoveRx Gene Symbol")
-  ) %>%
-  mutate(
-    data = map2(
-      data,
-      dataset_version,
-      \(df, version) {
-        if (version == "original") {
-          df <- df %>%
-            filter(!str_detect(experiment, "repeat"))
-        } else {
-          df <- df %>%
-            filter(!superseded)
-        }
-        df %>%
-          filter(!qpcr_miss) %>%
-          arrange(`Compound Concentration (nM)`)
-      }
-    )
+  as_tibble()
+
+single_dose_groups <- single_dose_datasets_trans %>%
+  filter(!qpcr_miss) %>%
+  arrange(`Compound Concentration (nM)`) %>%
+  group_nest(
+    dataset, lspci_id, hmsl_id, library, name, `DiscoveRx Gene Symbol`,
+    `Entrez Gene Symbol`, entrezgene_id, ensembl_gene_id, hgnc_symbol,
+    exclude_target
   )
 
 single_dose_hits <- single_dose_groups %>%
@@ -1167,19 +1193,7 @@ single_dose_classification <- single_dose_classification_res2 %>%
         ordered = TRUE
       )
   ) %>%
-  ungroup() %>%
-  power_left_join(
-    compound_names,
-    by = "lspci_id",
-    check = check_specs(
-      duplicate_keys_right = "abort",
-      unmatched_keys_left = "abort",
-      unmatched_keys_right = "ignore"
-    )
-  ) %>%
-  select(
-    lspci_id, name, hmsl_id, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`, classification, everything()
-  )
+  ungroup()
 
 library(qs)
 qsave(
@@ -1196,9 +1210,75 @@ write_csv(
   "classification/okl_eurofins_classification.csv"
 )
 # single_dose_classification <- read_csv("classification/okl_eurofins_classification.csv")
+```
+
+Troubleshoot erlotinib
+
+```{r}
+single_dose_classification %>% filter(name == "ERLOTINIB") %>% count(dataset, classification)
+
+set.seed(42)
+plot_single_drug(
+  "ERLOTINIB",
+  single_dose_classification %>%
+    filter(name == "ERLOTINIB", dataset == "original_repeat_replaced", classification == "discordant") %>%
+    pull(`DiscoveRx Gene Symbol`) %>%
+    sample(20) %>%
+    str_escape() %>%
+    paste(collapse = "|"),
+  single_dose_no_agg %>%
+    filter(
+      `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)
+    ),
+  aes(color = experiment)
+) +
+  theme_bw()
+
+  single_dose_classification %>%
+    filter(name == "ERLOTINIB", dataset == "original_repeat_replaced", classification == "discordant") %>%
+    select(where(negate(is.list))) %>%
+    View()
 
 single_dose_classification %>%
-filter(`DiscoveRx Gene Symbol` == "LATS1") %>%
+    filter(name == "ERLOTINIB", dataset == "original_repeat_replaced", classification == "discordant") %>%
+    chuck("data", 1)
+
+set.seed(42)
+plot_single_drug(
+  "ERLOTINIB",
+  single_dose_classification %>%
+    filter(name == "ERLOTINIB", dataset == "original_repeat_replaced", classification == "discordant") %>%
+    pull(`DiscoveRx Gene Symbol`) %>%
+    sample(20) %>%
+    str_escape() %>%
+    paste(collapse = "|"),
+  single_dose_datasets %>%
+    filter(
+      dataset == "only_original",
+      `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)
+    ),
+  aes(color = experiment)
+) +
+  theme_bw()
+```
+
+   dataset                  classification     n
+   <chr>                    <ord>          <int>
+ 1 only_original            binding           37
+ 2 only_original            weakly-binding    19
+ 3 only_original            non-binding      319
+ 4 only_original            undetermined      43
+ 5 only_original            discordant        50
+ 6 original_repeat_replaced binding           10
+ 7 original_repeat_replaced weakly-binding     1
+ 8 original_repeat_replaced non-binding      355
+
+It was just an issue with the ordering of the data. The data has to be ordered
+by concentration in the df fed into the function determining concordance.
+
+```{r}
+single_dose_classification %>%
+  filter(`DiscoveRx Gene Symbol` == "LATS1") %>%
   mutate(
     dataset = if_else(superseded, "original", "repeat")
   ) %>%
@@ -1221,102 +1301,174 @@ single_dose_classification %>%
   ggplot(aes(classification, fill = dataset)) +
     geom_bar(position = "dodge")
 
-library(powerjoin)
-p <- single_dose_classification %>%
-  count(lspci_id, name, classification) %>%
-  complete(nesting(lspci_id, name), classification, fill = list(n = 0)) %>%
-  group_by(lspci_id, name) %>%
+single_dose_classification_by_compound <- single_dose_classification %>%
+  count(dataset, lspci_id, name, classification) %>%
+  complete(nesting(dataset, lspci_id, name), classification, fill = list(n = 0)) %>%
+  group_by(dataset, lspci_id, name) %>%
   mutate(frac = n / sum(n)) %>%
-  ungroup() %>%
-  mutate(
-    name = factor(
-      name,
-      levels = filter(., classification == "binding") %>%
-        arrange(frac) %>%
-        pull(name)
-    )
+  ungroup()
+
+p <- single_dose_classification_by_compound %>%
+  group_by(
+    dataset
   ) %>%
-  arrange(desc(name)) %>%
-  mutate(split_var = floor(seq(from = 0, to = 2.99999, length.out = n()))) %>%
-  ggplot(aes(frac, name, color = classification)) +
-    geom_point() +
-    scale_color_manual(
-      values = c(
-        "binding" = "firebrick1",
-        "weakly-binding" = "darkorange",
-        "non-binding" = "black",
-        "undetermined" = "gray",
-        "discordant" = "blue"
-      )
-    ) +
-    facet_wrap(~split_var, scales = "free_y", nrow = 1) +
-    theme(strip.text = element_blank()) +
-    labs(x = "Fraction of dose-response curves", y = "Compound")
+  summarize(
+    p = list(
+      cur_data() %>%
+        mutate(
+          name = factor(
+            name,
+            levels = filter(., classification == "binding") %>%
+              arrange(frac) %>%
+              pull(name)
+          )
+        ) %>%
+        arrange(desc(name)) %>%
+        mutate(split_var = floor(seq(from = 0, to = 2.99999, length.out = n()))) %>%
+        ggplot(aes(frac, name, color = classification)) +
+          geom_point() +
+          scale_color_manual(
+            values = c(
+              "binding" = "firebrick1",
+              "weakly-binding" = "darkorange",
+              "non-binding" = "black",
+              "undetermined" = "gray",
+              "discordant" = "blue"
+            )
+      ) +
+      facet_wrap(~split_var, scales = "free_y", nrow = 1) +
+      theme(strip.text = element_blank()) +
+      labs(x = "Fraction of dose-response curves", y = "Compound")),
+    .groups = "drop"
+  )
 
 dir.create("classification")
-ggsave(
-  "classification/lm_classification_waterfall.pdf", p, width = 18, height = 10
-)
-
-
-library(powerjoin)
-p <- single_dose_classification %>%
-  count(`DiscoveRx Gene Symbol`, classification) %>%
-  complete(`DiscoveRx Gene Symbol`, classification, fill = list(n = 0)) %>%
-  group_by(`DiscoveRx Gene Symbol`) %>%
-  mutate(frac = n / sum(n)) %>%
-  ungroup() %>%
-  mutate(
-    `DiscoveRx Gene Symbol` = factor(
-      `DiscoveRx Gene Symbol`,
-      levels = filter(., classification == "binding") %>%
-        arrange(frac) %>%
-        pull(`DiscoveRx Gene Symbol`)
+pwalk(
+  p,
+  \(dataset, p) {
+    ggsave(
+      file.path("classification", paste0("lm_classification_waterfall_", dataset, ".pdf")),
+      p, width = 18, height = 10
     )
-  ) %>%
-  arrange(desc(`DiscoveRx Gene Symbol`)) %>%
-  mutate(split_var = floor(seq(from = 0, to = 2.99999, length.out = n()))) %>%
-  ggplot(aes(frac, `DiscoveRx Gene Symbol`, color = classification)) +
-    geom_point() +
-    scale_color_manual(
-      values = c(
-        "binding" = "firebrick1",
-        "weakly-binding" = "darkorange",
-        "non-binding" = "black",
-        "undetermined" = "gray",
-        "discordant" = "blue"
-      )
-    ) +
-    facet_wrap(~split_var, scales = "free_y", nrow = 1) +
-    theme(strip.text = element_blank()) +
-    labs(x = "Fraction of dose-response curves", y = "Kinase")
-
-ggsave(
-  "classification/lm_classification_waterfall_kinases.pdf", p, width = 18, height = 14
+  }
 )
 
+
+p <- single_dose_classification_by_compound %>%
+  group_by(
+    dataset
+  ) %>%
+  summarize(
+    p = list(
+      cur_data() %>%
+        mutate(
+          `DiscoveRx Gene Symbol` = factor(
+            `DiscoveRx Gene Symbol`,
+            levels = filter(., classification == "binding") %>%
+              arrange(frac) %>%
+              pull(`DiscoveRx Gene Symbol`)
+          )
+        ) %>%
+        arrange(desc(`DiscoveRx Gene Symbol`)) %>%
+        mutate(split_var = floor(seq(from = 0, to = 2.99999, length.out = n()))) %>%
+        ggplot(aes(frac, `DiscoveRx Gene Symbol`, color = classification)) +
+          geom_point() +
+          scale_color_manual(
+            values = c(
+              "binding" = "firebrick1",
+              "weakly-binding" = "darkorange",
+              "non-binding" = "black",
+              "undetermined" = "gray",
+              "discordant" = "blue"
+            )
+      ) +
+      facet_wrap(~split_var, scales = "free_y", nrow = 1) +
+      theme(strip.text = element_blank()) +
+      labs(x = "Fraction of dose-response curves", y = "Kinase")),
+    .groups = "drop"
+  )
+
+dir.create("classification")
+pwalk(
+  p,
+  \(dataset, p) {
+    ggsave(
+      file.path("classification", paste0("lm_classification_waterfall_kinases_", dataset, ".pdf")),
+      p, width = 18, height = 14
+    )
+  }
+)
 
 library(ggbeeswarm)
 p <- single_dose_classification %>%
-  count(lspci_id, name, classification) %>%
-  complete(nesting(lspci_id, name), classification, fill = list(n = 0)) %>%
-  group_by(lspci_id, name) %>%
+  count(dataset, lspci_id, name, classification) %>%
+  complete(nesting(dataset, lspci_id, name), classification, fill = list(n = 0)) %>%
+  group_by(dataset, lspci_id, name) %>%
   mutate(frac = n / sum(n)) %>%
   ungroup() %>%
-  mutate(
-    name = factor(
-      name,
-      levels = filter(., classification == "binding") %>%
-        arrange(frac) %>%
-        pull(name)
-    )
-  ) %>%
-  ggplot(aes(classification, frac)) +
-    geom_quasirandom()
+  group_by(dataset) %>%
+  summarize(
+    p = list(
+      cur_data() %>%
+      mutate(
+        name = factor(
+          name,
+          levels = filter(., classification == "binding") %>%
+            arrange(frac) %>%
+            pull(name)
+        )
+      ) %>%
+      ggplot(aes(classification, frac)) +
+        geom_quasirandom()
+    ),
+    .groups = "drop"
+  )
 
-ggsave(
-  "classification/hist_classes.pdf", p, width = 8, height = 6
+pwalk(
+  p,
+  \(dataset, p) {
+    ggsave(
+      file.path("classification", paste0("hist_classes_", dataset, ".pdf")), p,
+      width = 8, height = 6
+    )
+  }
 )
+
+p <- single_dose_classification_by_compound %>%
+  pivot_wider(names_from = dataset, values_from = c(n, frac)) %>%
+  ggplot(
+    aes(x = frac_only_original, y = frac_original_repeat_replaced)
+  ) +
+  geom_point() +
+  facet_wrap(~classification, scales = "free") +
+  geom_abline(slope = 1, intercept = 0)
+
+library(ggalluvial)
+single_dose_classification_change <- single_dose_classification %>%
+  select(
+    dataset, lspci_id, hmsl_id, library, name,
+    `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
+    hgnc_symbol, inhib_concordant, classification
+  ) %>%
+  pivot_wider(names_from = dataset, values_from = c(inhib_concordant, classification))
+
+single_dose_classification_change_agg <- single_dose_classification_change %>%
+  count(classification_only_original, classification_original_repeat_replaced)
+
+
+p <- single_dose_classification_change_agg %>%
+  # filter(classification_only_original == "discordant" | classification_original_repeat_replaced == "discordant") %>%
+  ggplot(
+    aes(axis1 = classification_only_original, axis2 = classification_original_repeat_replaced, y = n)
+  ) +
+  geom_alluvium(
+    aes(fill = classification_only_original == "discordant")
+  ) +
+  scale_fill_manual(
+    values = c(`TRUE` = "red", `FALSE` = "white")
+  ) +
+  geom_stratum() +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)))
 
 library(egg)
 set.seed(42)
