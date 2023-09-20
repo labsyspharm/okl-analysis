@@ -113,6 +113,8 @@ klaeger_mapping <- bind_rows(
   )
 ```
 
+RDEA-436 remains unmapped to a compound ID. I coulnd't find a structure for it
+so assuming that it's orphaned and ignoring it.
 
 ```{r}
 
