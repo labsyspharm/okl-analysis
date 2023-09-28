@@ -160,9 +160,10 @@ write_csv(
     klaeger_ic50s_matched,
     file.path("data", "klaeger_ic50s.csv.gz")
 )
+
 synStoreMany(
     file.path("data", "klaeger_ic50s.csv.gz"),
-    parentId = "syn45321440",
+    parentId = "syn18508401",
     forceVersion = FALSE
 )
 
