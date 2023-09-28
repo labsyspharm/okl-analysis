@@ -67,6 +67,58 @@ kinase_info <- input_files[["kinase_info"]] %>%
   read_csv()
 ```
 
+Do duplicate measurements agree on average?
+
+Can't take into account dupes that only exist because we repeated certain
+problematic measurements.
+
+```{r}
+single_dose_dupes <- single_dose_no_agg %>%
+  anti_join(
+    single_dose_no_agg %>%
+      filter(experiment_group == "repeat") %>%
+      mutate(experiment_group = "original"),
+    by = c("lspci_id", "DiscoveRx Gene Symbol", "Compound Concentration (nM)", "experiment_group")
+  ) %>%
+  group_by(lspci_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`) %>%
+  filter(n() > 1) %>%
+  mutate(dup_id = 1:n()) %>%
+  ungroup()
+
+single_dose_dupes %>%
+  count(name, `Compound Concentration (nM)`)
+
+single_dose_dupes %>%
+  count(dup_id)
+
+p <- single_dose_dupes %>%
+  filter(!qpcr_miss) %>%
+  select(
+    lspci_id, name, `DiscoveRx Gene Symbol`,
+    `Compound Concentration (nM)`, dup_id, `Percent Control`, experiment
+  ) %>%
+  pivot_wider(names_from = dup_id, values_from = c(experiment, `Percent Control`)) %>%
+  ggplot(
+    aes(`Percent Control_1`, `Percent Control_2`, color = fct_inseq(as.character(`Compound Concentration (nM)`)))
+  ) +
+    geom_point(alpha = 0.5, shape = 16) +
+    labs(x = "Percent Control Experiment 1", y = "Percent Control Experiment 2", title = "Agreement between duplicate experiments")
+
+ggsave(
+  "plots/agreement_duplicate_experiments.pdf", p,
+  width = 4, height = 4
+)
+
+single_dose_dupes %>%
+  filter(!qpcr_miss) %>%
+  select(
+    lspci_id, name, `DiscoveRx Gene Symbol`,
+    `Compound Concentration (nM)`, dup_id, `Percent Control`, experiment
+  ) %>%
+  pivot_wider(names_from = dup_id, values_from = c(experiment, `Percent Control`)) %>% 
+  filter(`Percent Control_1` < 10, `Percent Control_2` > 30) %>% View()
+```
+
 ```{r}
 p <- single_dose %>%
   filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
@@ -1170,7 +1222,12 @@ single_dose_classification_res <- single_dose_hits %>%
 
 single_dose_classification_res2 <- single_dose_classification_res %>%
   unnest(lin_mod_res) %>%
-  filter(term == "log_conc")
+  filter(term == "log_conc") %>%
+  select(-c(term, std.error, statistic)) %>%
+  rename(
+    slope_percent_control = estimate,
+    p_value_slope = p.value
+  )
 
 single_dose_classification <- single_dose_classification_res2 %>%
   rowwise() %>%
@@ -1182,7 +1239,10 @@ single_dose_classification <- single_dose_classification_res2 %>%
         "non-binding"
       } else if (inhib_concordant && sum(data$inhib_hit) >= 2) {
         "binding"
-      } else if (!is.na(estimate) && !is.na(p.value) && estimate < 0 && p.value < 0.1) {
+      } else if (
+        !is.na(slope_percent_control) && !is.na(p_value_slope) &&
+          slope_percent_control < 0 && p_value_slope < 0.1
+      ) {
         "weakly-binding"
       } else {
         "undetermined"
@@ -1600,8 +1660,8 @@ ggsave(
 
 ```
 
-```{r pseudo_ic_50}
-compute_pseudo_ic50 <- function(df) {
+```{r pseudo_kd}
+compute_pseudo_kd <- function(df) {
   df <- df %>%
     mutate(below_50 = `Percent Control` < 50)
   if (length(unique(df$below_50)) == 2 && !df$below_50[1]) {
@@ -1611,11 +1671,11 @@ compute_pseudo_ic50 <- function(df) {
       browser()
     mdl <- lm(`Percent Control` ~ log_conc, data = mdl_data)
     list(
-      pseudo_ic50 = 10^(chemCal::inverse.predict(mdl, 50)$Prediction),
-      pseudo_ic50_relation = "=",
-      # Make sure all values beyond the IC50 value are below 50
+      pseudo_kd = 10^(chemCal::inverse.predict(mdl, 50)$Prediction),
+      pseudo_kd_relation = "=",
+      # Make sure all values beyond the kd value are below 50
       # otherwise label as discordant
-      pseudo_ic50_concordant = if (
+      pseudo_kd_concordant = if (
         over_under_50_idx[2] == nrow(df) ||
         all(tail(df$`Percent Control`, -over_under_50_idx[2]) < 50)
       ) {
@@ -1626,54 +1686,59 @@ compute_pseudo_ic50 <- function(df) {
     )
   } else if (all(df$below_50)) {
     list(
-      pseudo_ic50 = min(df$`Compound Concentration (nM)`),
-      pseudo_ic50_relation= "<",
-      pseudo_ic50_concordant = "concordant"
+      pseudo_kd = min(df$`Compound Concentration (nM)`),
+      pseudo_kd_relation= "<",
+      pseudo_kd_concordant = "concordant"
     )
   } else if (!any(df$below_50)) {
     list(
-      pseudo_ic50 = max(df$`Compound Concentration (nM)`),
-      pseudo_ic50_relation= ">",
-      pseudo_ic50_concordant = "concordant"
+      pseudo_kd = max(df$`Compound Concentration (nM)`),
+      pseudo_kd_relation= ">",
+      pseudo_kd_concordant = "concordant"
     )
   } else {
     list(
-      pseudo_ic50 = NA_real_,
-      pseudo_ic50_relation = NA_character_,
-      pseudo_ic50_concordant = NA_character_
+      pseudo_kd = NA_real_,
+      pseudo_kd_relation = NA_character_,
+      pseudo_kd_concordant = NA_character_
     )
   }
 }
 
 
 library(chemCal)
-pseudo_ic50_raw <- single_dose_classification %>%
+pseudo_kd_raw <- single_dose_classification %>%
   mutate(
-    pseudo_ic50 = map(
+    pseudo_kd = map(
       data,
-      compute_pseudo_ic50
+      compute_pseudo_kd
     )
   )
 
-pseudo_ic50 <- pseudo_ic50_raw %>%
+pseudo_kd <- pseudo_kd_raw %>%
   unnest_wider(
-    pseudo_ic50
+    pseudo_kd
   )
 
-write_csv(
-  pseudo_ic50,
-  "classification/okl_eurofins_pseudo_ic50.csv"
+qsave(
+  pseudo_kd,
+  "classification/okl_eurofins_pseudo_kd_raw.qs"
 )
-pseudo_ic50 <- fread("classification/okl_eurofins_pseudo_ic50.csv")
+# pseudo_kd <- qread("classification/okl_eurofins_pseudo_kd_raw.qs")
 
-
+write_csv(
+  pseudo_kd %>%
+    select(where(negate(is.list))),
+  "classification/okl_eurofins_pseudo_kd.csv"
+)
+# pseudo_kd <- fread("classification/okl_eurofins_pseudo_kd.csv")
 ```
 
 
 ```{r upload_synapse}
 synStoreMany(
   c(
-    "classification/okl_eurofins_pseudo_ic50.csv",
+    "classification/okl_eurofins_pseudo_kd.csv",
     "classification/okl_eurofins_classification.csv",
     "classification/okl_eurofins_classification_raw.qs"
   ),
@@ -1682,6 +1747,277 @@ synStoreMany(
   executed = "https://github.com/labsyspharm/okl-analysis/blob/main/okl_descriptive.Rmd",
   forceVersion = FALSE
 )
+
+```
+
+Compute partition index
+
+Analysis of kinase inhibitor selectivity using a thermodynamics-based partition index
+Alan C Cheng  1 , John Eksterowicz, Stephanie Geuns-Meyer, Yaxiong Sun
+
+
+```{r}
+partition_index <- pseudo_kd %>%
+  # filter(pseudo_ic50_relation == "=") %>%
+  filter(!exclude_target) %>%
+  group_by(dataset, lspci_id) %>%
+  filter(n() > 50) %>%
+  mutate(
+    partition_index = (1 / pseudo_kd) / sum(1 / pseudo_kd, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+write_csv(
+  partition_index %>%
+    select(where(negate(is.list))),
+  "classification/okl_eurofins_partition_index.csv"
+)
+
+partition_index_max <- partition_index %>%
+  group_by(
+    dataset, lspci_id, hmsl_id, library, name
+  ) %>%
+  summarize(
+    partition_index_max = max(partition_index, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(
+  partition_index_max %>%
+    select(where(negate(is.list))),
+  "classification/okl_eurofins_partition_index_max.csv"
+)
+
+synStoreMany(
+  c(
+    "classification/okl_eurofins_partition_index.csv",
+    "classification/okl_eurofins_partition_index_max.csv"
+  ),
+  parentId = "syn18508401",
+  used = unname(inputs),
+  executed = "https://github.com/labsyspharm/okl-analysis/blob/main/okl_descriptive.Rmd",
+  forceVersion = FALSE
+)
+
+```
+
+
+```{r}
+partition_index_max %>%
+  ggplot(aes(partition_index_max)) +
+    geom_histogram() +
+    facet_wrap(~dataset + library)
+  
+partition_index_max %>%
+  ggplot(aes(partition_index_max, color = dataset)) +
+    stat_ecdf() +
+    lims(x = c(0, 1)) +
+    facet_wrap(~library)
+```
+
+
+```{r}
+catds <- single_dose_datasets %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  group_by(dataset, lspci_id, `Compound Concentration (nM)`) %>%
+  filter(n() > 50) %>%
+  mutate(
+    catds = (100 - `Percent Control`) / sum(100 - `Percent Control`)
+  ) %>%
+  ungroup()
+
+catds_max <- catds %>%
+  group_by(dataset, lspci_id, `Compound Concentration (nM)`) %>%
+  summarize(
+    catds_max = max(catds, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+catds %>%
+  filter(
+    `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)
+  ) %>%
+  ggplot(
+    aes(catds, color = fct_inseq(as.character(`Compound Concentration (nM)`)))
+  ) +
+  geom_density() +
+  facet_wrap(~dataset) +
+  scale_y_log10()
+
+catds_max %>%
+  filter(
+    `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)
+  ) %>%
+  ggplot(
+    aes(catds_max, color = fct_inseq(as.character(`Compound Concentration (nM)`)))
+  ) +
+  geom_density() +
+  facet_wrap(~dataset)
+
+catds_max %>%
+  ggplot(
+    aes(catds_max, color = fct_inseq(as.character(`Compound Concentration (nM)`)))
+  ) +
+  stat_ecdf() +
+  facet_wrap(~dataset) +
+  lims(x = c(0, 1))
+
+catds %>%
+  filter(name == "TOFACITINIB", str_detect(hgnc_symbol, "JAK")) %>%
+  View()
+
+catds %>%
+  mutate(target_engagement = 100 - `Percent Control`) %>%
+  filter(name == "TOFACITINIB", `Compound Concentration (nM)` == 12.5) %>%
+  View()
+
+klaeger_ic50s <- syn("syn51288931") %>%
+  read_csv()
+
+klaeger_partition_index <- klaeger_ic50s %>%
+  # filter(IC50_relation == "=") %>%
+  group_by(lspci_id, Compound) %>%
+  mutate(
+    partition_index = (1 / IC50) / sum(1 / IC50, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+klaeger_partition_index_max <- klaeger_partition_index %>%
+  group_by(lspci_id, Compound) %>%
+  summarize(
+    partition_index_max = max(partition_index, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+klaeger_partition_index_max %>%
+  ggplot(aes(partition_index_max)) +
+    stat_ecdf() +
+    lims(x = c(0, 1))
+
+shared_targets_klaeger_okl <- intersect(
+  klaeger_ic50s$Name,
+  pseudo_ic50$hgnc_symbol
+)
+
+kd_klaeger_okl <- bind_rows(
+  pseudo_kd %>%
+    filter(
+      hgnc_symbol %in% shared_targets_klaeger_okl,
+      !exclude_target,
+      classification != "discordant"
+    ) %>%
+    transmute(
+      lspci_id, hgnc_symbol, name, dataset,
+      pseudo_ic50, pseudo_ic50_relation, pseudo_ic50_concordant,
+      source = "okl"
+    ),
+  klaeger_ic50s %>%
+    filter(
+      Name %in% shared_targets_klaeger_okl
+    ) %>%
+    transmute(
+      lspci_id, hgnc_symbol = Name, name = Compound,
+      dataset = "klaeger",
+      pseudo_ic50 = IC50, pseudo_ic50_relation = IC50_relation,
+      pseudo_ic50_concordant = "concordant",
+      source = "klaeger"
+    )
+) %>%
+  mutate(
+    source_dataset = paste(source, dataset, sep = "_")
+  )
+
+partition_index_klaeger_okl <- ic50_klaeger_okl %>%
+  # filter(pseudo_ic50_relation == "=") %>%
+  group_by(source, dataset, source_dataset, lspci_id) %>%
+  # filter(n() > 50) %>%
+  mutate(
+    partition_index = (1 / pseudo_ic50) / sum(1 / pseudo_ic50, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+partition_index_max_klaeger_okl <- partition_index_klaeger_okl %>%
+  group_by(source, dataset, source_dataset, lspci_id) %>%
+  summarize(
+    partition_index_max = max(partition_index, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+partition_index_max_klaeger_okl %>%
+  ggplot(aes(partition_index_max, color = source_dataset)) +
+    stat_ecdf() +
+    lims(x = c(0, 1))
+
+p <- partition_index_max_klaeger_okl %>%
+  filter(
+    lspci_id %in% {
+      group_by(., lspci_id) %>%
+      filter(uniqueN(source) == 2) %>%
+      pull(lspci_id)
+    }
+  ) %>%
+  ggplot(aes(partition_index_max, color = source_dataset)) +
+    stat_ecdf() +
+    lims(x = c(0, 1)) +
+    labs(
+      x = "Partition index",
+      y = "Cumulative fraction of compounds",
+      title = "Compounds and targets shared between Klaeger and OKL",
+      color = "Dataset"
+    )
+
+ggsave(
+  file.path("plots", "partition_index_klaeger_okl_shared_compounds_and_targets_ecdf.pdf"),
+  p, width = 6, height = 4
+)
+
+p <- partition_index_max_klaeger_okl %>%
+  filter(
+    lspci_id %in% {
+      group_by(., lspci_id) %>%
+      filter(uniqueN(source) == 2) %>%
+      pull(lspci_id)
+    }
+  ) %>%
+  select(-source, -dataset) %>%
+  pivot_wider(names_from = source_dataset, values_from = partition_index_max) %>%
+  ggplot(aes(klaeger_klaeger, okl_original_repeat_replaced)) +
+    geom_point(shape = 16, alpha = 0.5) +
+    geom_smooth(method = "lm") +
+    lims(x = c(0, 1), y = c(0, 1)) +
+    labs(x = "Partition index Klaeger", y = "Partition index OKL (repeat)")
+
+
+ggsave(
+  file.path("plots", "partition_index_klaeger_vs_okl_shared_compounds_and_targets.pdf"),
+  p, width = 5, height = 5
+)
+
+partition_index_max_klaeger_okl %>%
+  filter(
+    lspci_id %in% {
+      group_by(., lspci_id) %>%
+      filter(uniqueN(source) == 2) %>%
+      pull(lspci_id)
+    }
+  ) %>%
+  select(-source, -dataset) %>%
+  pivot_wider(names_from = source_dataset, values_from = partition_index_max) %>%
+  {cor.test(.$klaeger_klaeger, .$okl_original_repeat_replaced)}
+
+
+partition_index_max_klaeger_okl %>%
+  filter(
+    lspci_id %in% {
+      group_by(., lspci_id) %>%
+      filter(uniqueN(source) == 2) %>%
+      pull(lspci_id)
+    }
+  ) %>%
+  ggplot(aes(partition_index_max, fill = source_dataset)) +
+    geom_bar(stat = "bin", color = "black", alpha = 0.5, position = "identity") +
+    lims(x = c(0, 1))
+
 
 ```
 
