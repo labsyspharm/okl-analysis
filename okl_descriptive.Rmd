@@ -1260,9 +1260,7 @@ qsave(
   single_dose_classification,
   file.path("classification", "okl_eurofins_classification_raw.qs")
 )
-# single_dose_classification <- qread(
-#   file.path("classification", "okl_eurofins_classification_raw.qs")
-# )
+# single_dose_classification <- qread(file.path("classification", "okl_eurofins_classification_raw.qs"))
 
 write_csv(
   single_dose_classification %>%
@@ -1718,6 +1716,15 @@ pseudo_kd_raw <- single_dose_classification %>%
 pseudo_kd <- pseudo_kd_raw %>%
   unnest_wider(
     pseudo_kd
+  ) %>%
+  mutate(
+    pseudo_kd_n_doses_missing = map_int(
+      data,
+      \(x) {
+        # Check that all doses are present
+        length(setdiff(c(12.5, 100, 1000, 10000), x$`Compound Concentration (nM)`))
+      }
+    )
   )
 
 qsave(
