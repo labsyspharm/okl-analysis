@@ -463,6 +463,32 @@ single_dose_datasets <- bind_rows(
 )
 
 fwrite(single_dose_datasets, here("data", "okl_single_dose_datasets.csv.gz"))
+# single_dose_datasets <- fread(here("data", "okl_single_dose_datasets.csv.gz"))
+```
+
+Find for which compounds we have all four measurements.
+
+```{r}
+compound_stats_datasets <- single_dose_datasets %>%
+  group_by(dataset, lspci_id, name, `Compound Concentration (nM)`) %>%
+  summarize(
+    all_measured = (n() / 468) >= 1,
+    .groups = "drop"
+  ) %>%
+  arrange(dataset, `Compound Concentration (nM)`) %>%
+  pivot_wider(
+    names_from = `Compound Concentration (nM)`,
+    values_from = all_measured,
+    values_fill = list(all_measured = FALSE)
+  ) %>%
+  mutate(
+    standard_doses_measured = `12.5` & `100` & `1000` & `10000`
+  )
+
+fwrite(
+  compound_stats_datasets,
+  here("data", "okl_single_dose_datasets_compound_stats.csv.gz")
+)
 ```
 
 ## Upload to Synapse
@@ -477,7 +503,8 @@ fwrite(single_dose_datasets, here("data", "okl_single_dose_datasets.csv.gz"))
 c(
   here("data", "okl_single_dose.csv.gz"),
   here("data", "okl_single_dose_datasets.csv.gz"),
-  here("data", "okl_single_dose_no_agg.csv.gz")
+  here("data", "okl_single_dose_no_agg.csv.gz"),
+  here("data", "okl_single_dose_datasets_compound_stats.csv.gz")
 ) %>%
   synStoreMany(
     parentId = "syn18508401",
