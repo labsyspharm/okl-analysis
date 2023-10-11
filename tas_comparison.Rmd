@@ -25,6 +25,10 @@ lsp_target_dictionary <- syn("syn25173506") %>%
     read_fst(as.data.table = TRUE)
 single_dose <- syn("syn26486828") %>%
     read_csv()
+pseudo_kds <- syn("syn51080578") %>%
+    read_csv()
+compound_stats <- syn("syn52624367") %>%
+    read_csv()
 ```
 
 ```{r}
@@ -117,6 +121,177 @@ p <- tas_heatmap(tas_reduced_clustered, lspci_id, symbol, tas) +
 ggsave(
     "plots/tas_heatmap.pdf",
     p, width = 7, height = 3.5
+)
+
+pseudo_kds_tas <- pseudo_kds %>%
+    filter(
+        dataset == "original_repeat_replaced",
+        !exclude_target
+    ) %>%
+    semi_join(
+        compound_stats %>%
+            filter(standard_doses_measured),
+        by = c("dataset", "lspci_id")
+    ) %>%
+    mutate(
+        tas_pseudo_kd = cut(
+            pseudo_kd,
+            breaks = c(-Inf, 100, 999, 9999, Inf),
+            labels = c("1", "2", "3", "10")
+        )
+    ) %>%
+    group_by(lspci_id, hgnc_symbol) %>%
+    arrange(tas_pseudo_kd) %>%
+    slice_head(n = 1) %>%
+    ungroup()
+
+pseudo_kds_tas_clustered <- pseudo_kds_tas %>%
+    mutate(
+        hgnc_symbol = factor(hgnc_symbol, levels = levels(tas_reduced_clustered$symbol)),
+        lspci_id = factor(lspci_id, levels = levels(tas_reduced_clustered$lspci_id))
+    )
+
+p <- tas_heatmap(pseudo_kds_tas_clustered, lspci_id, hgnc_symbol, tas_pseudo_kd) +
+    labs(x = "Kinase", y = "Compound", fill = "TAS") +
+    coord_equal() +
+    theme_bw() +
+    theme(
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()
+    )
+
+pseudo_kds_tas_clustered_2 <- pseudo_kds_tas %>%
+    mutate(across(tas_pseudo_kd, \(x) as.numeric(as.character(x)))) %>%
+    cluster_df(lspci_id, hgnc_symbol, tas_pseudo_kd) %>%
+    mutate(across(tas_pseudo_kd, \(x) factor(as.character(x), levels = c("1", "2", "3", "10"))))
+
+pseudo_kds_tas_clustered_2 %>%
+    complete(lspci_id, hgnc_symbol) %>%
+    group_by(hgnc_symbol) %>%
+    summarize(
+        n = sum(is.na(tas_pseudo_kd)),
+        .groups = "drop"
+    ) %>%
+    arrange(desc(n))
+
+tas_reduced_clustered_2 <- tas_reduced_clustered %>%
+    filter(
+        lspci_id %in% pseudo_kds_tas_clustered_2$lspci_id,
+        symbol %in% pseudo_kds_tas_clustered_2$hgnc_symbol
+    ) %>%
+    mutate(
+        lspci_id = factor(lspci_id, levels = levels(pseudo_kds_tas_clustered_2$lspci_id)),
+        symbol = factor(symbol, levels = levels(pseudo_kds_tas_clustered_2$hgnc_symbol))
+    ) %>%
+    group_by(lspci_id, symbol) %>%
+    arrange(tas) %>%
+    slice_head(n = 1) %>%
+    ungroup()
+
+tas_clustered_both_2 <- bind_rows(
+    okl = pseudo_kds_tas_clustered_2 %>%
+        mutate(tas = tas_pseudo_kd),
+    pre_okl = tas_reduced_clustered_2 %>%
+        mutate(hgnc_symbol = symbol),
+    .id = "dataset"
+)
+
+p <- tas_heatmap(tas_clustered_both_2, lspci_id, hgnc_symbol, tas) +
+    labs(x = "Kinase", y = "Compound", fill = "TAS") +
+    coord_equal() +
+    theme_bw() +
+    facet_wrap(~dataset) +
+    theme(
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank()
+    )
+
+ggsave(
+    "plots/tas_heatmap_pre_okl_vs_okl.pdf",
+    p, width = 10, height = 4
+)
+```
+
+
+Remaining vertical stripes of NAs are due to kinases like PRKD2, PKN1, and RAF1
+which have a large number of measurements at 12.5 and 1000 nM that are below
+50% but above 35% remaining and are thus not picked up as discordant. For the
+purposes of pseudo Kd they are discordant though (first measurement <50% and
+then going up again) so the pseudo Kd is NA.
+
+```{r}
+library(ggalluvial)
+
+tas_clustered_both_alluvial <- tas_clustered_both_2 %>%
+    complete(dataset, lspci_id, hgnc_symbol) %>%
+    mutate(
+        across(tas, \(x) fct_na_value_to_level(x, "missing")),
+        dataset = factor(dataset, levels = c("pre_okl", "okl"), labels = c("Pre-OKL", "OKL"))
+    ) %>%
+    select(dataset, lspci_id, hgnc_symbol, tas) %>%
+    pivot_wider(names_from = dataset, values_from = tas) %>%
+    count(`OKL`, `Pre-OKL`, sort = TRUE, name = "freq") %>%
+    mutate(
+        added = factor(
+            if_else(`OKL` != "missing" & `Pre-OKL` == "missing", "added", "existing"),
+            levels = c("added", "existing")
+        )
+    )
+
+tas_clustered_both_alluvial_long <- tas_clustered_both_alluvial %>%
+    to_lodes_form(
+        axes = 1:2, key = "Dataset", value = "TAS"
+    ) %>%
+    mutate(
+        across(Dataset, fct_rev)
+    )
+
+p <- tas_clustered_both_alluvial_long %>%
+    filter(freq > 200) %>%
+    ggplot(
+        aes(x = Dataset, y = freq, stratum = TAS, alluvium = alluvium)
+    ) +
+    scale_x_discrete(expand = c(0.05, 0.05)) +
+    geom_alluvium(aes(fill = added), width = 1/10) +
+    labs(fill = NULL) +
+    ggnewscale::new_scale_fill() +
+    scale_fill_manual(values = tas_colors, guide = "none") +
+    geom_stratum(aes(fill = TAS), width = 1/10) +
+    geom_label(stat = "stratum", aes(label = after_stat(stratum))) +
+    theme_minimal() +
+    labs(y = "Frequency", fill = NA) +
+    theme(
+        panel.grid.major.x = element_blank()
+    ) +
+    coord_cartesian(clip = "off")
+
+ggsave(
+    "plots/tas_alluvial.pdf",
+    p, width = 4, height = 7
+)
+```
+
+
+```{r}
+library(cvms)
+
+p <- plot_confusion_matrix(
+    tas_clustered_both_alluvial,
+    target_col = "Pre-OKL",
+    prediction_col = "OKL",
+    counts_col = "freq"
+) +
+    labs(x = "Pre-OKL", y = "OKL")
+
+ggsave(
+    "plots/tas_confusion_matrix.pdf",
+    p, width = 6, height = 6
 )
 ```
 
