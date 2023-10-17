@@ -12,7 +12,7 @@ syn <- synDownloader("~/data", .cache = TRUE)
 ```
 
 ```{r}
-kinomescan_pseudo_ic50s <- syn("syn51080578") %>%
+kinomescan_pseudo_kds <- syn("syn51080578") %>%
     read_csv()
 
 kinomescan_classes <- syn("syn51080579") %>%
@@ -27,13 +27,13 @@ single_dose <- syn("syn26486828") %>%
 compound_mapping <- syn("syn26260389") %>%
   read_fst(as.data.table = TRUE)
 
-qpcr_misses <- syn("syn33531640") %>%
-  readxl::read_excel() %>%
-  left_join(
-    compound_mapping[, .(lspci_id, external_id)] %>%
-      unique(),
-    by = c("Compound Name" = "external_id")
-  )
+# qpcr_misses <- syn("syn33531640") %>%
+#   readxl::read_excel() %>%
+#   left_join(
+#     compound_mapping[, .(lspci_id, external_id)] %>%
+#       unique(),
+#     by = c("Compound Name" = "external_id")
+#   )
 
 # lsp_biochem <- syn("syn25173511") %>%
 #   read_fst()
@@ -66,35 +66,62 @@ lsp_biochem <- lsp_biochem_single %>%
 
 ```{r pseudo_ic50_plots}
 
-pseudo_ic50_class <- kinomescan_pseudo_ic50s %>%
-  power_full_join(
-    kinomescan_classes %>%
-      select(lspci_id, `DiscoveRx Gene Symbol`, classification) %>%
-      mutate(
-        classification = factor(
-          classification,
-          levels = c("binding", "weakly-binding", "undetermined", "non-binding")
-        )
-      ),
-    by = c("lspci_id", "DiscoveRx Gene Symbol"),
-    check = check_specs(
-      duplicate_keys_left = "abort",
-      duplicate_keys_right = "abort",
-      unmatched_keys_left = "abort",
-      unmatched_keys_right = "abort"
-    )
+# pseudo_kd_class <- kinomescan_pseudo_kds %>%
+#   power_full_join(
+#     kinomescan_classes %>%
+#       select(lspci_id, `DiscoveRx Gene Symbol`, classification) %>%
+#       mutate(
+#         classification = factor(
+#           classification,
+#           levels = c("binding", "weakly-binding", "undetermined", "non-binding")
+#         )
+#       ),
+#     by = c("lspci_id", "DiscoveRx Gene Symbol"),
+#     check = check_specs(
+#       duplicate_keys_left = "abort",
+#       duplicate_keys_right = "abort",
+#       unmatched_keys_left = "abort",
+#       unmatched_keys_right = "abort"
+#     )
+#   ) %>%
+  # power_left_join(
+  #   kinomescan_kinase_info %>%
+  #     select(`DiscoveRx Gene Symbol`, hgnc_symbol),
+  #   by = "DiscoveRx Gene Symbol",
+  #   check = check_specs(
+  #     duplicate_keys_left = "ignore",
+  #     duplicate_keys_right = "abort",
+  #     unmatched_keys_left = "abort",
+  #     unmatched_keys_right = "ignore"
+  #   )
+  # ) %>%
+  # power_left_join(
+  #   lsp_targets %>%
+  #     filter(organism == "Homo sapiens") %>%
+  #     select(lspci_target_id, symbol),
+  #   by = c("hgnc_symbol" = "symbol"),
+  #   check = check_specs(
+  #     duplicate_keys_left = "ignore",
+  #     duplicate_keys_right = "ignore",
+  #     unmatched_keys_left = "warn",
+  #     unmatched_keys_right = "ignore"
+  #   )
+  # )
+# NA ok. Comes from P. falciparum genes
+
+class_colors <- c(
+    "binding" = "firebrick1",
+    "weakly-binding" = "darkorange",
+    "undetermined" = "gray",
+    "non-binding" = "black",
+    "discordant" = "blue"
+)
+
+pseudo_kd_comp <- kinomescan_pseudo_kds %>%
+  mutate(
+    across(classification, \(x) factor(x, levels = names(class_colors)))
   ) %>%
-  power_left_join(
-    kinomescan_kinase_info %>%
-      select(`DiscoveRx Gene Symbol`, hgnc_symbol),
-    by = "DiscoveRx Gene Symbol",
-    check = check_specs(
-      duplicate_keys_left = "ignore",
-      duplicate_keys_right = "abort",
-      unmatched_keys_left = "abort",
-      unmatched_keys_right = "ignore"
-    )
-  ) %>%
+  filter(dataset == "original_repeat_replaced") %>%
   power_left_join(
     lsp_targets %>%
       filter(organism == "Homo sapiens") %>%
@@ -106,18 +133,18 @@ pseudo_ic50_class <- kinomescan_pseudo_ic50s %>%
       unmatched_keys_left = "warn",
       unmatched_keys_right = "ignore"
     )
-  )
-# NA ok. Comes from P. falciparum genes
-
-pseudo_ic50_comp <- pseudo_ic50_class %>%
-  group_by(
-    lspci_id, name, hmsl_id, `Entrez Gene Symbol`, lspci_target_id
   ) %>%
-  # Select representative for each gene among all
-  # mutants etc by favoring concordant measurements and low pseudo IC50s
-  arrange(classification == "discordant", pseudo_ic50_relation != "=", pseudo_ic50) %>%
-  slice_head(n = 1) %>%
-  ungroup() %>%
+  filter(
+    !exclude_target
+  ) %>%
+  # group_by(
+  #   lspci_id, name, hmsl_id, `Entrez Gene Symbol`, lspci_target_id
+  # ) %>%
+  # # Select representative for each gene among all
+  # # mutants etc by favoring concordant measurements and low pseudo IC50s
+  # arrange(classification == "discordant", pseudo_kd_relation != "=", pseudo_kd) %>%
+  # slice_head(n = 1) %>%
+  # ungroup() %>%
   inner_join(
     lsp_biochem,
     by = c("lspci_id", "lspci_target_id")
@@ -126,41 +153,43 @@ pseudo_ic50_comp <- pseudo_ic50_class %>%
 
 ```
 
-Check weird cases where we have pseudo IC50 < 1000 uM but binding
+Check weird cases where we have pseudo Kd < 1000 uM but binding
 is classified as non-binding. Probably results mostly of cases
 where entire binding curve is between 50-35% control so the 35% threshold
-is never triggered but the 50% threshold for IC50 is.
+is never triggered but the 50% threshold for Kd is.
 
 ```{r}
-pseudo_ic50_class %>%
-    filter(pseudo_ic50 < 1000, classification == "non-binding", pseudo_ic50_concordant == "concordant")
+pseudo_kd_comp %>%
+    filter(pseudo_kd < 1000, classification == "non-binding", pseudo_kd_concordant == "concordant")
 
 ```
 
-Make scatterplot of ChEMBL IC50 vs KINOMEscan pseudo-IC50
+Only 152 such cases. Not worth worrying about.
+
+Make scatterplot of ChEMBL IC50 vs KINOMEscan pseudo-Kd
 Also show distribution of pseudo-IC50 values for each binding class as
 beeswarm plot.
 
 ```{r}
 
-class_colors <- c(
-    "binding" = "firebrick1",
-    "weakly-binding" = "darkorange",
-    "non-binding" = "black",
-    "undetermined" = "gray",
-    "discordant" = "blue"
-)
 
-p_scatter <- pseudo_ic50_comp %>%
-  drop_na(pseudo_ic50) %>%
+p_scatter <- pseudo_kd_comp %>%
+  drop_na(pseudo_kd) %>%
   filter(
     # pseudo_ic50_relation == "=",
-    pseudo_ic50_concordant == "concordant",
+    pseudo_kd_concordant == "concordant",
     classification != "discordant"
   ) %>%
   ggplot(
     # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
-    aes(value, pseudo_ic50, color = classification)
+    aes(
+      value, pseudo_kd,
+      color = classification,
+      text = paste(
+        name, `DiscoveRx Gene Symbol`,
+        "<br>ChEMBL", signif(value, 2), "nM Eurofins", signif(pseudo_kd, 2), "nM"
+      )
+    )
   ) +
   scale_color_manual(values = class_colors) +
   geom_point(alpha = 0.5, shape = 16, size = 1) +
@@ -169,39 +198,46 @@ p_scatter <- pseudo_ic50_comp %>%
   coord_equal() +
   labs(
     x = "IC50 (ChEMBL)",
-    y = "Pseudo-IC50 (KINOMEscan)"
+    y = "Pseudo-Kd (KINOMEscan)"
   )
 
 ggsave(
-    "plots/chembl_ic50_vs_kinomescan_pseudo_ic50.pdf", p_scatter,
+    "plots/chembl_ic50_vs_kinomescan_pseudo_kd.pdf", p_scatter,
     width = 8, height = 3
 )
+
+library(plotly)
+
+p_scatter_plotly <- ggplotly(p_scatter, tooltip = "text") %>%
+  toWebGL()
+
+htmlwidgets::saveWidget(p_scatter_plotly, "plots/chembl_ic50_vs_kinomescan_pseudo_kd.html")
 
 library(ggbeeswarm)
 library(ggtext)
 library(glue)
 
 class_labels <- glue_data(
-  distinct(pseudo_ic50_comp, classification) %>%
+  distinct(pseudo_kd_comp, classification) %>%
     filter(classification != "discordant"),
   "<span style='font-weight: bold; color: {class_colors[classification]}'>{classification}</span>"
 ) %>%
   set_names(
-    distinct(pseudo_ic50_comp, classification) %>%
+    distinct(pseudo_kd_comp, classification) %>%
       filter(classification != "discordant") %>%
       pull(classification)
   )
 
-p_beeswarm <- pseudo_ic50_comp %>%
+p_beeswarm <- pseudo_kd_comp %>%
   filter(
-    pseudo_ic50_concordant == "concordant",
+    pseudo_kd_concordant == "concordant",
     # pseudo_ic50_relation == "=",
     classification != "discordant"
   ) %>%
   mutate(
     classification = factor(
       classification,
-      levels = c("binding", "weakly-binding", "undetermined", "non-binding") %>%
+      levels = names(class_colors) %>%
         rev()
     )
   ) %>%
@@ -259,7 +295,7 @@ p_combined <- egg::ggarrange(
 )
 
 ggsave(
-    "plots/chembl_ic50_by_comparison_combined.pdf", p_combined,
+    "plots/chembl_ic50_by_comparison_combined_new.pdf", p_combined,
     width = 8, height = 4.5
 )
 ```
@@ -271,7 +307,8 @@ the relation is ">" or ">=" and the value is greater than 9000.
 
 
 ```{r}
-chembl_kd_raw <- fread("data/kds_raw.csv.gz")
+chembl_kd_raw <- fread("data/kds_raw.csv.gz") %>%
+  as_tibble()
 
 chembl_kd <- chembl_kd_raw %>%
   mutate(across(standard_value, as.numeric)) %>%
@@ -279,44 +316,58 @@ chembl_kd <- chembl_kd_raw %>%
     standard_relation == "=" |
       (standard_relation %in% c(">=", ">") & standard_value > 9000)
   ) %>%
-  inner_join(
+  power_inner_join(
     compound_mapping %>%
-      select(lspci_id, chembl_id_compound = external_id),
-    by = "chembl_id_compound"
+      filter(source == "chembl") %>%
+      distinct(lspci_id, chembl_id_compound = external_id),
+    by = "chembl_id_compound",
+    check = check_specs(
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn"
+    )
   ) %>%
   group_by(gene_symbol, lspci_id) %>%
   summarize(
     chembl_kd = quantile(standard_value, 0.25, na.rm = TRUE, names = FALSE),
+    chembl_kd_relation = paste(sort(unique(standard_relation)), collapse = ""),
     .groups = "drop"
   ) %>%
-  inner_join(
+  power_inner_join(
     kinomescan_kinase_info %>%
       distinct(hgnc_symbol, `DiscoveRx Gene Symbol`),
-    by = c("gene_symbol" = "hgnc_symbol")
+    by = c("gene_symbol" = "hgnc_symbol"),
+    check = check_specs(
+      duplicate_keys_right = "ignore",
+      unmatched_keys_left = "warn"
+    )
   )
 
-pseudo_ic50_kd_comp <- pseudo_ic50_class %>%
-  group_by(
-    lspci_id, hmsl_id, name, `Entrez Gene Symbol`, lspci_target_id
+chembl_kd %>%
+  count(chembl_kd_relation)
+
+pseudo_kd_kd_comp <- kinomescan_pseudo_kds %>%
+  mutate(
+    across(classification, \(x) factor(x, levels = names(class_colors)))
   ) %>%
-  arrange(classification == "discordant", pseudo_ic50_relation != "=", pseudo_ic50) %>%
-  slice_head(n = 1) %>%
-  ungroup() %>%
+  filter(
+    dataset == "original_repeat_replaced",
+    !exclude_target
+  ) %>%
   inner_join(
     chembl_kd,
     by = c("lspci_id", "DiscoveRx Gene Symbol")
   )
 
-p_scatter <- pseudo_ic50_kd_comp %>%
-  drop_na(pseudo_ic50) %>%
+p_scatter <- pseudo_kd_kd_comp %>%
+  drop_na(pseudo_kd) %>%
   filter(
     # pseudo_ic50_relation == "=",
-    pseudo_ic50_concordant == "concordant",
+    pseudo_kd_concordant == "concordant",
     classification != "discordant"
   ) %>%
   ggplot(
     # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
-    aes(chembl_kd, pseudo_ic50, color = classification)
+    aes(chembl_kd, pseudo_kd, color = classification)
   ) +
   scale_color_manual(values = class_colors) +
   geom_point(alpha = 0.5, shape = 16, size = 1) +
@@ -326,24 +377,24 @@ p_scatter <- pseudo_ic50_kd_comp %>%
   coord_equal() +
   labs(
     x = "Kd (ChEMBL)",
-    y = "Pseudo-IC50 (KINOMEscan)"
+    y = "Pseudo-Kd (KINOMEscan)"
   )
 
 ggsave(
-    "plots/chembl_kd_vs_kinomescan_pseudo_ic50.pdf", p_scatter,
+    "plots/chembl_kd_vs_kinomescan_pseudo_kd_new.pdf", p_scatter,
     width = 8, height = 4
 )
 
-p_beeswarm <- pseudo_ic50_kd_comp %>%
+p_beeswarm <- pseudo_kd_kd_comp %>%
   filter(
-    pseudo_ic50_concordant == "concordant",
+    pseudo_kd_concordant == "concordant",
     # pseudo_ic50_relation == "=",
     classification != "discordant"
   ) %>%
   mutate(
     classification = factor(
       classification,
-      levels = c("binding", "weakly-binding", "undetermined", "non-binding") %>%
+      levels = names(class_colors) %>%
         rev()
     )
   ) %>%
@@ -383,7 +434,7 @@ p_combined <- egg::ggarrange(
 )
 
 ggsave(
-    "plots/chembl_kd_by_comparison_combined.pdf", p_combined,
+    "plots/chembl_kd_by_comparison_combined_new.pdf", p_combined,
     width = 6, height = 4.5
 )
 ```
@@ -398,29 +449,29 @@ two_cor_test <- function(r1, r2, n1, n2) {
     sqrt(1/(n1-3) + 1/(n2-3))
 }
 
-pseudo_ic50_comp_both <- bind_rows(
-  ic50 = pseudo_ic50_comp %>%
+pseudo_kd_comp_both <- bind_rows(
+  ic50 = pseudo_kd_comp %>%
     filter(
-      pseudo_ic50_concordant == "concordant",
+      pseudo_kd_concordant == "concordant",
       # pseudo_ic50_relation == "=",
       classification != "discordant"
     ) %>%
-    select(lspci_id, `DiscoveRx Gene Symbol`, gene_symbol = hgnc_symbol, value, pseudo_ic50, classification),
-  kd = pseudo_ic50_kd_comp %>%
+    select(lspci_id, name, `DiscoveRx Gene Symbol`, gene_symbol = hgnc_symbol, value, pseudo_kd, classification),
+  kd = pseudo_kd_kd_comp %>%
     filter(
-      pseudo_ic50_concordant == "concordant",
+      pseudo_kd_concordant == "concordant",
       # pseudo_ic50_relation == "=",
       classification != "discordant"
     ) %>%
-    select(lspci_id, `DiscoveRx Gene Symbol`, gene_symbol, value = chembl_kd, pseudo_ic50, classification),
+    select(lspci_id, name, `DiscoveRx Gene Symbol`, gene_symbol, value = chembl_kd, pseudo_kd, classification),
   .id = "chembl_type"
 )
 
-pseudo_ic50_comp_cor_res <- pseudo_ic50_comp_both %>%
+pseudo_kd_comp_cor_res <- pseudo_kd_comp_both %>%
   group_by(chembl_type) %>%
   summarize(
     res = cor.test(
-      ~value + pseudo_ic50, data = cur_data()
+      ~value + pseudo_kd, data = cur_data()
     ) %>%
       broom::tidy() %>%
       list(),
@@ -429,9 +480,9 @@ pseudo_ic50_comp_cor_res <- pseudo_ic50_comp_both %>%
   ) %>%
   unnest(res)
 
-pseudo_ic50_comp_cor_res
+pseudo_kd_comp_cor_res
 
-pseudo_ic50_comp_cor_res %>%
+pseudo_kd_comp_cor_res %>%
   select(chembl_type, estimate, n) %>%
   pivot_wider(names_from = chembl_type, values_from = c(estimate, n)) %>%
   with(
@@ -439,7 +490,7 @@ pseudo_ic50_comp_cor_res %>%
       estimate_ic50, estimate_kd,
       n_ic50, n_kd
     )
-  ) %>%
+  )
 
 ```
 
@@ -462,11 +513,99 @@ pseudo_ic50_comp_false_class %>%
   count(chembl_type, false_class)
 
 pseudo_ic50_comp_false_class_by_compound <- pseudo_ic50_comp_false_class %>%
-  count(chembl_type, lspci_id, false_class) %>%
-  group_by(chembl_type, lspci_id) %>%
+  count(chembl_type, lspci_id, name, false_class) %>%
+  group_by(chembl_type, lspci_id, name) %>%
   mutate(
     prop = n / sum(n)
   )
+
+pseudo_ic50_comp_false_wide_by_compound <- pseudo_ic50_comp_false_class %>%
+  count(chembl_type, lspci_id, name, false_class) %>%
+  pivot_wider(names_from = false_class, values_from = n, values_fill = 0L)
+
+
+pseudo_ic50_comp_false_wide_brms_input <- pseudo_ic50_comp_false_wide_by_compound %>%
+  mutate(
+    n_total = concordant + `false positive` + `false negative`
+  ) %>%
+  transmute(
+    chembl_type,
+    lspci_id, name,
+    n_total,
+    y = data.frame(
+      concordant = concordant,
+      `false positive` = `false positive`,
+      `false negative` = `false negative`
+    ) %>%
+      as.matrix()
+  )
+
+library(brms)
+mdl <- brm(
+  y | trials(n_total) ~ 1 + (1 | name),
+  data = pseudo_ic50_comp_false_wide_brms_input %>%
+    filter(chembl_type == "kd"),
+  family = multinomial(refcat = "concordant"),
+  cores = 4,
+  chains = 4
+)
+
+mdl2 <- brm(
+  y | trials(n_total) ~ 1 + (1 | name) + chembl_type,
+  data = pseudo_ic50_comp_false_wide_brms_input,
+  family = multinomial(refcat = "concordant"),
+  cores = 4,
+  chains = 4
+)
+
+pseudo_ic50_comp_false_fisher_by_compound <- pseudo_ic50_comp_false_wide_by_compound %>%
+  mutate(
+    n_total = concordant + `false positive` + `false negative`
+  ) %>%
+  pivot_longer(
+    c(`false positive`, `false negative`),
+    names_to = "false_class",
+    values_to = "n_class"
+  ) %>%
+  mutate(
+    n_other = n_total - n_class
+  ) %>%
+  group_by(
+    chembl_type, false_class
+  ) %>%
+  mutate(
+    n_rest_class = sum(n_class) - n_class,
+    n_rest_other = sum(n_other) - n_other
+  ) %>%
+  ungroup()
+
+
+
+pseudo_ic50_comp_false_fisher_res_by_compound <- pseudo_ic50_comp_false_fisher_by_compound %>%
+  group_by(chembl_type, lspci_id, name) %>%
+  summarize(
+    res = fisher.test(
+      matrix(
+        c(n_class, n_rest_class, n_other, n_rest_other),
+        ncol = 2
+      ),
+      simulate = TRUE
+    ) %>%
+      broom::tidy() %>%
+      list(),
+    .groups = "drop"
+  ) %>%
+  unnest(res)
+
+library(brms)
+data(HairEyeColor)
+haireye <- as.data.frame(HairEyeColor)
+names(haireye) <- tolower(names(haireye))
+names(haireye)[names(haireye) == "freq"] <- "number"
+haireye
+he_formula <- brmsformula(number ~ sex + hair + eye + sex:hair + sex:eye + hair:eye)
+get_prior(he_formula, data=haireye, family='poisson')
+
 
 pseudo_ic50_comp_false_class_by_kinase <- pseudo_ic50_comp_false_class %>%
   count(chembl_type, `DiscoveRx Gene Symbol`, false_class) %>%
