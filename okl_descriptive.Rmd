@@ -25,14 +25,7 @@ inputs <- list(
   okl_single_dose = "syn26486828",
   okl_single_dose_datasets = "syn52504516",
   okl_single_dose_no_agg = "syn52505898",
-  # hmsl_single_dose = "syn26260430",
-  # hmsl_single_dose_agg = "syn26260426",
-  # compound_dictionary = "syn26260332",
   kinase_info = "syn51286743"
-  # references = "syn26260402",
-  # target_mapping = "syn26260398",
-  # target_dictionary = "syn26260394",
-  # compound_mapping = "syn26260389"
 )
 
 input_files <- map(
@@ -47,21 +40,6 @@ single_dose_datasets <- input_files[["okl_single_dose_datasets"]] %>%
 
 single_dose_no_agg <- input_files[["okl_single_dose_no_agg"]] %>%
   fread()
-
-# compound_dictionary <- input_files[["compound_dictionary"]] %>%
-#   read_fst(as.data.table = TRUE)
-
-# #compound_mapping <- input_files[["compound_mapping"]] %>%
-#   read_fst(as.data.table = TRUE)
-
-# compound_names <- compound_dictionary %>%
-#   select(lspci_id, name = pref_name) %>%
-#   drop_na() %>%
-#   # lazy_dt() %>%
-#   group_by(lspci_id) %>%
-#   slice_head(n = 1) %>%
-#   ungroup()
-#   # as_tibble()
 
 kinase_info <- input_files[["kinase_info"]] %>%
   read_csv()
