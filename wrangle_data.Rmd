@@ -433,10 +433,15 @@ fwrite(single_dose_processed_all_final, here("data", "okl_single_dose_no_agg.csv
 
 Making two complete datasets:
 
-1. Measurements before the repeat experiment but not including the repeat
+1. (original_only) Measurements before the repeat experiment but not including the repeat
   experiments.
-2. All measurements, but excluding measurements that were repeated in the
+2. (original_repeat_replaced) All measurements, but excluding measurements that were repeated in the
   repeat experiment.
+
+Additionally, for 2., throw out measurements for 7 kinases by 18 compounds
+at 12.5 and 1000nM that were not repeated in the repeat experiment. This is
+because the plate of 184 compounds send for the repeat experiment at 12.5/1000nM
+was not exactly identical to the original plate of 184 compounds.
 
 This way it should be easy to compare these two complete datasets in follow-up
 analysis.
@@ -454,6 +459,22 @@ single_dose_datasets <- bind_rows(
         "lspci_id", "hmsl_id", "DiscoveRx Gene Symbol", "Entrez Gene Symbol",
         "Compound Concentration (nM)"
       )
+    ) %>%
+    # This is to remove the above mentioned 7 kinases by 18 compounds by 2 doses
+    anti_join(
+      single_dose_processed_all_final %>%
+        filter(experiment == "okl1_1") %>%
+        semi_join(
+          single_dose_processed_all_final %>%
+            filter(experiment == "okl2_repeat1"),
+          by = c("DiscoveRx Gene Symbol", "Compound Concentration (nM)")
+        ) %>%
+        anti_join(
+          single_dose_processed_all_final %>%
+            filter(experiment == "okl2_repeat1"),
+          by = c("lspci_id", "DiscoveRx Gene Symbol", "Compound Concentration (nM)")
+        ),
+      by = c("lspci_id", "DiscoveRx Gene Symbol", "Compound Concentration (nM)")
     ) %>%
     bind_rows(
       single_dose_processed_deduped_final %>%
