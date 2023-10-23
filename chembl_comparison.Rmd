@@ -50,8 +50,6 @@ is greater than 9000. This is to avoid underestimating IC50s for cases where
 people just didn't assay higher concentrations.
 
 ```{r}
-chembl_kd_raw <- fread("data/kds_raw.csv.gz")
-
 lsp_biochem <- lsp_biochem_single %>%
   filter(
     value_relation == "=" |
@@ -64,51 +62,7 @@ lsp_biochem <- lsp_biochem_single %>%
   )
 ```
 
-```{r pseudo_ic50_plots}
-
-# pseudo_kd_class <- kinomescan_pseudo_kds %>%
-#   power_full_join(
-#     kinomescan_classes %>%
-#       select(lspci_id, `DiscoveRx Gene Symbol`, classification) %>%
-#       mutate(
-#         classification = factor(
-#           classification,
-#           levels = c("binding", "weakly-binding", "undetermined", "non-binding")
-#         )
-#       ),
-#     by = c("lspci_id", "DiscoveRx Gene Symbol"),
-#     check = check_specs(
-#       duplicate_keys_left = "abort",
-#       duplicate_keys_right = "abort",
-#       unmatched_keys_left = "abort",
-#       unmatched_keys_right = "abort"
-#     )
-#   ) %>%
-  # power_left_join(
-  #   kinomescan_kinase_info %>%
-  #     select(`DiscoveRx Gene Symbol`, hgnc_symbol),
-  #   by = "DiscoveRx Gene Symbol",
-  #   check = check_specs(
-  #     duplicate_keys_left = "ignore",
-  #     duplicate_keys_right = "abort",
-  #     unmatched_keys_left = "abort",
-  #     unmatched_keys_right = "ignore"
-  #   )
-  # ) %>%
-  # power_left_join(
-  #   lsp_targets %>%
-  #     filter(organism == "Homo sapiens") %>%
-  #     select(lspci_target_id, symbol),
-  #   by = c("hgnc_symbol" = "symbol"),
-  #   check = check_specs(
-  #     duplicate_keys_left = "ignore",
-  #     duplicate_keys_right = "ignore",
-  #     unmatched_keys_left = "warn",
-  #     unmatched_keys_right = "ignore"
-  #   )
-  # )
-# NA ok. Comes from P. falciparum genes
-
+```{r pseudo_ic50_vs_kd}
 class_colors <- c(
     "binding" = "firebrick1",
     "weakly-binding" = "darkorange",
@@ -171,8 +125,6 @@ Also show distribution of pseudo-IC50 values for each binding class as
 beeswarm plot.
 
 ```{r}
-
-
 p_scatter <- pseudo_kd_comp %>%
   drop_na(pseudo_kd) %>%
   filter(
@@ -259,23 +211,6 @@ ggsave(
 )
 
 library(patchwork)
-# p_combined <- wrap_plots(
-#     p_scatter +
-#         labs(x = NULL) +
-#         theme(
-#             axis.text.x = element_blank(),
-#             plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
-#         ),
-#     p_beeswarm +
-#         guides(color = "none") +
-#         theme(
-#             plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm")
-#         ),
-#     ncol = 1,
-#     nrow = 2,
-#     heights = c(2, 1),
-#     guides = "collect"
-# )
 p_combined <- egg::ggarrange(
     p_scatter +
         labs(x = NULL) +
@@ -357,7 +292,10 @@ pseudo_kd_kd_comp <- kinomescan_pseudo_kds %>%
     chembl_kd,
     by = c("lspci_id", "DiscoveRx Gene Symbol")
   )
+```
 
+
+```{r}
 p_scatter <- pseudo_kd_kd_comp %>%
   drop_na(pseudo_kd) %>%
   filter(
@@ -456,14 +394,14 @@ pseudo_kd_comp_both <- bind_rows(
       # pseudo_ic50_relation == "=",
       classification != "discordant"
     ) %>%
-    select(lspci_id, name, `DiscoveRx Gene Symbol`, gene_symbol = hgnc_symbol, value, pseudo_kd, classification),
+    select(lspci_id, name, `DiscoveRx Gene Symbol`, gene_symbol = hgnc_symbol, value, pseudo_kd, classification, pseudo_kd_relation),
   kd = pseudo_kd_kd_comp %>%
     filter(
       pseudo_kd_concordant == "concordant",
       # pseudo_ic50_relation == "=",
       classification != "discordant"
     ) %>%
-    select(lspci_id, name, `DiscoveRx Gene Symbol`, gene_symbol, value = chembl_kd, pseudo_kd, classification),
+    select(lspci_id, name, `DiscoveRx Gene Symbol`, gene_symbol, value = chembl_kd, pseudo_kd, classification, pseudo_kd_relation),
   .id = "chembl_type"
 )
 
@@ -479,8 +417,6 @@ pseudo_kd_comp_cor_res <- pseudo_kd_comp_both %>%
     .groups = "drop"
   ) %>%
   unnest(res)
-
-pseudo_kd_comp_cor_res
 
 pseudo_kd_comp_cor_res %>%
   select(chembl_type, estimate, n) %>%
@@ -500,30 +436,416 @@ targets that are consistently discordant?
 Use Kd data
 
 ```{r}
-pseudo_ic50_comp_false_class <- pseudo_ic50_comp_both %>%
+pseudo_kd_comp_false_class <- pseudo_kd_comp_both %>%
+  filter(
+    pseudo_kd_relation == "=" | (
+      pseudo_kd_relation == "<" & pseudo_kd < 90
+    ) | (
+      pseudo_kd_relation == ">" & pseudo_kd > 9000
+    )
+  ) %>%
   mutate(
     false_class = case_when(
-      value > (10 * pseudo_ic50) ~ "false positive",
-      value < (0.1 * pseudo_ic50) ~ "false negative",
+      (value > (10 * pseudo_kd)) & pseudo_kd != 10000 ~ "false positive",
+      (value < (0.1 * pseudo_kd)) & pseudo_kd != 12.5 ~ "false negative",
       TRUE ~ "concordant"
     )
   )
 
-pseudo_ic50_comp_false_class %>%
+pseudo_kd_comp_false_class %>%
   count(chembl_type, false_class)
 
-pseudo_ic50_comp_false_class_by_compound <- pseudo_ic50_comp_false_class %>%
+pseudo_kd_comp_false_class_by_compound <- pseudo_kd_comp_false_class %>%
   count(chembl_type, lspci_id, name, false_class) %>%
   group_by(chembl_type, lspci_id, name) %>%
+  filter(sum(n) > 50) %>%
   mutate(
     prop = n / sum(n)
+  ) %>%
+  ungroup()
+
+pseudo_kd_comp_false_wide_by_compound <- pseudo_kd_comp_false_class_by_compound %>%
+  pivot_wider(names_from = false_class, values_from = c(n, prop), values_fill = list(n = 0L, prop = 0))
+
+View(
+  pseudo_kd_comp_false_wide_by_compound %>%
+    filter(chembl_type == "kd") %>%
+    arrange(desc(`prop_false negative` + `prop_false positive`))
+)
+
+pseudo_kd_comp_false_class_by_kinase <- pseudo_kd_comp_false_class %>%
+  count(chembl_type, `DiscoveRx Gene Symbol`, gene_symbol, false_class) %>%
+  group_by(chembl_type, `DiscoveRx Gene Symbol`, gene_symbol) %>%
+  filter(sum(n) > 50) %>%
+  mutate(
+    prop = n / sum(n)
+  ) %>%
+  ungroup()
+
+pseudo_kd_comp_false_wide_by_kinase <- pseudo_kd_comp_false_class_by_kinase %>%
+  pivot_wider(names_from = false_class, values_from = c(n, prop), values_fill = list(n = 0L, prop = 0))
+
+View(
+  pseudo_kd_comp_false_wide_by_kinase %>%
+    filter(chembl_type == "kd") %>%
+    arrange(desc(`prop_false negative` + `prop_false positive`))
+)
+
+pseudo_kd_comp_false_wide_by_kinase %>%
+    filter(chembl_type == "kd") %>%
+    arrange(desc(`prop_false negative`)) %>%
+    head(n = 20) %>%
+    select(-chembl_type, -gene_symbol) %>%
+    print(n = Inf)
+
+pseudo_kd_comp_false_wide_by_kinase %>%
+    filter(chembl_type == "kd") %>%
+    arrange(desc(`prop_false positive`)) %>%
+    head(n = 20) %>%
+    select(-chembl_type, -gene_symbol) %>%
+    print(n = Inf)
+```
+
+Plot common false positives/negatives
+
+```{r}
+pseudo_kd_comp_false_cherrypicked <- pseudo_kd_comp_false_class_by_kinase %>%
+  filter(chembl_type == "kd", false_class != "concordant") %>%
+  group_by(false_class) %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 5) %>%
+  ungroup()
+
+library(ggrepel)
+p <- pseudo_kd_kd_comp %>%
+  drop_na(pseudo_kd) %>%
+  filter(
+    # pseudo_ic50_relation == "=",
+    pseudo_kd_concordant == "concordant",
+    classification != "discordant"
+  ) %>%
+  ggplot(
+    # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
+    aes(chembl_kd, pseudo_kd, fill = classification)
+  ) +
+  scale_fill_manual(values = map_chr(class_colors, \(x) alpha(x, alpha = 0.5))) +
+  geom_point(
+    aes(color = false_class, size = false_class),
+    data = \(x) x %>%
+      left_join( 
+        pseudo_kd_comp_false_class %>%
+          filter(
+            chembl_type == "kd"
+          ) %>%
+          semi_join(
+            pseudo_kd_comp_false_cherrypicked,
+            by = c("DiscoveRx Gene Symbol", "false_class")
+          ) %>%
+          transmute(
+            lspci_id, `DiscoveRx Gene Symbol`,
+            false_class
+          ),
+        by = c("lspci_id", "DiscoveRx Gene Symbol")
+      ) %>%
+      arrange(desc(is.na(false_class))),
+    shape = 21
+  ) +
+  scale_color_manual(
+    values = c(`false negative` = alpha("black", .8), `false positive` = alpha("black", .8)),
+    na.value = alpha("purple", 0), guide = "none"
+  ) +
+  scale_size_manual(
+    values = c(`false negative` = 2, `false positive` = 2),
+    na.value = 1, guide = "none"
+  ) +
+  # geom_label_repel(
+  #   aes(label = label),
+  #   data = \(x) x %>%
+  #     left_join(
+  #       pseudo_kd_comp_false_class %>%
+  #         filter(
+  #           chembl_type == "kd"
+  #         ) %>%
+  #         semi_join(
+  #           pseudo_kd_comp_false_cherrypicked,
+  #           by = c("DiscoveRx Gene Symbol", "false_class")
+  #         ) %>%
+  #         transmute(
+  #           lspci_id, `DiscoveRx Gene Symbol`,
+  #           label = `DiscoveRx Gene Symbol`
+  #         ),
+  #       by = c("lspci_id", "DiscoveRx Gene Symbol")
+  #     ) %>%
+  #     mutate(label = replace_na(label, "")),
+  #     show.legend = FALSE
+  # ) +
+  # Limiting to between 1 and 10000 because barely any data outside this range
+  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, 10000)) +
+  scale_y_log10(labels = scales::label_number(big.mark = "")) +
+  coord_equal() +
+  labs(
+    x = "Kd (ChEMBL)",
+    y = "Pseudo-Kd (KINOMEscan)"
   )
 
-pseudo_ic50_comp_false_wide_by_compound <- pseudo_ic50_comp_false_class %>%
-  count(chembl_type, lspci_id, name, false_class) %>%
-  pivot_wider(names_from = false_class, values_from = n, values_fill = 0L)
+ggsave(
+    "plots/chembl_kd_vs_kinomescan_pseudo_kd_top_false.pdf", p,
+    width = 10, height = 6
+)
+
+```
 
 
+We can identify some kinases which seem to have disproportionately many false
+negatives and positives. However, it turns out that most of them, e.g. KIT-1, FLT-3,
+and JAK3, are measured in multiple variants in Kinomescan, such as autoinhibited,
+phosphorylated, or multidomain variants. Therefore, we think that the Kinomescan
+"false negatives" might actually be correct.
+
+In order to pick false negatives and positives that don't have an easy explanation
+we can exclude kinases which are measured in multiple variants in Kinomescan.
+
+Manually adding EIF2AK4, JAK2, JAK3, because they only have one variant in Kinomescan
+but they actually contain multiple kinase domains.
+
+In the ChEMBL comparison, using the `exclude_target` column, we are already
+removing any data points from mutants in Kinomescan.
+
+```{r}
+kinase_n_variants <- kinomescan_kinase_info %>%
+  filter(`Kinase Form` == "Wild Type") %>%
+  count(hgnc_symbol)
+
+kinase_multiple_variants <- kinase_n_variants %>%
+  filter(n > 1) %>%
+  pull(hgnc_symbol) %>%
+  c(c("EIF2AK4", "JAK2", "JAK3"))
+
+kinomescan_kinase_info %>%
+  filter(
+    `Kinase Form` == "Wild Type",
+    hgnc_symbol %in% kinase_multiple_variants
+  )
+
+pseudo_kd_comp_false_class_by_kinase_no_var <- pseudo_kd_comp_false_class %>%
+  filter(!gene_symbol %in% kinase_multiple_variants) %>%
+  count(chembl_type, `DiscoveRx Gene Symbol`, gene_symbol, false_class) %>%
+  group_by(chembl_type, `DiscoveRx Gene Symbol`, gene_symbol) %>%
+  filter(sum(n) > 50) %>%
+  mutate(
+    prop = n / sum(n)
+  ) %>%
+  ungroup()
+
+pseudo_kd_comp_false_wide_by_kinase_no_var <- pseudo_kd_comp_false_class_by_kinase_no_var %>%
+  pivot_wider(names_from = false_class, values_from = c(n, prop), values_fill = list(n = 0L, prop = 0))
+
+View(
+  pseudo_kd_comp_false_wide_by_kinase_no_var %>%
+    filter(chembl_type == "kd") %>%
+    arrange(desc(`prop_false negative` + `prop_false positive`))
+)
+```
+
+Visualize which false positive/negative outliers are proteins with variants
+in Kinomescan. Marking them large and with black outline
+
+```{r}
+p <- pseudo_kd_kd_comp %>%
+  drop_na(pseudo_kd) %>%
+  filter(
+    # pseudo_ic50_relation == "=",
+    pseudo_kd_concordant == "concordant",
+    classification != "discordant"
+  ) %>%
+  ggplot(
+    # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
+    aes(chembl_kd, pseudo_kd, fill = classification)
+  ) +
+  scale_fill_manual(values = map_chr(class_colors, \(x) alpha(x, alpha = 0.5))) +
+  geom_point(
+    aes(color = false_class, size = false_class),
+    data = \(x) x %>%
+      left_join( 
+        pseudo_kd_comp_false_class %>%
+          filter(
+            chembl_type == "kd",
+            gene_symbol %in% kinase_multiple_variants
+          ) %>%
+          transmute(
+            lspci_id, `DiscoveRx Gene Symbol`,
+            false_class
+          ),
+        by = c("lspci_id", "DiscoveRx Gene Symbol")
+      ) %>%
+      arrange(desc(is.na(false_class))),
+    shape = 21
+  ) +
+  scale_color_manual(
+    values = c(`false negative` = alpha("black", .8), `false positive` = alpha("black", .8)),
+    na.value = alpha("purple", 0), guide = "none"
+  ) +
+  scale_size_manual(
+    values = c(`false negative` = 2, `false positive` = 2),
+    na.value = 1, guide = "none"
+  ) +
+  # geom_label_repel(
+  #   aes(label = label),
+  #   data = \(x) x %>%
+  #     left_join(
+  #       pseudo_kd_comp_false_class %>%
+  #         filter(
+  #           chembl_type == "kd"
+  #         ) %>%
+  #         semi_join(
+  #           pseudo_kd_comp_false_cherrypicked,
+  #           by = c("DiscoveRx Gene Symbol", "false_class")
+  #         ) %>%
+  #         transmute(
+  #           lspci_id, `DiscoveRx Gene Symbol`,
+  #           label = `DiscoveRx Gene Symbol`
+  #         ),
+  #       by = c("lspci_id", "DiscoveRx Gene Symbol")
+  #     ) %>%
+  #     mutate(label = replace_na(label, "")),
+  #     show.legend = FALSE
+  # ) +
+  # Limiting to between 1 and 10000 because barely any data outside this range
+  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, 10000)) +
+  scale_y_log10(labels = scales::label_number(big.mark = "")) +
+  coord_equal() +
+  labs(
+    x = "Kd (ChEMBL)",
+    y = "Pseudo-Kd (KINOMEscan)"
+  )
+
+ggsave(
+    "plots/chembl_kd_vs_kinomescan_pseudo_kd_false_multiple_variants.pdf", p,
+    width = 10, height = 6
+)
+
+```
+
+What proportion of false positives/negatives are due to multiple variants?
+
+```{r}
+pseudo_kd_comp_false_class_with_var <- pseudo_kd_comp_false_class %>%
+  mutate(
+    multiple_variants = gene_symbol %in% kinase_multiple_variants
+  )
+
+pseudo_kd_comp_false_class_with_var_xtab <- pseudo_kd_comp_false_class_with_var %>%
+  count(false_class, multiple_variants) %>%
+  pivot_wider(names_from = multiple_variants, values_from = n)
+  
+pseudo_kd_comp_false_class_with_var_xtab %>%
+  column_to_rownames("false_class") %>%
+  rstatix::pairwise_fisher_test(detailed = TRUE) %>%
+  select(group1, group2, estimate, p)
+
+library(janitor)
+pseudo_kd_comp_false_class_with_var_xtab %>%
+  as_tabyl(col_var_name = "multiple_variants", row_var_name = "false_class") %>%
+  adorn_percentages("row") %>%
+  adorn_pct_formatting(digits = 1) %>%
+  adorn_ns()
+```
+
+ group1         group2         estimate         p
+  <chr>          <chr>             <dbl>     <dbl>
+1 concordant     false negative    4.92  4.53e-127
+2 concordant     false positive    1.48  1.03e- 13
+3 false negative false positive    0.301 2.48e- 56
+
+False negative and positive group definitely overrepresented in kinases with
+multiple variants.
+
+Select some false positives and negatives that are not due to multiple variants
+for further analysis, perhaps for collecting full IC50s from Reaction Biology.
+
+```{r}
+pseudo_kd_comp_for_verification <- pseudo_kd_comp_false_class_with_var %>%
+  filter(!multiple_variants, chembl_type == "kd") %>%
+  mutate(
+    lfc = log2(pseudo_kd / value)
+  ) %>%
+  arrange(desc(abs(lfc)))
+
+View(pseudo_kd_comp_for_verification)
+```
+
+Double check if the dose-resonse curves for these look geom_pointdensity
+
+```{r}
+kinomescan_classification_raw <- syn("syn52428590") %>%
+  qs::qread()
+
+pseudo_kd_comp_for_verification_hm <- pseudo_kd_comp_for_verification %>%
+  filter(
+    false_class == "false negative"
+  ) %>%
+  head(n = 100) %>%
+  inner_join(
+    kinomescan_classification_raw %>%
+      filter(dataset == "original_repeat_replaced") %>%
+      select(lspci_id, `DiscoveRx Gene Symbol`, data),
+    by = c("lspci_id", "DiscoveRx Gene Symbol")
+  ) %>%
+  transmute(
+    combo = paste(name, `DiscoveRx Gene Symbol`, sep = " "), data
+  ) %>%
+  unnest(data) %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  select(combo, `Compound Concentration (nM)`, `Percent Control`) %>%
+  pivot_wider(names_from = `Compound Concentration (nM)`, values_from = `Percent Control`)
+
+p <- pheatmap::pheatmap(
+  pseudo_kd_comp_for_verification_hm %>%
+    column_to_rownames("combo"),
+  cluster_cols = FALSE,
+  color = rev(viridisLite::viridis(100)),
+  silent = TRUE
+)
+
+ggsave(
+  "plots/chembl_kd_vs_kinomescan_pseudo_kd_false_negative_top100_heatmap.pdf",
+  p, width = 8, height = 12
+)
+
+pseudo_kd_comp_for_verification_hm <- pseudo_kd_comp_for_verification %>%
+  filter(
+    false_class == "false positive"
+  ) %>%
+  head(n = 100) %>%
+  inner_join(
+    kinomescan_classification_raw %>%
+      filter(dataset == "original_repeat_replaced") %>%
+      select(lspci_id, `DiscoveRx Gene Symbol`, data),
+    by = c("lspci_id", "DiscoveRx Gene Symbol")
+  ) %>%
+  transmute(
+    combo = paste(name, `DiscoveRx Gene Symbol`, sep = " "), data
+  ) %>%
+  unnest(data) %>%
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  select(combo, `Compound Concentration (nM)`, `Percent Control`) %>%
+  pivot_wider(names_from = `Compound Concentration (nM)`, values_from = `Percent Control`)
+
+p <- pheatmap::pheatmap(
+  pseudo_kd_comp_for_verification_hm %>%
+    column_to_rownames("combo"),
+  cluster_cols = FALSE,
+  color = rev(viridisLite::viridis(100)),
+  silent = TRUE
+)
+ggsave(
+  "plots/chembl_kd_vs_kinomescan_pseudo_kd_false_positive_top100_heatmap.pdf",
+  p, width = 8, height = 12
+)
+
+```
+
+```{r}
 pseudo_ic50_comp_false_wide_brms_input <- pseudo_ic50_comp_false_wide_by_compound %>%
   mutate(
     n_total = concordant + `false positive` + `false negative`
