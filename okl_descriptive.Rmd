@@ -1336,7 +1336,10 @@ single_dose_classification %>%
   group_by(classification, dataset) %>%
   ggplot(aes(classification, fill = dataset)) +
     geom_bar(position = "dodge")
+```
 
+
+```{r}
 single_dose_classification_by_compound <- single_dose_classification %>%
   count(dataset, lspci_id, name, classification) %>%
   complete(nesting(dataset, lspci_id, name), classification, fill = list(n = 0)) %>%
@@ -1388,9 +1391,14 @@ pwalk(
     )
   }
 )
+single_dose_classification_by_kinase <- single_dose_classification %>%
+  count(dataset, `DiscoveRx Gene Symbol`, hgnc_symbol, classification) %>%
+  complete(nesting(dataset, `DiscoveRx Gene Symbol`, hgnc_symbol), classification, fill = list(n = 0)) %>%
+  group_by(dataset, `DiscoveRx Gene Symbol`, hgnc_symbol) %>%
+  mutate(frac = n / sum(n)) %>%
+  ungroup()
 
-
-p <- single_dose_classification_by_compound %>%
+p <- single_dose_classification_by_kinase %>%
   group_by(
     dataset
   ) %>%
@@ -1554,8 +1562,8 @@ single_dose_classification %>%
 
 library(ggrepel)
 p <- single_dose_classification %>%
-  count(lspci_id, name, classification) %>%
-  complete(nesting(lspci_id, name), classification, fill = list(n = 0)) %>%
+  count(dataset, lspci_id, name, classification) %>%
+  complete(dataset, nesting(lspci_id, name), classification, fill = list(n = 0)) %>%
   group_by(lspci_id, name) %>%
   mutate(frac = n / sum(n)) %>%
   ungroup() %>%
@@ -1567,14 +1575,14 @@ p <- single_dose_classification %>%
   #       pull(name)
   #   )
   # ) %>%
-  select(lspci_id, name, classification, frac) %>%
+  select(dataset, lspci_id, name, classification, frac) %>%
   pivot_wider(names_from = classification, values_from = frac) %>%
   ggplot(aes(binding, discordant)) +
     geom_point() +
     geom_text_repel(
       aes(label = name),
       data = ~.x %>%
-        mutate(name = if_else(discordant < 0.04, "", name)),
+        mutate(name = if_else(discordant < 0.02, "", name)),
       min.segment.length = 0.2,
       max.overlaps = Inf,
       max.iter = 50000,
@@ -1587,17 +1595,18 @@ p <- single_dose_classification %>%
       title = "Discordant vs binding per compound"
     ) +
     scale_x_continuous(labels = scales::percent) +
-    scale_y_continuous(labels = scales::percent)
+    scale_y_continuous(labels = scales::percent) +
+    facet_wrap(~dataset)
 
 ggsave(
-  "classification/discordant_vs_binding.pdf", p, width = 7, height = 7
+  "classification/discordant_vs_binding.pdf", p, width = 12, height = 7
 )
 
 
 p <- single_dose_classification %>%
-  count(`DiscoveRx Gene Symbol`, classification) %>%
-  complete(`DiscoveRx Gene Symbol`, classification, fill = list(n = 0)) %>%
-  group_by(`DiscoveRx Gene Symbol`) %>%
+  count(dataset, `DiscoveRx Gene Symbol`, classification) %>%
+  complete(dataset, `DiscoveRx Gene Symbol`, classification, fill = list(n = 0)) %>%
+  group_by(dataset, `DiscoveRx Gene Symbol`) %>%
   mutate(frac = n / sum(n)) %>%
   ungroup() %>%
   # mutate(
@@ -1608,7 +1617,7 @@ p <- single_dose_classification %>%
   #       pull(name)
   #   )
   # ) %>%
-  select(`DiscoveRx Gene Symbol`, classification, frac) %>%
+  select(dataset, `DiscoveRx Gene Symbol`, classification, frac) %>%
   pivot_wider(names_from = classification, values_from = frac) %>%
   ggplot(aes(binding, discordant)) +
     geom_point() +
@@ -1628,10 +1637,11 @@ p <- single_dose_classification %>%
       title = "Discordant vs binding per kinase"
     ) +
     scale_x_continuous(labels = scales::percent) +
-    scale_y_continuous(labels = scales::percent)
+    scale_y_continuous(labels = scales::percent) +
+    facet_wrap(~dataset)
 
 ggsave(
-  "classification/discordant_vs_binding_kinases.pdf", p, width = 7, height = 7
+  "classification/discordant_vs_binding_kinases.pdf", p, width = 12, height = 7
 )
 
 ```
