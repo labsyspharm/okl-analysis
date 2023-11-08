@@ -13,16 +13,16 @@ syn <- synDownloader("~/data", .cache = TRUE)
 
 ```{r}
 kinomescan_pseudo_kds <- syn("syn51080578") %>%
-    read_csv()
+  read_csv()
 
 kinomescan_classes <- syn("syn51080579") %>%
-    read_csv()
+  read_csv()
 
 kinomescan_kinase_info <- syn("syn51286743") %>%
-    read_csv()
+  read_csv()
 
 single_dose <- syn("syn52504516") %>%
-    read_csv()
+  read_csv()
 
 compound_mapping <- syn("syn26260389") %>%
   read_fst(as.data.table = TRUE)
@@ -1563,7 +1563,7 @@ ggsave(
 ```
 
 ```{r}
-KD_THRESHOLDS <- c(100, 1000, 5000)
+KD_THRESHOLDS <- c(10, 100, 1000, 5000)
 library(ROCit)
 
 single_dose_comp_binned_filtered <- single_dose_comp_binned %>%
@@ -1593,8 +1593,8 @@ single_dose_comp_rocs <- single_dose_comp_binned_filtered %>%
   group_by(`Compound Concentration (nM)`, kd_threshold) %>%
   summarize(
     roc = rocit(
-      # 100 - `Percent Control`,
-      `Percent Control`,
+      100 - `Percent Control`,
+      # `Percent Control`,
       chembl_kd < cur_group()$kd_threshold,
       method = "empirical"
     ) %>%
@@ -1748,7 +1748,7 @@ ggsave(
 
 p <- single_dose_comp_scores_weighted_diagnostics %>%
   filter(
-    variable %in% c("score_naive",  "FP", "FN")
+    variable %in% c("score_naive", "FP", "FN")
   ) %>%
   left_join(
     measure_names,
@@ -1767,7 +1767,19 @@ p <- single_dose_comp_scores_weighted_diagnostics %>%
       left_join(
         measure_names,
         by = c("variable" = "abbreviation")
-      )
+      ),
+    show.legend = FALSE
+  ) +
+  geom_text_repel(
+    aes(label = signif(Cutoff, 2)),
+    data = single_dose_comp_scores_weighted_diagnostic_optim %>%
+      filter(variable %in% c("score_naive")) %>%
+      left_join(
+        measure_names,
+        by = c("variable" = "abbreviation")
+      ),
+    size = 3,
+    show.legend = FALSE
   ) +
   scale_linetype_manual(
     values = c(
@@ -1776,22 +1788,17 @@ p <- single_dose_comp_scores_weighted_diagnostics %>%
       "2xFP" = "dashed"
     )
   ) +
+  scale_y_sqrt() +
   facet_grid(vars(kd_threshold), vars(`Compound Concentration (nM)`)) +
   labs(
     x = "Cutoff", y = "Value",
     color = "Variable", linetype = "Weights"
   )
 
-single_dose_comp_scores_weighted_optimal <- single_dose_comp_scores_weighted %>%
-  select(-roc, -roc_measures) %>%
-  mutate(
-    across(
-      scores,
-      \(x) map(x, \(y) slice_max(y, score))
-    )
-  ) %>%
-  unnest(scores) %>%
-  mutate(Cutoff = 100 - Cutoff)
+ggsave(
+  file.path("plots", "kd_roc_weighted_score_naive.pdf"),
+  width = 8, height = 5
+)
 
 ```
 
@@ -1864,6 +1871,10 @@ optimal_params_gt <- optimal_params_table %>%
     rows = variable %in% c("SENS", "SPEC", "PREC"),
     direction = "row",
     fn = \(x) {
+      # scales::col_numeric(
+      #   palette = c("white", "red"),
+      #   domain = NULL
+      # )(as.numeric(x))
       x_fct <- fct_inseq(x, ordered = TRUE)
       scales::col_factor(
         palette = c("white", "red"),
@@ -1877,8 +1888,11 @@ optimal_params_gt <- optimal_params_table %>%
     rows = variable %in% c("FP", "FN"),
     direction = "row",
     fn = \(x) {
+      # scales::col_numeric(
+      #   palette = c("red", "white"),
+      #   domain = NULL
+      # )(as.numeric(x))
       x_fct <- fct_inseq(x, ordered = TRUE)
-      # browser()
       scales::col_factor(
         palette = c("red", "white"),
         domain = levels(x_fct),
