@@ -21,11 +21,14 @@ kinomescan_classes <- syn("syn51080579") %>%
 kinomescan_kinase_info <- syn("syn51286743") %>%
     read_csv()
 
-single_dose <- syn("syn26486828") %>%
+single_dose <- syn("syn52504516") %>%
     read_csv()
 
 compound_mapping <- syn("syn26260389") %>%
   read_fst(as.data.table = TRUE)
+
+chembl_kd_raw <- syn("syn52854574") %>%
+  read_csv()
 
 # qpcr_misses <- syn("syn33531640") %>%
 #   readxl::read_excel() %>%
@@ -44,7 +47,7 @@ lsp_biochem_single <- syn("syn25173513") %>%
   read_fst()
 ```
 
-Aggregate single-dose data to get IC50s. Remove any ChEMBL Kd values that 
+Aggregate ChEMBL IC50 values. Remove any values that
 have relation that is not "=" unless the relation is ">" or ">=" and the value
 is greater than 9000. This is to avoid underestimating IC50s for cases where
 people just didn't assay higher concentrations.
@@ -242,9 +245,6 @@ the relation is ">" or ">=" and the value is greater than 9000.
 
 
 ```{r}
-chembl_kd_raw <- fread("data/kds_raw.csv.gz") %>%
-  as_tibble()
-
 chembl_kd <- chembl_kd_raw %>%
   mutate(across(standard_value, as.numeric)) %>%
   filter(
@@ -319,7 +319,7 @@ p_scatter <- pseudo_kd_kd_comp %>%
   )
 
 ggsave(
-    "plots/chembl_kd_vs_kinomescan_pseudo_kd_new.pdf", p_scatter,
+    "plots/chembl_kd_vs_kinomescan_pseudo_kd_new2.pdf", p_scatter,
     width = 8, height = 4
 )
 
@@ -372,7 +372,7 @@ p_combined <- egg::ggarrange(
 )
 
 ggsave(
-    "plots/chembl_kd_by_comparison_combined_new.pdf", p_combined,
+    "plots/chembl_kd_by_comparison_combined_new2.pdf", p_combined,
     width = 6, height = 4.5
 )
 ```
@@ -532,7 +532,7 @@ p <- pseudo_kd_kd_comp %>%
   geom_point(
     aes(color = false_class, size = false_class),
     data = \(x) x %>%
-      left_join( 
+      left_join(
         pseudo_kd_comp_false_class %>%
           filter(
             chembl_type == "kd"
@@ -666,7 +666,7 @@ p <- pseudo_kd_kd_comp %>%
   geom_point(
     aes(color = false_class, size = false_class),
     data = \(x) x %>%
-      left_join( 
+      left_join(
         pseudo_kd_comp_false_class %>%
           filter(
             chembl_type == "kd",
@@ -720,7 +720,7 @@ p <- pseudo_kd_kd_comp %>%
   )
 
 ggsave(
-    "plots/chembl_kd_vs_kinomescan_pseudo_kd_false_multiple_variants.pdf", p,
+    "plots/chembl_kd_vs_kinomescan_pseudo_kd_false_multiple_variants_new.pdf", p,
     width = 10, height = 6
 )
 
@@ -737,7 +737,7 @@ pseudo_kd_comp_false_class_with_var <- pseudo_kd_comp_false_class %>%
 pseudo_kd_comp_false_class_with_var_xtab <- pseudo_kd_comp_false_class_with_var %>%
   count(false_class, multiple_variants) %>%
   pivot_wider(names_from = multiple_variants, values_from = n)
-  
+
 pseudo_kd_comp_false_class_with_var_xtab %>%
   column_to_rownames("false_class") %>%
   rstatix::pairwise_fisher_test(detailed = TRUE) %>%
@@ -751,11 +751,11 @@ pseudo_kd_comp_false_class_with_var_xtab %>%
   adorn_ns()
 ```
 
- group1         group2         estimate         p
+  group1         group2         estimate         p
   <chr>          <chr>             <dbl>     <dbl>
-1 concordant     false negative    4.92  4.53e-127
-2 concordant     false positive    1.48  1.03e- 13
-3 false negative false positive    0.301 2.48e- 56
+1 concordant     false negative    5.50  2.87e-117
+2 concordant     false positive    1.46  3.93e- 13
+3 false negative false positive    0.266 2.54e- 58
 
 False negative and positive group definitely overrepresented in kinases with
 multiple variants.
@@ -983,38 +983,28 @@ pseudo_ic50_comp_left %>%
 
 ```{r ic50_single_dose_comp}
 single_dose_trans <- single_dose %>%
-  left_join(
-    qpcr_misses %>%
-      transmute(
-        hmsl_id = `Compound Name`,
-        `DiscoveRx Gene Symbol` = `Ambit Gene Symbol`,
-        `Compound Conc`,
-        qpcr_miss = TRUE
-      ),
-    by = c("hmsl_id", "DiscoveRx Gene Symbol", "Compound Concentration (nM)" = "Compound Conc")
-  ) %>%
   mutate(
     log_inhibition = log10(`Percent Control` + 0.01),
-    qpcr_miss = replace_na(qpcr_miss, FALSE)
   ) %>%
   as_tibble()
 
 
 single_dose_comp <- single_dose_trans %>%
-  power_left_join(
-    lsp_targets %>%
-      filter(organism == "Homo sapiens") %>%
-      select(lspci_target_id, symbol),
-    by = c("Entrez Gene Symbol" = "symbol"),
-    check = check_specs(
-      duplicate_keys_left = "ignore",
-      duplicate_keys_right = "ignore",
-      unmatched_keys_left = "warn",
-      unmatched_keys_right = "ignore"
-    )
-  )  %>%
+  # power_left_join(
+  #   lsp_targets %>%
+  #     filter(organism == "Homo sapiens") %>%
+  #     select(lspci_target_id, symbol),
+  #   by = c("Entrez Gene Symbol" = "symbol"),
+  #   check = check_specs(
+  #     duplicate_keys_left = "ignore",
+  #     duplicate_keys_right = "ignore",
+  #     unmatched_keys_left = "warn",
+  #     unmatched_keys_right = "ignore"
+  #   )
+  # )  %>%
   power_left_join(
     kinomescan_classes %>%
+      filter(dataset == "original_repeat_replaced") %>%
       distinct(lspci_id, `DiscoveRx Gene Symbol`, classification) %>%
       mutate(across(classification, factor, levels = names(class_colors))),
     by = c("lspci_id", "DiscoveRx Gene Symbol"),
@@ -1026,8 +1016,9 @@ single_dose_comp <- single_dose_trans %>%
     )
   ) %>%
   inner_join(
-    lsp_biochem,
-    by = c("lspci_id", "lspci_target_id")
+    chembl_kd %>%
+      select(lspci_id, chembl_kd, chembl_kd_relation, `DiscoveRx Gene Symbol`),
+    by = c("lspci_id", "DiscoveRx Gene Symbol")
   )
 
 p <- single_dose_comp %>%
@@ -1038,16 +1029,18 @@ p <- single_dose_comp %>%
       0.5 * min(`Percent Control`[`Percent Control` > 0]),
       `Percent Control`
     ),
-    value = pmin(value, 30000)
+    chembl_kd = pmin(chembl_kd, 30000)
   ) %>%
   group_by(`Compound Concentration (nM)`) %>%
   filter(n() > 1000) %>%
   ungroup() %>%
   filter(
-    !qpcr_miss
+    !qpcr_miss,
+    !exclude_target,
+    classification != "discordant"
   ) %>%
   ggplot(
-    aes(value, `Percent Control`)
+    aes(chembl_kd, `Percent Control`)
   ) +
   # ggrastr::rasterize(geom_point(alpha = 0.5)) +
   ggrastr::rasterize(
@@ -1061,7 +1054,7 @@ p <- single_dose_comp %>%
   facet_grid(classification ~ `Compound Concentration (nM)`)
 
 ggsave(
-  "plots/single_dose_vs_chembl_ic50_all_doses.pdf", p,
+  "plots/single_dose_vs_chembl_kd_all_doses_new.pdf", p,
   width = 10, height = 10
 )
 
@@ -1366,13 +1359,14 @@ Doing it in bins of %control values as well as cumulatively
 
 ```{r}
 single_dose_comp_binned <- single_dose_comp %>%
+  filter(dataset == "original_repeat_replaced") %>%
   mutate(
     percent_control_bin = cut(
       `Percent Control`,
       breaks = c(-Inf, seq(from = 10, to = 90, by = 10), Inf)
     ),
-    ic_50_bin = cut(
-      value,
+    kd_bin = cut(
+      chembl_kd,
       breaks = c(-Inf, 10**seq(-1, 4), Inf)
     )
   )
@@ -1433,13 +1427,14 @@ p <- percent_control_ic50_ci_ic50 %>%
   facet_wrap(~`Compound Concentration (nM)`) +
   scale_y_log10()
 
-p <- single_dose_comp_binned %>%
-  ggplot(
-    aes(ic_50_bin, value)
-  ) +
-  ggrastr::rasterize(geom_beeswarm()) +
-  facet_wrap(~`Compound Concentration (nM)`) +
-  scale_y_log10()
+# library(ggbeeswarm)
+# p <- single_dose_comp_binned %>%
+#   ggplot(
+#     aes(ic_50_bin, value)
+#   ) +
+#   ggrastr::rasterize(geom_beeswarm()) +
+#   facet_wrap(~`Compound Concentration (nM)`) +
+#   scale_y_log10()
 
 
 p <- single_dose_comp_binned %>%
@@ -1568,7 +1563,7 @@ ggsave(
 ```
 
 ```{r}
-IC50_THRESHOLDS <- c(100, 1000, 5000)
+KD_THRESHOLDS <- c(100, 1000, 5000)
 library(ROCit)
 
 single_dose_comp_binned_filtered <- single_dose_comp_binned %>%
@@ -1587,18 +1582,20 @@ single_dose_comp_binned_filtered <- single_dose_comp_binned %>%
   ) %>%
   filter(
     classification != "discordant",
-    !qpcr_miss
+    !qpcr_miss,
+    !exclude_target
   )
 
 single_dose_comp_rocs <- single_dose_comp_binned_filtered %>%
   crossing(
-    ic50_threshold = IC50_THRESHOLDS
+    kd_threshold = KD_THRESHOLDS
   ) %>%
-  group_by(`Compound Concentration (nM)`, ic50_threshold) %>%
+  group_by(`Compound Concentration (nM)`, kd_threshold) %>%
   summarize(
     roc = rocit(
-      100 - `Percent Control`,
-      value < cur_group()$ic50_threshold,
+      # 100 - `Percent Control`,
+      `Percent Control`,
+      chembl_kd < cur_group()$kd_threshold,
       method = "empirical"
     ) %>%
       list(),
@@ -1608,7 +1605,7 @@ single_dose_comp_rocs <- single_dose_comp_binned_filtered %>%
     # roc_ci = map(roc, ciROC),
     roc_measures = map(
       roc,
-      ~measureit(.x, measure = c("SENS", "SPEC", "PREC")) %>%
+      ~measureit(.x, measure = c("SENS", "SPEC", "PREC", "PPV")) %>%
         unclass() %>%
         as_tibble()
     )
@@ -1618,31 +1615,351 @@ single_dose_comp_rocs <- single_dose_comp_binned_filtered %>%
 single_dose_comp_roc_values <- single_dose_comp_rocs %>%
   transmute(
     `Compound Concentration (nM)`,
-    ic50_threshold = fct_inorder(
-      paste(ic50_threshold, "nM")
+    kd_threshold = fct_inorder(
+      paste(kd_threshold, "nM")
     ),
     roc_values = map(roc, plot)
   )
 
-single_dose_comp_roc_values_optimal <- single_dose_comp_roc_values %>%
-  mutate(
-    across(
-      roc_values,
-      map,
-      ~.x$`optimal Youden Index point` %>%
-        as.list() %>%
-        as_tibble()
+fn_fp_weights <- c("2xFN" = 2/3, "equal" = .5, "2xFP" = 1/3)
+compute_weighted_score <- function(df, fn_fp_weight) {
+  df %>%
+    mutate(
+      score = 2 * (fn_fp_weight * (TP / (TP + FN)) + (1 - fn_fp_weight) * (TN / (TN + FP))) - 1,
+      score_naive = fn_fp_weight * FN + (1 - fn_fp_weight) * FP
+    )
+}
+
+single_dose_comp_scores_weighted <- single_dose_comp_rocs %>%
+  cross_join(
+    enframe(
+      fn_fp_weights,
+      name = "weight_name",
+      value = "fn_fp_weight"
     )
   ) %>%
-  unnest(roc_values) %>%
-  transmute(
-    `Compound Concentration (nM)`,
-    ic50_threshold,
-    `Cutoff` = 100 - cutoff,
-    `FPR/1-Specificity` = FPR,
-    `TPR/Sensitivity/Recall` = TPR
+  mutate(
+    scores = map2(roc_measures, fn_fp_weight, compute_weighted_score)
+  ) %>%
+  select(-roc, -roc_measures)
+
+
+single_dose_comp_scores_weighted_diagnostics <- single_dose_comp_scores_weighted %>%
+  unnest(scores) %>%
+  pivot_longer(
+    c(TP, TN, FP, FN, score, score_naive, SENS, SPEC, PREC, PPV),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  filter(
+    case_when(
+      variable %in% c("score", "score_naive") ~ TRUE,
+      TRUE ~ weight_name == "equal"
+    )
+  ) %>%
+  mutate(
+    Cutoff = 100 - Cutoff
   )
 
+single_dose_comp_scores_weighted_diagnostic_optim <- single_dose_comp_scores_weighted_diagnostics %>%
+  filter(str_starts(variable, "score")) %>%
+  group_nest(
+    variable, `Compound Concentration (nM)`, kd_threshold, weight_name
+  ) %>%
+  mutate(
+    data = map2(
+      data, variable,
+      \(df, variable) {
+        if (variable == "score")
+          slice_max(df, value)
+        else
+          slice_min(df, value)
+      }
+    )
+  ) %>%
+  unnest(data)
+
+measure_names <- tribble(
+  ~abbreviation, ~name, ~name_long,
+  "SENS", "Sensitivity", "Sensitivity TP / (TP + FN)",
+  "SPEC", "Specificity", "Specificity TN / (TN + FP)",
+  "PREC", "Precision", "Precision TP / (TP + FP)",
+  "score", "Weighted Youden", "Weighted Youden",
+  "score_naive", "Weighted Score", "Weighted Score",
+  "TP", "True Positives", "True Positives TP",
+  "TN", "True Negatives", "True Negatives TN",
+  "FP", "False Positives", "False Positives FP",
+  "FN", "False Negatives", "False Negatives FN"
+)
+
+library(ggrepel)
+p <- single_dose_comp_scores_weighted_diagnostics %>%
+  filter(
+    variable %in% c("score", "SENS", "SPEC", "PREC")
+  ) %>%
+  left_join(
+    measure_names,
+    by = c("variable" = "abbreviation")
+  ) %>%
+  ggplot(
+    aes(
+      Cutoff, value, color = name_long,
+      linetype = weight_name
+    )
+  ) +
+  geom_line() +
+  geom_point(
+    data = single_dose_comp_scores_weighted_diagnostic_optim %>%
+      filter(variable %in% c("score")) %>%
+      left_join(
+        measure_names,
+        by = c("variable" = "abbreviation")
+      ),
+    show.legend = FALSE
+  ) +
+  geom_text_repel(
+    aes(label = signif(Cutoff, 2)),
+    data = single_dose_comp_scores_weighted_diagnostic_optim %>%
+      filter(variable %in% c("score")) %>%
+      left_join(
+        measure_names,
+        by = c("variable" = "abbreviation")
+      ),
+    size = 3,
+    show.legend = FALSE
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "2xFN" = "dotted",
+      "equal" = "solid",
+      "2xFP" = "dashed"
+    )
+  ) +
+  facet_grid(vars(kd_threshold), vars(`Compound Concentration (nM)`)) +
+  labs(
+    x = "Cutoff", y = "Value",
+    color = "Variable", linetype = "Weights"
+  )
+
+ggsave(
+  file.path("plots", "kd_roc_weighted_scores.pdf"),
+  width = 8, height = 5
+)
+
+p <- single_dose_comp_scores_weighted_diagnostics %>%
+  filter(
+    variable %in% c("score_naive",  "FP", "FN")
+  ) %>%
+  left_join(
+    measure_names,
+    by = c("variable" = "abbreviation")
+  ) %>%
+  ggplot(
+    aes(
+      Cutoff, value, color = name_long,
+      linetype = weight_name
+    )
+  ) +
+  geom_line() +
+  geom_point(
+    data = single_dose_comp_scores_weighted_diagnostic_optim %>%
+      filter(variable %in% c("score_naive")) %>%
+      left_join(
+        measure_names,
+        by = c("variable" = "abbreviation")
+      )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "2xFN" = "dotted",
+      "equal" = "solid",
+      "2xFP" = "dashed"
+    )
+  ) +
+  facet_grid(vars(kd_threshold), vars(`Compound Concentration (nM)`)) +
+  labs(
+    x = "Cutoff", y = "Value",
+    color = "Variable", linetype = "Weights"
+  )
+
+single_dose_comp_scores_weighted_optimal <- single_dose_comp_scores_weighted %>%
+  select(-roc, -roc_measures) %>%
+  mutate(
+    across(
+      scores,
+      \(x) map(x, \(y) slice_max(y, score))
+    )
+  ) %>%
+  unnest(scores) %>%
+  mutate(Cutoff = 100 - Cutoff)
+
+```
+
+
+```{r}
+param_order <- c(
+  "Cutoff", "FP", "FN", "SENS", "SPEC", "PREC"
+)
+
+optimal_params_table <- single_dose_comp_scores_weighted_diagnostics %>%
+  inner_join(
+    single_dose_comp_scores_weighted_diagnostic_optim %>%
+      filter(variable == "score") %>%
+      select(-variable, -value)
+  ) %>%
+  bind_rows(
+    single_dose_comp_scores_weighted_diagnostic_optim %>%
+      filter(variable == "score") %>%
+      transmute(
+        `Compound Concentration (nM)`, kd_threshold,
+        weight_name,
+        value = Cutoff, variable = "Cutoff"
+      ) %>%
+      distinct()
+  ) %>%
+  filter(
+    weight_name == "equal",
+    variable %in% c("Cutoff", "FP", "FN", "SENS", "SPEC", "PREC")
+  ) %>%
+  select(
+    `Compound Concentration (nM)`, kd_threshold,
+    variable, value
+  ) %>%
+  mutate(
+    value = case_when(
+      variable %in% c("SENS", "SPEC", "PREC") ~ sprintf("%.2f", value),
+      TRUE ~ sprintf("%.0f", value)
+    ),
+    variable = factor(variable, levels = param_order),
+    kd_threshold = fct_inseq(as.character(kd_threshold)) %>%
+      fct_relabel(\(x) paste0("Target affinity <", x, " nM"))
+  ) %>%
+  arrange(
+    kd_threshold,
+    `Compound Concentration (nM)`,
+    variable
+  ) %>%
+  pivot_wider(
+    names_from = `Compound Concentration (nM)`,
+    values_from = value
+  )
+
+library(gt)
+optimal_params_gt <- optimal_params_table %>%
+  gt(
+    groupname_col = "kd_threshold",
+    rowname_col = "variable"
+  ) %>%
+  cols_align(
+    align = "right",
+    columns = -variable
+  ) %>%
+  cols_align(
+    align = "left",
+    columns = variable
+  ) %>%
+  tab_stub_indent(rows = everything(), indent = 2) %>%
+  data_color(
+    columns = everything(),
+    rows = variable %in% c("SENS", "SPEC", "PREC"),
+    direction = "row",
+    fn = \(x) {
+      x_fct <- fct_inseq(x, ordered = TRUE)
+      scales::col_factor(
+        palette = c("white", "red"),
+        domain = levels(x_fct),
+        ordered = TRUE
+      )(x_fct)
+    }
+  ) %>%
+  data_color(
+    columns = everything(),
+    rows = variable %in% c("FP", "FN"),
+    direction = "row",
+    fn = \(x) {
+      x_fct <- fct_inseq(x, ordered = TRUE)
+      # browser()
+      scales::col_factor(
+        palette = c("red", "white"),
+        domain = levels(x_fct),
+        ordered = TRUE
+      )(x_fct)
+    }
+  ) %>%
+  tab_options(
+    table.font.names = "Helvetica"
+  )
+
+gtsave(
+  optimal_params_gt,
+  file.path("plots", "kd_roc_weighted_equal_optimal_table.html")
+)
+```
+
+```{r}
+
+optimal_params_table <- single_dose_comp_scores_weighted_diagnostics %>%
+  inner_join(
+    single_dose_comp_scores_weighted_diagnostic_optim %>%
+      filter(variable == "score") %>%
+      select(-variable, -value)
+  ) %>%
+  bind_rows(
+    single_dose_comp_scores_weighted_diagnostic_optim %>%
+      filter(variable == "score") %>%
+      transmute(
+        `Compound Concentration (nM)`, kd_threshold,
+        weight_name,
+        value = Cutoff, variable = "Cutoff"
+      ) %>%
+      distinct()
+  ) %>%
+  filter(
+    weight_name == "equal",
+    variable %in% c("Cutoff", "FP", "FN", "SENS", "SPEC", "PREC")
+  ) %>%
+  select(
+    `Compound Concentration (nM)`, kd_threshold,
+    variable, value
+  ) %>%
+  # mutate(
+  #   value = case_when(
+  #     variable %in% c("SENS", "SPEC", "PREC") ~ sprintf("%.2f", value),
+  #     TRUE ~ sprintf("%.0f", value)
+  #   )
+  # ) %>%
+  mutate(
+    variable = factor(variable, levels = param_order)
+  )  %>%
+  arrange(
+    kd_threshold,
+    `Compound Concentration (nM)`,
+    variable
+  ) %>%
+  pivot_wider(
+    names_from = variable,
+    values_from = value
+  )
+
+library(gt)
+optimal_params_gt <- optimal_params_table %>%
+  gt(
+    groupname_col = "kd_threshold",
+    rowname_col = "variable"
+  ) %>%
+  cols_align(
+    align = "right",
+    columns = -variable
+  ) %>%
+  cols_align(
+    align = "left",
+    columns = variable
+  ) %>%
+  tab_stub_indent(rows = everything(), indent = 2)
+```
+
+
+```{r}
 
 pwalk(
   single_dose_comp_rocs,
@@ -1696,8 +2013,8 @@ library(cvms)
 
 # p <- plot_confusion_matrix(
 #   confusion_tables$confusion_table[[1]] %>%
-#   as_tibble(), 
-#   target_col = "chembl_ic50_below", 
+#   as_tibble(),
+#   target_col = "chembl_ic50_below",
 #   prediction_col = "eurofins_below",
 #   counts_col = "n"
 # )
@@ -1711,8 +2028,8 @@ pwalk(
   function(`Compound Concentration (nM)`, ic50_threshold, confusion_table, ...) {
     p <- plot_confusion_matrix(
       confusion_table %>%
-        as_tibble(), 
-      target_col = "chembl_ic50_below", 
+        as_tibble(),
+      target_col = "chembl_ic50_below",
       prediction_col = "eurofins_below",
       counts_col = "n"
     ) +
@@ -1736,13 +2053,13 @@ pwalk(
 Plot precision-recall curves
 
 ```{r}
-
+single_dose_comp_scores_weighted_diagnostic_optim
 library(ggrepel)
 single_dose_comp_pr_plots <- single_dose_comp_rocs %>%
   transmute(
     `Compound Concentration (nM)`,
-    ic50_threshold = fct_inorder(
-      paste(ic50_threshold, "nM")
+    kd_threshold = fct_inorder(
+      paste(kd_threshold, "nM")
     ),
     roc_measures
   ) %>%
@@ -1765,7 +2082,13 @@ single_dose_comp_pr_plots <- single_dose_comp_rocs %>%
       bind_rows(
         inner_join(
           .x,
-          single_dose_comp_roc_values_optimal
+          single_dose_comp_scores_weighted_diagnostic_optim %>%
+            filter(variable == "score", weight_name == "equal") %>%
+            mutate(
+              kd_threshold = fct_inorder(
+                paste(kd_threshold, "nM")
+              )
+            )
         )
       ),
     show.legend = FALSE
@@ -1781,13 +2104,25 @@ single_dose_comp_pr_plots <- single_dose_comp_rocs %>%
         )
       ) %>%
       anti_join(
-        single_dose_comp_roc_values_optimal %>%
-          mutate(across(Cutoff, as.character))
+        single_dose_comp_scores_weighted_diagnostic_optim %>%
+          filter(variable == "score", weight_name == "equal") %>%
+          mutate(across(Cutoff, as.character)) %>%
+          mutate(
+            kd_threshold = fct_inorder(
+              paste(kd_threshold, "nM")
+            )
+          )
       ) %>%
       bind_rows(
         inner_join(
           .x,
-          single_dose_comp_roc_values_optimal
+          single_dose_comp_scores_weighted_diagnostic_optim %>%
+            filter(variable == "score", weight_name == "equal") %>%
+            mutate(
+              kd_threshold = fct_inorder(
+                paste(kd_threshold, "nM")
+              )
+            )
         ) %>%
         mutate(
           across(Cutoff, ~paste0(.x, "*"))
@@ -1805,13 +2140,13 @@ single_dose_comp_pr_plots <- single_dose_comp_rocs %>%
     x = "Recall TP / (TP + FN)",
     y = "Precision TP / (TP + FP)",
     color = "Assay concentration",
-    title = "Precision-recall curves for prediction of IC50 < threshold"
+    title = "Precision-recall curves for prediction of Kd < threshold"
   ) +
-  facet_wrap(~ic50_threshold) +
+  facet_wrap(~kd_threshold) +
   coord_cartesian(xlim = c(0, 1.1))
 
 ggsave(
-  "plots/percent_control_ic50_pr.pdf",
+  "plots/percent_control_kd_pr.pdf",
   single_dose_comp_pr_plots,
   width = 10, height = 4
 )
@@ -1880,7 +2215,7 @@ single_dose_comp_roc_plot <- single_dose_comp_roc_values %>%
     x = "1 - Specificity TN / (TN + FP)",
     y = "Sensitivity TP / (TP + FN)",
     color = "Assay concentration",
-    title = "ROC curve for predicting an IC50 below threshold"
+    title = "ROC curve for predicting an Kd below threshold"
   ) +
   facet_wrap(~ic50_threshold) +
   coord_cartesian(xlim = c(-0.1, 1), ylim = c(0, 1.1))
