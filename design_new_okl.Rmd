@@ -1,0 +1,102 @@
+---
+title: "Design new OKL"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(fst)
+library(data.table)
+library(powerjoin)
+library(morgancpp)
+# library(dtplyr)
+
+theme_set(theme_minimal())
+
+synapser::synLogin()
+syn <- synDownloader("~/data/", .cache = TRUE)
+```
+
+```{r loading}
+inputs <- list(
+  okl_pseudo_kds = "syn51080578",
+  fingerprints = "syn26262157"
+)
+
+input_files <- map(
+  inputs, syn
+)
+
+pseudo_kds <- input_files[["okl_pseudo_kds"]] %>%
+  fread() %>%
+  as_tibble()
+
+dir.create(here("new_okl"))
+```
+
+
+```{r}
+fingerprints <- MorganFPS$new(input_files[["fingerprints"]], from_file = TRUE)
+setdiff(pseudo_kds$lspci_id, fingerprints$names)
+
+similarity_matrix <- fingerprints$tanimoto_subset(
+  unique(single_dose_datasets$lspci_id),
+  unique(single_dose_datasets$lspci_id)
+) %>%
+  as_tibble() %>%
+  rename(lspci_id_1 = id_1, lspci_id_2 = id_2)
+
+write_csv(
+  similarity_matrix,
+  here("new_okl", "similarity_values.csv")
+)
+```
+
+Remove results from mutant kinases, then aggregate across remaining variants
+(phosphorylation etc) using minimum pseudo-kd. Should hopefully reflect the
+kinase state that people typically want to inhibit.
+
+
+```{r}
+kd_matrix <- pseudo_kds %>%
+  filter(
+    dataset == "original_repeat_replaced",
+    !exclude_target
+  ) %>%
+  group_by(lspci_id, hgnc_symbol) %>%
+  slice_min(pseudo_kd, na_rm = TRUE, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(
+    lspci_id, hmsl_id, name,
+    `DiscoveRx Gene Symbol`, hgnc_symbol,
+    classification, pseudo_kd, pseudo_kd_relation
+  )
+
+write_csv(
+  kd_matrix,
+  here("new_okl", "kd_values.csv")
+)
+```
+
+
+```{r}
+new_okl_syn <- synMkdir(
+  "syn18508401", "new_okl"
+)
+
+synStoreMany(
+  c(
+    here("new_okl", "kd_values.csv"),
+    here("new_okl", "similarity_values.csv")
+  ),
+  parentId = new_okl_syn,
+  used = unname(inputs),
+  executed = "https://github.com/labsyspharm/okl-analysis/blob/main/design_new_okl.Rmd",
+  forceVersion = FALSE
+)
+```
+
