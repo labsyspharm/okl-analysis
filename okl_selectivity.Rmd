@@ -65,7 +65,11 @@ pseudo_kd <- input_files[["okl_pseudo_kds"]] %>%
 
 ```{r}
 catds <- single_dose_datasets %>%
-  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
+  filter(
+    `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000),
+    !exclude_target,
+    !qpcr_miss
+  ) %>%
   group_by(dataset, lspci_id, `Compound Concentration (nM)`) %>%
   filter(n() > 50) %>%
   mutate(
@@ -149,7 +153,10 @@ Alan C Cheng  1 , John Eksterowicz, Stephanie Geuns-Meyer, Yaxiong Sun
 ```{r}
 partition_index <- pseudo_kd %>%
   # filter(pseudo_ic50_relation == "=") %>%
-  filter(!exclude_target) %>%
+  filter(
+    !exclude_target,
+    classification != "discordant"
+  ) %>%
   group_by(dataset, lspci_id) %>%
   filter(n() > 50) %>%
   mutate(
