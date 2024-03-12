@@ -92,78 +92,41 @@ pseudo_kds_nominal_target_sorted <- kinomescan_pseudo_kds %>%
   ) %>%
   arrange(
     lspci_id, pseudo_kd
-  )
-
-pseudo_kds_nominal_top_n <- tibble(
-  top_x = seq_len(length(unique(pseudo_kds_nominal_target_sorted$`DiscoveRx Gene Symbol`)))
-) %>%
+  ) %>%
+  group_by(lspci_id) %>%
   mutate(
-    data = map(
-      top_x,
-      ~pseudo_kds_nominal_target_sorted %>%
-        group_by(lspci_id) %>%
-        filter(any(nominal_target)) %>%
-        ungroup() %>%
-        group_by(lspci_id, hmsl_id, name) %>%
-        summarize(
-          in_top_n = any(nominal_target[1:.x + 1]),
-          .groups = "drop"
-        )
-    ),
-    proportion_in_top_n = map_dbl(
-      data,
-      ~ mean(.x$in_top_n)
-    )
+    rank = seq_len(n())
+  ) %>%
+  ungroup()
+
+pseudo_kds_nominal_top_n <- pseudo_kds_nominal_target_sorted %>%
+  group_by(lspci_id) %>%
+  slice(
+    which(nominal_target)[1]
+  ) %>%
+  ungroup()
+
+pseudo_kds_nominal_top_n_plot_data <- pseudo_kds_nominal_top_n %>%
+  group_by(rank) %>%
+  summarize(
+    n_rank = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(rank) %>%
+  mutate(
+    n_cumsum = cumsum(n_rank),
+    proportion_in_top_n = n_cumsum / length(unique(pseudo_kds_nominal_target_sorted$lspci_id))
   )
 
-p <- pseudo_kds_nominal_top_n %>%
-  ggplot(aes(top_x, proportion_in_top_n)) +
+p <- pseudo_kds_nominal_top_n_plot_data %>%
+  ggplot(aes(rank, proportion_in_top_n)) +
   geom_point() +
-  geom_line() +
+  geom_step() +
   scale_x_log10() +
-  geom_hline(yintercept = 1, linetype = "dashed") +
+  # geom_hline(yintercept = 1, linetype = "dashed") +
   labs(
     x = "Top N targets",
-    y = "Proportion of compounds with\nnominal target in top N targets"
-  )
-
-ggsave(
-  "plots/nominal_target_in_top_n.pdf",
-  p, width = 5, height = 3
-)
-```
-
-
-```{r}
-
-pseudo_kds_nominal_top_n <- tibble(
-  top_x = seq_len(length(unique(pseudo_kds_nominal_target_sorted$`DiscoveRx Gene Symbol`)))
-) %>%
-  mutate(
-    data = map(
-      top_x,
-      ~ pseudo_kds_nominal_target_sorted %>%
-        filter(lspci_id %in% nominal_targets$lspci_id) %>%
-        group_by(lspci_id, hmsl_id, name) %>%
-        summarize(
-          in_top_n = any(nominal_target[1:.x + 1]),
-          .groups = "drop"
-        )
-    ),
-    proportion_in_top_n = map_dbl(
-      data,
-      ~ mean(.x$in_top_n)
-    )
-  )
-
-p <- pseudo_kds_nominal_top_n %>%
-  ggplot(aes(top_x, proportion_in_top_n)) +
-  geom_point() +
-  geom_line() +
-  scale_x_log10() +
-  labs(
-    x = "Top N targets",
-    y = "Proportion of compounds with\nnominal target in top N targets"
+    y = "Proportion of compounds with\nintended target in top N targets"
   )
 
 ggsave(
@@ -171,7 +134,41 @@ ggsave(
   p, width = 5, height = 3
 )
 
+
+pseudo_kds_nominal_top_n_plot_data_clinical <- pseudo_kds_nominal_top_n %>%
+  mutate(approved = if_else(max_phase >= 4, "Approved", "Not approved")) %>%
+  group_by(rank, approved) %>%
+  summarize(
+    n_rank = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(rank) %>%
+  group_by(approved) %>%
+  mutate(
+    n_cumsum = cumsum(n_rank),
+    proportion_in_top_n = n_cumsum / sum(n_rank)
+  ) %>%
+  ungroup()
+
+
+p <- pseudo_kds_nominal_top_n_plot_data_clinical %>%
+  ggplot(aes(rank, proportion_in_top_n, color = approved)) +
+  geom_point(alpha = 0.7) +
+  geom_step(alpha = 0.7) +
+  scale_x_log10() +
+  # geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(
+    x = "Top N targets",
+    y = "Proportion of compounds with\nintended target in top N targets"
+  )
+
+ggsave(
+  "plots/nominal_target_in_top_n_clinical.pdf",
+  p, width = 5, height = 3
+)
+
 ```
+
 
 ## Novel hit per kinase
 
