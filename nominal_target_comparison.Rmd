@@ -1,0 +1,244 @@
+
+```{r}
+library(tidyverse)
+library(synExtra)
+library(fst)
+library(data.table)
+library(powerjoin)
+
+synapser::synLogin()
+
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+```{r}
+kinomescan_pseudo_kds <- syn("syn51080578") %>%
+  read_csv()
+
+kinomescan_classes <- syn("syn51080579") %>%
+  read_csv()
+
+kinomescan_kinase_info <- syn("syn51286743") %>%
+  read_csv()
+
+
+# qpcr_misses <- syn("syn33531640") %>%
+#   readxl::read_excel() %>%
+#   left_join(
+#     compound_mapping[, .(lspci_id, external_id)] %>%
+#       unique(),
+#     by = c("Compound Name" = "external_id")
+#   )
+
+lsp_biochem <- syn("syn25173511") %>%
+  read_fst()
+
+nominal_targets <- syn("syn52947779") %>%
+  read_csv() %>%
+  power_inner_join(
+    kinomescan_pseudo_kds %>%
+      distinct(lspci_id, hmsl_id),
+    by = c("HMSLID" = "hmsl_id"),
+    check = check_specs(
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn"
+    )
+  )
+
+lsp_clinical <- syn("syn26260451") %>%
+  read_fst() %>%
+  as_tibble()
+```
+
+
+## Frequency nominal in top X targets
+
+```{r}
+nominal_targets_unique <- nominal_targets %>%
+  filter(!is.na(`DiscoveRx Gene Symbol`), `DiscoveRx Gene Symbol` != "n/a") %>%
+  transmute(lspci_id, `DiscoveRx Gene Symbol`, nominal_target = TRUE) %>%
+  distinct()
+
+pseudo_kds_nominal_target_sorted <- kinomescan_pseudo_kds %>%
+  filter(
+    dataset == "original_repeat_replaced",
+    lspci_id %in% nominal_targets_unique$lspci_id
+  ) %>%
+  power_left_join(
+    nominal_targets_unique,
+    by = c("lspci_id", "DiscoveRx Gene Symbol"),
+    check = check_specs(
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  power_left_join(
+    lsp_clinical %>%
+      group_by(lspci_id) %>%
+      summarize(
+        max_phase = max(max_phase),
+        .groups = "drop"
+      ) %>%
+      select(lspci_id, max_phase),
+    by = "lspci_id",
+    check = check_specs(
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  replace_na(
+    replace = list(
+      nominal_target = FALSE,
+      max_phase = 0
+    )
+  ) %>%
+  arrange(
+    lspci_id, pseudo_kd
+  )
+
+pseudo_kds_nominal_top_n <- tibble(
+  top_x = seq_len(length(unique(pseudo_kds_nominal_target_sorted$`DiscoveRx Gene Symbol`)))
+) %>%
+  mutate(
+    data = map(
+      top_x,
+      ~pseudo_kds_nominal_target_sorted %>%
+        group_by(lspci_id) %>%
+        filter(any(nominal_target)) %>%
+        ungroup() %>%
+        group_by(lspci_id, hmsl_id, name) %>%
+        summarize(
+          in_top_n = any(nominal_target[1:.x + 1]),
+          .groups = "drop"
+        )
+    ),
+    proportion_in_top_n = map_dbl(
+      data,
+      ~ mean(.x$in_top_n)
+    )
+  )
+
+p <- pseudo_kds_nominal_top_n %>%
+  ggplot(aes(top_x, proportion_in_top_n)) +
+  geom_point() +
+  geom_line() +
+  scale_x_log10() +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(
+    x = "Top N targets",
+    y = "Proportion of compounds with\nnominal target in top N targets"
+  )
+
+ggsave(
+  "plots/nominal_target_in_top_n.pdf",
+  p, width = 5, height = 3
+)
+```
+
+
+```{r}
+
+pseudo_kds_nominal_top_n <- tibble(
+  top_x = seq_len(length(unique(pseudo_kds_nominal_target_sorted$`DiscoveRx Gene Symbol`)))
+) %>%
+  mutate(
+    data = map(
+      top_x,
+      ~ pseudo_kds_nominal_target_sorted %>%
+        filter(lspci_id %in% nominal_targets$lspci_id) %>%
+        group_by(lspci_id, hmsl_id, name) %>%
+        summarize(
+          in_top_n = any(nominal_target[1:.x + 1]),
+          .groups = "drop"
+        )
+    ),
+    proportion_in_top_n = map_dbl(
+      data,
+      ~ mean(.x$in_top_n)
+    )
+  )
+
+p <- pseudo_kds_nominal_top_n %>%
+  ggplot(aes(top_x, proportion_in_top_n)) +
+  geom_point() +
+  geom_line() +
+  scale_x_log10() +
+  labs(
+    x = "Top N targets",
+    y = "Proportion of compounds with\nnominal target in top N targets"
+  )
+
+ggsave(
+  "plots/nominal_target_in_top_n.pdf",
+  p, width = 5, height = 3
+)
+
+```
+
+## Novel hit per kinase
+
+```{r}
+kd_thresholds <- c(100, 1000, 10000)
+
+biochem_pseudo_kd <- lsp_biochem %>%
+  filter(symbol %in% kinomescan_pseudo_kds$hgnc_symbol) %>%
+  power_left_join(
+    kinomescan_pseudo_kds %>%
+      filter(dataset == "original_repeat_replaced") %>%
+      group_by(lspci_id, hgnc_symbol) %>%
+      summarize(
+        pseudo_kd = min(pseudo_kd),
+        .groups = "drop"
+      ),
+    by = c("lspci_id", "symbol" = "hgnc_symbol"),
+    check = check_specs(
+      duplicate_keys_right = "warn"
+    )
+  )
+
+novel_hits <- tibble(
+  kd_threshold = kd_thresholds
+) %>%
+  mutate(
+    data = map(
+      kd_threshold,
+      ~biochem_pseudo_kd %>%
+        group_by(
+          symbol
+        ) %>%
+        summarize(
+          hit_by_chembl = any(value < .x, na.rm = TRUE),
+          hit_by_kinomescan = any(pseudo_kd < .x, na.rm = TRUE),
+          .groups = "drop"
+        )
+    )
+  )
+
+p <- novel_hits %>%
+  unnest(data) %>%
+  filter(!hit_by_chembl, hit_by_kinomescan) %>%
+  group_by(kd_threshold) %>%
+  summarize(
+    n = n(),
+    symbols = paste(symbol, collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    across(kd_threshold, \(x) fct_inseq(as.character(x), ordered = TRUE) %>% fct_relabel(\(y) paste0("≤", y)))
+  ) %>%
+  ggplot(aes(kd_threshold, n)) +
+  geom_col() +
+  geom_text(
+    aes(label = symbols),
+    vjust = -0.5
+  ) +
+  labs(
+    x = "Kd threshold",
+    y = "Number of novel hits"
+  )
+
+ggsave(
+  "plots/novel_hits_per_kinase.pdf",
+  p, width = 6, height = 4,
+  device = Cairo::CairoPDF
+)
+```
+
