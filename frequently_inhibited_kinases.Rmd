@@ -1,0 +1,494 @@
+---
+title: "Analysis of "
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(fst)
+library(data.table)
+library(powerjoin)
+# library(dtplyr)
+
+theme_set(theme_minimal())
+
+synapser::synLogin()
+syn <- synDownloader("~/data/", .cache = TRUE)
+```
+
+```{r loading}
+inputs <- list(
+  okl_single_dose_datasets = "syn52504516",
+  kinase_info = "syn51286743",
+  okl_pseudo_kds = "syn51080578",
+  partition_index_max = "syn52576129"
+)
+
+input_files <- map(
+  inputs, syn
+)
+
+kinase_info <- input_files[["kinase_info"]] %>%
+  read_csv()
+
+pseudo_kds <- input_files[["okl_pseudo_kds"]] %>%
+  fread() %>%
+  as_tibble() %>%
+  filter(dataset == "original_repeat_replaced")
+
+partition_index_max <- input_files[["partition_index_max"]] %>%
+  read_csv() %>%
+  filter(dataset == "original_repeat_replaced")
+```
+
+
+```{r}
+pseudo_kds_dedup <- pseudo_kds %>%
+  filter(
+    hgnc_symbol != "",
+    classification != "discordant",
+    pseudo_kd_concordant != "discordant",
+    !exclude_target,
+    library == "OKL"
+  ) %>%
+  group_by(lspci_id, hgnc_symbol) %>%
+  slice_min(
+    pseudo_kd,
+    with_ties = FALSE,
+    na_rm = TRUE
+  ) %>%
+  ungroup()
+
+CUTOFFS <- c(100, 1000)
+TOP_N <- 20
+
+most_inhibited_raw <- pseudo_kds_dedup %>%
+  group_by(hgnc_symbol) %>%
+  summarize(
+    n_inhibitors = map_int(
+      set_names(CUTOFFS),
+      ~ sum(pseudo_kd <= as.numeric(.x), na.rm = TRUE)
+    ) %>%
+      list(),
+    .groups = "drop"
+  )
+
+most_inhibited <- most_inhibited_raw %>%
+  unnest_longer(n_inhibitors, indices_to = "cutoff", values_to = "n_inhibitors") %>%
+  mutate(across(cutoff, as.numeric)) %>%
+  arrange(desc(n_inhibitors))
+
+most_inhibited %>%
+  count(cutoff, n_inhibitors) %>%
+  View()
+```
+
+
+```{r}
+library(UpSetR)
+
+most_inhibited_inhibitors <- most_inhibited %>%
+  group_by(cutoff) %>%
+  slice_head(n = TOP_N) %>%
+  ungroup() %>%
+  inner_join(
+    pseudo_kds_dedup,
+    by = "hgnc_symbol"
+  ) %>%
+  mutate(
+    inhibited = pseudo_kd <= cutoff
+  ) %>%
+  group_by(lspci_id, cutoff) %>%
+  filter(sum(inhibited) > 0) %>%
+  ungroup()
+
+most_inhibited_inhibitors_mats <- most_inhibited_inhibitors %>%
+  select(name, lspci_id, hgnc_symbol, cutoff, inhibited) %>%
+  group_nest(cutoff) %>%
+  mutate(
+    data = map(
+      data,
+      \(x) pivot_wider(x, names_from = hgnc_symbol, values_from = inhibited, values_fill = FALSE)
+    )
+  )
+
+```
+
+```{r}
+most_inhibited_inhibitors_table <- most_inhibited_inhibitors %>%
+  filter(inhibited) %>%
+  arrange(cutoff, lspci_id, hgnc_symbol) %>%
+  group_by(cutoff, lspci_id, name) %>%
+  summarize(
+    inhibited = list(hgnc_symbol),
+    .groups = "drop"
+  ) %>%
+  group_by(cutoff, inhibited) %>%
+  summarize(
+    names = list(name),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    inhibited_str = map_chr(inhibited, \(x) paste(x, collapse = ", ")),
+    names_str = map_chr(names, \(x) paste(x, collapse = ", ")),
+    n_inhibited = map_int(inhibited, length),
+    n_compounds = map_int(names, length)
+  ) %>%
+  arrange(cutoff, desc(n_inhibited))
+
+write_csv(
+  most_inhibited_inhibitors_table %>%
+    select(where(negate(is.list))),
+  here("data", paste0("top", TOP_N, "_most_inhibited_kinases_inhibitor_overlap_table.csv"))
+)
+```
+
+
+```{r}
+ps <- most_inhibited_inhibitors_mats %>%
+  mutate(
+    p = map(
+      data,
+      \(x) ComplexUpset::upset(
+        select(x, -name, -lspci_id) %>%
+          as.data.frame(),
+        colnames(x) %>%
+          setdiff(c("name", "lspci_id")),
+        min_size = 3,
+        name = "Compound targets"
+      )
+    )
+  )
+
+pwalk(
+  ps,
+  function(p, cutoff, ...) {
+    ggsave(
+      here("plots", paste0("upset_top", TOP_N, "_kinase_targets_cutoff_", cutoff, ".pdf")),
+      p, width = 7, height = 5
+    )
+  }
+)
+
+```
+
+```{r}
+
+library(SuperExactTest)
+set_input <- most_inhibited_inhibitors %>%
+  filter(inhibited) %>%
+  group_by(cutoff, hgnc_symbol) %>%
+  summarize(
+    inhibs = list(name),
+    .groups = "drop"
+  ) %>%
+  group_by(cutoff) %>%
+  summarize(
+    data = set_names(inhibs, hgnc_symbol) %>%
+      list(),
+    .groups = "drop"
+  )
+
+set_res <- set_input %>%
+  mutate(
+    res = map(
+      data,
+      \(x) SuperExactTest::supertest(x, n = length(unique(pseudo_kds$hgnc_symbol)))
+    )
+  )
+
+pwalk(
+  set_res,
+  function(res, cutoff, ...) {
+    withr::with_cairo_pdf(
+      here("plots", paste0("top", TOP_N, "_inhibited_kinases_inhibitor_overlap_cutoff_", cutoff, ".pdf")),
+      plot(
+        res,
+        Layout = "landscape",
+        min.intersection.size = 3,
+        degree = c(10, 9, 8),
+        sort.by = "size",
+        show.expected.overlap = TRUE
+        # sort.by = x$overlap.sizes %>%
+        #   sort() %>%
+        #   magrittr::is_greater_than(5) %>%
+        #   names(),
+        #   Layout = "landscape",
+        #   ke
+      ), width = 8, height = 4
+    )
+  }
+)
+
+set_plots <- set_res %>%
+  mutate(
+    plot = map(
+      res,
+      \(x) {
+        plot(
+          x,
+          Layout = "landscape",
+          min.intersection.size = 3,
+          sort.by = "size",
+          show.expected.overlap = TRUE
+          # sort.by = x$overlap.sizes %>%
+          #   sort() %>%
+          #   magrittr::is_greater_than(5) %>%
+          #   names(),
+          #   Layout = "landscape",
+          #   ke
+        )
+      }
+    )
+  )
+
+```
+
+
+```{r}
+partition_index_max_unique <- partition_index_max %>%
+  distinct(name, lspci_id, partition_index)
+
+inhibitors_n_kinases <- most_inhibited_inhibitors %>%
+  filter(inhibited) %>%
+  group_by(cutoff, lspci_id, name) %>%
+  summarize(
+    n_kinases = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(cutoff, desc(n_kinases))
+
+
+
+ps <- inhibitors_n_kinases %>%
+  group_nest(cutoff) %>%
+  mutate(
+    p = map(
+      data,
+      \(x) {
+        # browser()
+        df <- partition_index_max_unique %>%
+          semi_join(
+            pseudo_kds_dedup,
+            by = "lspci_id"
+          ) %>%
+          left_join(
+            x,
+            by = c("lspci_id", "name")
+          ) %>%
+          mutate(
+            n_kinases = n_kinases %>%
+              replace_na(0) %>%
+              as.character() %>%
+              fct_inseq(ordered = TRUE),
+            name = factor(name, levels = name[order(partition_index)])
+          )
+        ggplot(
+          df,
+          aes(
+            x = name,
+            y = partition_index,
+            fill = n_kinases
+          )
+        ) +
+          geom_step(group = 1) +
+          geom_col(
+            aes(
+              y = 0.05
+            ),
+            data = \(y) filter(y, as.numeric(as.character(n_kinases)) > 0)
+          ) +
+          scale_fill_viridis_d(
+            drop = FALSE
+          ) +
+          scale_color_viridis_d(
+            aesthetics = "segment.color",
+            drop = FALSE
+          ) +
+          ggrepel::geom_text_repel(
+            aes(
+              label = name,
+              segment.color = n_kinases,
+              # fill = n_kinases,
+              y = .05
+            ),
+            data = \(y) filter(y, as.numeric(as.character(n_kinases)) > 7),
+            color = "black",
+            direction = "x",
+            size = 2.5,
+            vjust = 1,
+            hjust = 1,
+            nudge_y = .6,
+            angle = 90,
+            seed = 42,
+            max.overlaps = 100,
+            show.legend = FALSE
+          ) +
+          theme(
+            axis.title.x = element_blank(),
+            axis.text.x = element_blank(),
+            axis.ticks.x = element_blank(),
+            panel.grid.major.x = element_blank(),
+          )
+      }
+    )
+  )
+
+pwalk(
+  ps,
+  function(p, cutoff, ...) {
+    ggsave(
+      here("plots", paste0("top", TOP_N, "_inhibited_kinases_inhibitor_overlap_size_cutoff_", cutoff, ".pdf")),
+      p, width = 8, height = 4
+    )
+  }
+)
+
+```
+
+
+```{r}
+
+pseudo_kds_inhibited <- pseudo_kds_dedup %>%
+  crossing(threshold = CUTOFFS) %>%
+  filter(pseudo_kd <= threshold)
+
+pseudo_kds_n_inhibited <- pseudo_kds_inhibited %>%
+  group_by(lspci_id, threshold) %>%
+  summarize(
+    n_inhibited = n(),
+    .groups = "drop"
+  )
+
+pseudo_kds_inhibited %>%
+  filter(threshold == 1000) %>%
+  group_by(hgnc_symbol) %>%
+  summarize(
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  pull(n) %>%
+  paste(collapse = ", ") %>%
+  clipr::write_clip()
+
+pseudo_kds_n_inhibited %>%
+  filter(threshold == 1000) %>%
+  pull(n_inhibited) %>%
+  paste(collapse = ", ") %>%
+  clipr::write_clip()
+```
+
+
+```{r}
+library(reticulate)
+use_condaenv("pulp")
+```
+
+
+```{r}
+
+make_random_inhibited <- function(cutoff) {
+  n_inhibited_kinases_at_thresh <- pseudo_kds_n_inhibited %>%
+    filter(threshold == cutoff)
+  n_inhibs <- nrow(n_inhibited_kinases_at_thresh)
+  n_inhibited_kinases <- n_inhibited_kinases_at_thresh %>%
+    slice_sample(prop = 1) %>%
+    pull(n_inhibited)
+  n_compounds_per_kinase <- pseudo_kds_inhibited %>%
+    filter(threshold == cutoff) %>%
+    group_by(hgnc_symbol) %>%
+    summarize(
+      n = n(),
+      .groups = "drop"
+    )
+  # browser()
+  random_inhibs <- list()
+  for (i in seq_len(n_inhibs)) {
+    n_this <- n_inhibited_kinases[i]
+    message("n_this: ", n_this, " i: ", i)
+    still_available_mask <- n_compounds_per_kinase$n > 0
+    message("still_available total: ", sum(n_compounds_per_kinase$n), " still available: ", sum(still_available_mask))
+    still_available_idx <- which(still_available_mask)
+    selected_idx <- sample(still_available_idx, size = n_this, replace = FALSE, prob = n_compounds_per_kinase$n[still_available_idx])
+    random_inhibs[[i]] <- n_compounds_per_kinase$hgnc_symbol[selected_idx]
+    n_compounds_per_kinase$n[selected_idx] <- n_compounds_per_kinase$n[selected_idx] - 1
+  }
+  random_inhibs
+}
+
+x <- make_random_inhibited(1000)
+
+N_RANDOM <- 3
+random_inhib_list <- map(
+  CUTOFFS,
+  \(cutoff) {
+    l <- list()
+    for (i in seq_len(N_RANDOM)) {
+      message("i start: ", i)
+      res <- NULL
+      while (is.null(res)) {
+        try({
+          res <- make_random_inhibited(cutoff)
+          # res <- 1
+        })
+      }
+      message("i end: ", i)
+      l[[i]] <- res
+    }
+    l
+  }
+)
+
+
+random_inhibs <- map(
+  CUTOFFS,
+  \(x) {
+    l <- list()
+    i <- 1
+    while(i <= N_RANDOM) {
+      try({
+        message(",")
+        res <- make_random_inhibited(x)
+        message("x")
+        l[[i]] <- res
+        message("i: ", i)
+        i <- i + 1
+      }, silent = TRUE)
+      message(".")
+    }
+    l
+  }
+)
+
+most_inhibited <- most_inhibited_raw %>%
+  unnest_longer(n_inhibitors, indices_to = "cutoff", values_to = "n_inhibitors") %>%
+  mutate(across(cutoff, as.numeric)) %>%
+  arrange(desc(n_inhibitors))
+
+```
+
+
+```{r}
+
+make_random_most_inhibited <- function()
+most_inhibited_inhibitors <- most_inhibited %>%
+  group_by(cutoff) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  inner_join(
+    pseudo_kds_dedup,
+    by = "hgnc_symbol"
+  ) %>%
+  mutate(
+    inhibited = pseudo_kd <= cutoff
+  ) %>%
+  group_by(lspci_id, cutoff) %>%
+  filter(sum(inhibited) > 0) %>%
+  ungroup()
+
+
+```
