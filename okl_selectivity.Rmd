@@ -26,7 +26,8 @@ inputs <- list(
   kinase_info = "syn51286743",
   klaeger_ic50s = "syn51288931",
   nominal_targets = "syn52947779",
-  okl_pseudo_kds = "syn51080578"
+  okl_pseudo_kds = "syn51080578",
+  okl_classification = "syn51080579"
 )
 
 input_files <- map(
@@ -60,8 +61,19 @@ nominal_targets <- input_files[["nominal_targets"]] %>%
 pseudo_kd <- input_files[["okl_pseudo_kds"]] %>%
   fread() %>%
   as_tibble()
+
+classification <- input_files[["okl_classification"]] %>%
+  fread() %>%
+  as_tibble()
 ```
 
+For computing CATDS try to reduce noise by censoring Percent Control values of
+compound-target pairs that are classified as non-binding. We frequently have
+values of 90% activity remaining for non-binding compounds, which is likely
+just noise but affects CATDS calculation significantly.
+
+Setting Percent Control to 100% for measurements classified as non-binding
+AND where Percent Control >35%
 
 ```{r}
 catds <- single_dose_datasets %>%
@@ -70,33 +82,68 @@ catds <- single_dose_datasets %>%
     !exclude_target,
     !qpcr_miss
   ) %>%
-  group_by(dataset, lspci_id, `Compound Concentration (nM)`) %>%
+  mutate(
+    non_binding_censored = FALSE
+  ) %>%
+  bind_rows(
+    power_left_join(
+      ., select(classification, dataset, lspci_id, `DiscoveRx Gene Symbol`, classification),
+      by = c("dataset", "lspci_id", "DiscoveRx Gene Symbol"),
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        duplicate_keys_right = "warn"
+      )
+    ) %>%
+    mutate(
+      non_binding_censored = TRUE,
+      `Percent Control` = if_else(
+        classification == "non-binding" & `Percent Control` > 35,
+        100, `Percent Control`
+      )
+    )
+  ) %>%
+  group_by(non_binding_censored, dataset, lspci_id, `Compound Concentration (nM)`) %>%
   filter(n() > 50) %>%
   mutate(
     catds = (100 - `Percent Control`) / sum(100 - `Percent Control`)
   ) %>%
-  ungroup()
+  ungroup() %>%
+  select(dataset, non_binding_censored, everything())
 
 catds_max <- catds %>%
-  group_by(dataset, lspci_id, `Compound Concentration (nM)`) %>%
+  group_by(dataset, non_binding_censored, lspci_id, `Compound Concentration (nM)`) %>%
   slice_max(
     catds,
     n = 1,
     na_rm = TRUE,
     with_ties = TRUE
+  ) %>%
+  ungroup()
+
+catds %>%
+  group_nest(non_binding_censored) %>%
+  pwalk(
+    \(non_binding_censored, data) {
+      write_csv(
+        data %>%
+          select(where(negate(is.list))),
+        paste0("classification/okl_eurofins_catds", if (non_binding_censored) "_censored" else "", ".csv")
+      )
+    }
   )
 
-write_csv(
-  catds %>%
-    select(where(negate(is.list))),
-  "classification/okl_eurofins_catds.csv"
-)
+catds_max %>%
+  group_nest(non_binding_censored) %>%
+  pwalk(
+    \(non_binding_censored, data) {
+      write_csv(
+        data %>%
+          select(where(negate(is.list))),
+        paste0("classification/okl_eurofins_catds_index_max", if (non_binding_censored) "_censored" else "", ".csv")
+      )
+    }
+  )
 
-write_csv(
-  catds_max %>%
-    select(where(negate(is.list))),
-  "classification/okl_eurofins_catds_index_max.csv"
-)
 ```
 
 CATDSmax here can include ties. This happens especially when a compound has
@@ -120,17 +167,17 @@ catds_max %>%
     `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)
   ) %>%
   ggplot(
-    aes(catds_max, color = fct_inseq(as.character(`Compound Concentration (nM)`)))
+    aes(catds, color = fct_inseq(as.character(`Compound Concentration (nM)`)))
   ) +
   geom_density() +
-  facet_wrap(~dataset)
+  facet_wrap(~dataset + non_binding_censored)
 
 catds_max %>%
   ggplot(
-    aes(catds_max, color = fct_inseq(as.character(`Compound Concentration (nM)`)))
+    aes(catds, color = fct_inseq(as.character(`Compound Concentration (nM)`)))
   ) +
   stat_ecdf() +
-  facet_wrap(~dataset) +
+  facet_wrap(~dataset + non_binding_censored) +
   lims(x = c(0, 1))
 
 catds %>%
@@ -229,7 +276,9 @@ synStoreMany(
     "classification/okl_eurofins_partition_index.csv",
     "classification/okl_eurofins_partition_index_max.csv",
     "classification/okl_eurofins_catds.csv",
-    "classification/okl_eurofins_catds_index_max.csv"
+    "classification/okl_eurofins_catds_index_max.csv",
+    "classification/okl_eurofins_catds_censored.csv",
+    "classification/okl_eurofins_catds_index_max_censored.csv"
   ),
   parentId = "syn18508401",
   used = unname(inputs),
