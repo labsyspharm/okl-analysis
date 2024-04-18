@@ -168,7 +168,7 @@ p_scatter <- pseudo_kd_comp %>%
     classification != "discordant"
   ) %>%
   # Clamp values >10000 to 10000
-  # mutate(value = pmin(value, 10000)) %>%
+  mutate(value = pmin(value, 10000)) %>%
   ggplot(
     # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
     aes(
@@ -266,7 +266,7 @@ p_beeswarm <- pseudo_kd_comp %>%
       levels = names(class_colors) %>%
         rev()
     ),
-    # value = pmin(value, 10000)
+    value = pmin(value, 10000)
   ) %>%
   ggplot(
     aes(value, classification, color = classification)
@@ -275,7 +275,7 @@ p_beeswarm <- pseudo_kd_comp %>%
   geom_boxplot(fill = NA, outlier.shape = NA) +
   scale_color_manual(values = class_colors) +
   guides(color = "none") +
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, 10000)) +
+  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
   scale_y_discrete(labels = class_labels) +
   theme(axis.text.y = element_markdown()) +
   labs(x = "IC50 (ChEMBL)", y = NULL)
@@ -306,8 +306,8 @@ p_combined <- egg::ggarrange(
 )
 
 ggsave(
-    "plots/chembl_ic50_by_comparison_combined_new_with_nominal_fda_unclamped.pdf", p_combined,
-    width = 8, height = 4.5
+    "plots/chembl_ic50_by_comparison_combined_new_with_nominal_fda.pdf", p_combined,
+    width = 6, height = 4.5
 )
 ```
 
@@ -393,16 +393,6 @@ pseudo_kd_kd_comp <- kinomescan_pseudo_kds %>%
 
 
 ```{r}
-pseudo_kd_kd_comp %>%
-  drop_na(pseudo_kd) %>%
-  filter(
-    # pseudo_ic50_relation == "=",
-    pseudo_kd_concordant == "concordant",
-    classification != "discordant"
-  ) %>%
-  mutate(outside_range = chembl_kd < 1 | chembl_kd > 10000) %>%
-  count(outside_range)
-
 p_scatter <- pseudo_kd_kd_comp %>%
   drop_na(pseudo_kd) %>%
   filter(
@@ -410,6 +400,7 @@ p_scatter <- pseudo_kd_kd_comp %>%
     pseudo_kd_concordant == "concordant",
     classification != "discordant"
   ) %>%
+  mutate(chembl_kd = pmin(chembl_kd, 10000)) %>%
   arrange(desc(fda_target)) %>%
   ggplot(
     # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
@@ -481,7 +472,8 @@ p_beeswarm <- pseudo_kd_kd_comp %>%
       classification,
       levels = names(class_colors) %>%
         rev()
-    )
+    ),
+    chembl_kd = pmin(chembl_kd, 10000)
   ) %>%
   ggplot(
     aes(chembl_kd, classification, color = classification)
@@ -490,7 +482,7 @@ p_beeswarm <- pseudo_kd_kd_comp %>%
   geom_boxplot(fill = NA, outlier.shape = NA) +
   scale_color_manual(values = class_colors) +
   guides(color = "none") +
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, 10000)) +
+  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
   scale_y_discrete(labels = class_labels) +
   theme(axis.text.y = element_markdown()) +
   labs(x = "Kd (ChEMBL)", y = NULL)
@@ -599,6 +591,11 @@ pseudo_kd_comp_false_class <- pseudo_kd_comp_both %>%
       TRUE ~ "concordant"
     )
   )
+
+write_csv(
+  pseudo_kd_comp_false_class,
+  "classification/pseudo_kd_chembl_comparison_false_class.csv"
+)
 
 pseudo_kd_comp_false_class %>%
   count(chembl_type, false_class)
@@ -1150,11 +1147,12 @@ single_dose_comp <- single_dose_trans %>%
   #     unmatched_keys_right = "ignore"
   #   )
   # )  %>%
+  filter(dataset == "original_repeat_replaced") %>%
   power_left_join(
     kinomescan_classes %>%
       filter(dataset == "original_repeat_replaced") %>%
       distinct(lspci_id, `DiscoveRx Gene Symbol`, classification) %>%
-      mutate(across(classification, factor, levels = names(class_colors))),
+      mutate(across(classification, \(x) factor(x, levels = names(class_colors)))),
     by = c("lspci_id", "DiscoveRx Gene Symbol"),
     check = check_specs(
       duplicate_keys_left = "ignore",
@@ -1177,7 +1175,7 @@ p <- single_dose_comp %>%
       0.5 * min(`Percent Control`[`Percent Control` > 0]),
       `Percent Control`
     ),
-    chembl_kd = pmin(chembl_kd, 30000)
+    chembl_kd = pmin(chembl_kd, 10000)
   ) %>%
   group_by(`Compound Concentration (nM)`) %>%
   filter(n() > 1000) %>%
@@ -1206,6 +1204,19 @@ ggsave(
   width = 10, height = 10
 )
 
+density_2d <- function (x, y = NULL, nbin = 128, bandwidth) {
+  xy <- xy.coords(x, y, setLab = FALSE)
+  select <- is.finite(xy$x) & is.finite(xy$y)
+  x <- cbind(xy$x, xy$y)[select, ]
+  map <- grDevices:::.smoothScatterCalcDensity(x, nbin, bandwidth)
+  mkBreaks <- function(u) u - diff(range(u))/(length(u) - 1)/2
+  xbin <- cut(x[, 1], mkBreaks(map$x1), labels = FALSE)
+  ybin <- cut(x[, 2], mkBreaks(map$x2), labels = FALSE)
+  dens <- map$fhat[cbind(xbin, ybin)]
+  dens[is.na(dens)] <- 0
+  dens
+}
+
 ps <- single_dose_comp %>%
   mutate(
     percent_control_zero = `Percent Control` == 0,
@@ -1214,18 +1225,32 @@ ps <- single_dose_comp %>%
       0.5 * min(`Percent Control`[`Percent Control` > 0]),
       `Percent Control`
     ),
-    value = pmin(value, 30000)
+    chembl_kd = pmin(chembl_kd, 10000)
   ) %>%
   filter(
-    !qpcr_miss
+    !qpcr_miss,
+    !exclude_target,
+    classification != "discordant"
   ) %>%
   group_by(`Compound Concentration (nM)`) %>%
   summarize(
     plot = list(
+      cur_data() %>%
+        mutate(
+          density = density_2d(
+            log10(chembl_kd), `Percent Control`
+          )
+        ) %>%
+        arrange(density) %>%
       # ggplot(cur_data(), aes(value, percent_control_trans, shape = percent_control_zero)) +
-      ggplot(cur_data(), aes(value, `Percent Control`, color = classification)) +
-        geom_point(alpha = 0.5, shape = 16) +
-        scale_color_manual(values = class_colors) +
+      ggplot(aes(chembl_kd, `Percent Control`, color = density)) +
+        geom_point(alpha = 0.8, shape = 16) +
+        scale_color_viridis_c(
+          trans = "log10",
+          breaks = scales::log_breaks(base = 10),
+          labels = scales::trans_format("log10", scales::math_format(10^.x))
+        ) +
+        # scale_color_manual(values = class_colors) +
         # scale_shape_manual(
         #   values = c(`TRUE` = 25, `FALSE` = 16)
         # ) +
@@ -1233,8 +1258,9 @@ ps <- single_dose_comp %>%
         # scale_y_log10() +
         guides(shape = "none") +
         labs(
-          x = "IC50 ChEMBL (nM)",
+          x = "Kd ChEMBL (nM)",
           y = "% control Eurofins",
+          color = "Density",
           title = paste("Compound concentration", cur_group()$`Compound Concentration (nM)`, "nM")
         )
     )
@@ -1244,9 +1270,9 @@ pwalk(
   ps,
   function(`Compound Concentration (nM)`, plot, ...) {
     ggsave(
-      paste0("plots/single_dose_vs_chembl_ic50_", `Compound Concentration (nM)`, "nM_with_class.pdf"),
+      paste0("plots/single_dose_vs_chembl_kd_", `Compound Concentration (nM)`, ".pdf"),
       plot,
-      width = 8, height = 6
+      width = 5, height = 3.5
     )
   }
 )
