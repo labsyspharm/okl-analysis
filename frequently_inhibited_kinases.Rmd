@@ -357,6 +357,13 @@ pseudo_kds_inhibited <- pseudo_kds_dedup %>%
   crossing(threshold = CUTOFFS) %>%
   filter(pseudo_kd <= threshold)
 
+write_csv(
+  pseudo_kds_inhibited %>%
+    filter(threshold == 1000),
+  here("data", "pseudo_kds_inhibited_1000_threshold.csv")
+)
+
+
 pseudo_kds_n_inhibited <- pseudo_kds_inhibited %>%
   group_by(lspci_id, threshold) %>%
   summarize(
@@ -384,111 +391,110 @@ pseudo_kds_n_inhibited %>%
 
 
 ```{r}
-library(reticulate)
-use_condaenv("pulp")
-```
-
-
-```{r}
-
-make_random_inhibited <- function(cutoff) {
-  n_inhibited_kinases_at_thresh <- pseudo_kds_n_inhibited %>%
-    filter(threshold == cutoff)
-  n_inhibs <- nrow(n_inhibited_kinases_at_thresh)
-  n_inhibited_kinases <- n_inhibited_kinases_at_thresh %>%
-    slice_sample(prop = 1) %>%
-    pull(n_inhibited)
-  n_compounds_per_kinase <- pseudo_kds_inhibited %>%
-    filter(threshold == cutoff) %>%
-    group_by(hgnc_symbol) %>%
-    summarize(
-      n = n(),
-      .groups = "drop"
-    )
-  # browser()
-  random_inhibs <- list()
-  for (i in seq_len(n_inhibs)) {
-    n_this <- n_inhibited_kinases[i]
-    message("n_this: ", n_this, " i: ", i)
-    still_available_mask <- n_compounds_per_kinase$n > 0
-    message("still_available total: ", sum(n_compounds_per_kinase$n), " still available: ", sum(still_available_mask))
-    still_available_idx <- which(still_available_mask)
-    selected_idx <- sample(still_available_idx, size = n_this, replace = FALSE, prob = n_compounds_per_kinase$n[still_available_idx])
-    random_inhibs[[i]] <- n_compounds_per_kinase$hgnc_symbol[selected_idx]
-    n_compounds_per_kinase$n[selected_idx] <- n_compounds_per_kinase$n[selected_idx] - 1
-  }
-  random_inhibs
-}
-
-x <- make_random_inhibited(1000)
-
-N_RANDOM <- 3
-random_inhib_list <- map(
-  CUTOFFS,
-  \(cutoff) {
-    l <- list()
-    for (i in seq_len(N_RANDOM)) {
-      message("i start: ", i)
-      res <- NULL
-      while (is.null(res)) {
-        try({
-          res <- make_random_inhibited(cutoff)
-          # res <- 1
-        })
-      }
-      message("i end: ", i)
-      l[[i]] <- res
-    }
-    l
-  }
-)
-
-
-random_inhibs <- map(
-  CUTOFFS,
-  \(x) {
-    l <- list()
-    i <- 1
-    while(i <= N_RANDOM) {
-      try({
-        message(",")
-        res <- make_random_inhibited(x)
-        message("x")
-        l[[i]] <- res
-        message("i: ", i)
-        i <- i + 1
-      }, silent = TRUE)
-      message(".")
-    }
-    l
-  }
-)
-
-most_inhibited <- most_inhibited_raw %>%
-  unnest_longer(n_inhibitors, indices_to = "cutoff", values_to = "n_inhibitors") %>%
-  mutate(across(cutoff, as.numeric)) %>%
-  arrange(desc(n_inhibitors))
-
-```
-
-
-```{r}
-
-make_random_most_inhibited <- function()
-most_inhibited_inhibitors <- most_inhibited %>%
-  group_by(cutoff) %>%
-  slice_head(n = 10) %>%
-  ungroup() %>%
-  inner_join(
-    pseudo_kds_dedup,
-    by = "hgnc_symbol"
+hgnc_id_map <- pseudo_kds_inhibited %>%
+  filter(threshold == 1000) %>%
+  group_by(hgnc_symbol) %>%
+  summarize(
+    n = n(),
+    .groups = "drop"
   ) %>%
+  select(hgnc_symbol) %>%
   mutate(
-    inhibited = pseudo_kd <= cutoff
-  ) %>%
-  group_by(lspci_id, cutoff) %>%
-  filter(sum(inhibited) > 0) %>%
-  ungroup()
+    id = seq_len(n()) - 1
+  )
 
+lspci_id_map <- pseudo_kds_n_inhibited %>%
+  filter(threshold == 1000) %>%
+  select(lspci_id) %>%
+  mutate(
+    id = seq_len(n()) - 1
+  )
+
+random_matrices_1000_threshold <- syn("syn54155262") %>%
+  read_csv() %>%
+  magrittr::set_colnames(c("matrix_id", "row_id", "col_id")) %>%
+  power_inner_join(
+    hgnc_id_map,
+    by = c("row_id" = "id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  power_inner_join(
+    lspci_id_map,
+    by = c("col_id" = "id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+random_and_real_1000_threshold <- bind_rows(
+  pseudo_kds_inhibited %>%
+    filter(threshold == 1000) %>%
+    transmute(matrix_id = -1, lspci_id, hgnc_symbol),
+  random_matrices_1000_threshold
+)
+
+pseudo_kds_inhibited_n_inhibs_per_kinase <- pseudo_kds_inhibited %>%
+  count(threshold, hgnc_symbol) %>%
+  arrange(threshold, desc(n))
+
+top_15_1000 <- pseudo_kds_inhibited_n_inhibs_per_kinase %>%
+  filter(threshold == 1000) %>%
+  slice_head(n = 15)
+
+random_and_real_1000_n_overlap_top_15_kinases <- random_and_real_1000_threshold %>%
+  filter(hgnc_symbol %in% top_15_1000$hgnc_symbol) %>%
+  count(matrix_id, lspci_id, name = "n_kinases")
+
+
+random_and_real_1000_n_overlap_top_15_kinases_n_inhibs_per_group <- random_and_real_1000_n_overlap_top_15_kinases %>%
+  count(matrix_id, n_kinases, name = "n_inhibitors") %>%
+  complete(matrix_id, n_kinases, fill = list(n_inhibitors = 0))
+
+p <- random_and_real_1000_n_overlap_top_15_kinases_n_inhibs_per_group %>%
+  filter(matrix_id >= 0) %>%
+  ggplot(
+    aes(fct_inseq(as.character(n_kinases)), n_inhibitors)
+  ) +
+  ggbeeswarm::geom_quasirandom(
+    dodge.width = .5,
+    alpha = 0.5, orientation = "x"
+  ) +
+  geom_point(
+    data = filter(random_and_real_1000_n_overlap_top_15_kinases_n_inhibs_per_group, matrix_id == -1),
+    size = 4,
+    color = "red"
+  ) +
+  geom_text(
+    aes(label = signif(p, 2)),
+    y = Inf,
+    vjust = 1,
+    data = random_and_real_1000_n_overlap_top_15_kinases_n_inhibs_per_group_p
+  ) +
+  labs(
+    x = "Number of top 15 kinases hit",
+    y = "Number of inhibitors"
+  )
+
+ggsave(
+  here("plots", "top_15_kinases_n_inhibitors.pdf"),
+  p, width = 8, height = 4
+)
+
+random_and_real_1000_n_overlap_top_15_kinases_n_inhibs_per_group_p <- random_and_real_1000_n_overlap_top_15_kinases_n_inhibs_per_group %>%
+  filter(matrix_id >= 0) %>%
+  inner_join(
+    random_and_real_1000_n_overlap_top_15_kinases_n_inhibs_per_group %>%
+      filter(matrix_id == -1) %>%
+      select(n_kinases, n_inhibitors_real = n_inhibitors),
+    by = "n_kinases"
+  ) %>%
+  group_by(n_kinases) %>%
+  summarize(p = sum(n_inhibitors >= n_inhibitors_real) / n(), .groups = "drop")
 
 ```
