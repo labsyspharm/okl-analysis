@@ -67,6 +67,8 @@ classification <- input_files[["okl_classification"]] %>%
   as_tibble()
 ```
 
+## CATDS
+
 For computing CATDS try to reduce noise by censoring Percent Control values of
 compound-target pairs that are classified as non-binding. We frequently have
 values of 90% activity remaining for non-binding compounds, which is likely
@@ -82,19 +84,20 @@ catds <- single_dose_datasets %>%
     !exclude_target,
     !qpcr_miss
   ) %>%
+  power_left_join(
+    select(classification, dataset, lspci_id, `DiscoveRx Gene Symbol`, classification),
+    by = c("dataset", "lspci_id", "DiscoveRx Gene Symbol"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
   mutate(
     non_binding_censored = FALSE
   ) %>%
   bind_rows(
-    power_left_join(
-      ., select(classification, dataset, lspci_id, `DiscoveRx Gene Symbol`, classification),
-      by = c("dataset", "lspci_id", "DiscoveRx Gene Symbol"),
-      check = check_specs(
-        unmatched_keys_left = "warn",
-        duplicate_keys_right = "warn"
-      )
-    ) %>%
     mutate(
+      .,
       non_binding_censored = TRUE,
       `Percent Control` = if_else(
         classification == "non-binding" & `Percent Control` > 35,
@@ -190,6 +193,31 @@ catds %>%
   View()
 ```
 
+### Chemical probes
+
+Check if any of our compounds fits the criteria for chemical probes. Potency <100nM
+and CATDSmax >.5
+
+```{r}
+chemical_probes <- catds_max %>%
+  power_inner_join(
+    pseudo_kd %>%
+      select(dataset, lspci_id, `DiscoveRx Gene Symbol`, pseudo_kd),
+    by = c("dataset", "lspci_id", "DiscoveRx Gene Symbol"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  filter(
+    catds > 0.5,
+    pseudo_kd < 100
+  )
+
+
+```
+
+## Partition index
 
 Compute partition index
 
