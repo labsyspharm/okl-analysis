@@ -23,7 +23,7 @@ tas_table <- syn("syn25173510") %>%
     read_fst(as.data.table = TRUE)
 lsp_target_dictionary <- syn("syn25173506") %>%
     read_fst(as.data.table = TRUE)
-single_dose <- syn("syn26486828") %>%
+single_dose_datasets <- syn("syn26486828") %>%
     read_csv()
 pseudo_kds <- syn("syn51080578") %>%
     read_csv()
@@ -32,20 +32,6 @@ compound_stats <- syn("syn52624367") %>%
 ```
 
 ```{r}
-kinomescan_reduced <- single_dose %>%
-    select(lspci_id, `DiscoveRx Gene Symbol`, hgnc_symbol, `Compound Concentration (nM)`, `Percent Control`) %>%
-    group_by(lspci_id, hgnc_symbol, `Compound Concentration (nM)`) %>%
-    summarize(`Percent Control` = min(`Percent Control`), .groups = "drop") %>%
-    semi_join(
-        tas_table %>%
-            semi_join(
-                lsp_target_dictionary %>%
-                    filter(organism == "Homo sapiens"),
-                by = "lspci_target_id"
-            ),
-        by = c("lspci_id", "hgnc_symbol" = "symbol")
-    )
-
 tas_reduced <- tas_table %>%
     semi_join(
         lsp_target_dictionary %>%
@@ -53,7 +39,7 @@ tas_reduced <- tas_table %>%
         by = "lspci_target_id"
     ) %>%
     semi_join(
-        single_dose,
+        single_dose_datasets,
         by = c("lspci_id", "symbol" = "hgnc_symbol")
     )
 
@@ -71,7 +57,7 @@ OKL before we did Kinomescan.
 library(seriation)
 library(impute)
 
-tas_colors <- c(`1` = "#b2182b", `2` = "#ef8a62", `3` = "#fddbc7", `10` = "#d9d9d9")
+tas_colors <- c(`1` = "#b2182b", `2` = "#ef8a62", `3` = "#fddbc7", `10` = "#2166ac", `no data` = "#ffffff")
 
 cluster_df <- function(df, row_var, col_var, value_var) {
     mat <- df %>%
@@ -105,7 +91,7 @@ tas_heatmap <- function(df, row_var, col_var, value_var) {
 }
 
 tas_reduced_clustered <- cluster_df(tas_reduced, lspci_id, symbol, tas) %>%
-    mutate(tas = as.factor(tas))
+    mutate(tas = fct_inseq(as.character(tas)) %>% fct_na_value_to_level("no data"))
 p <- tas_heatmap(tas_reduced_clustered, lspci_id, symbol, tas) +
     labs(x = "Kinase", y = "Compound", fill = "TAS") +
     coord_equal() +
@@ -122,7 +108,12 @@ ggsave(
     "plots/tas_heatmap.pdf",
     p, width = 7, height = 3.5
 )
+```
 
+Do not need to filter by discordant here. Was already done before calculating
+pseudo Kd values.
+
+```{r}
 pseudo_kds_tas <- pseudo_kds %>%
     filter(
         dataset == "original_repeat_replaced",
@@ -192,29 +183,149 @@ tas_reduced_clustered_2 <- tas_reduced_clustered %>%
     ungroup()
 
 tas_clustered_both_2 <- bind_rows(
-    okl = pseudo_kds_tas_clustered_2 %>%
+    OKL = pseudo_kds_tas_clustered_2 %>%
         mutate(tas = tas_pseudo_kd),
-    pre_okl = tas_reduced_clustered_2 %>%
+    `Pre-OKL` = tas_reduced_clustered_2 %>%
         mutate(hgnc_symbol = symbol),
     .id = "dataset"
-)
+) %>%
+    complete(
+        dataset, lspci_id, hgnc_symbol, fill = list(tas = "no data")
+    )
 
 p <- tas_heatmap(tas_clustered_both_2, lspci_id, hgnc_symbol, tas) +
     labs(x = "Kinase", y = "Compound", fill = "TAS") +
     coord_equal() +
     theme_bw() +
     facet_wrap(~dataset) +
+    guides(fill = guide_legend(override.aes = list(color = "black"))) +
     theme(
+        strip.background = element_blank(),
         panel.grid.major = element_blank(),
         panel.grid.minor = element_blank(),
         axis.text.x = element_blank(),
         axis.text.y = element_blank(),
-        axis.ticks = element_blank()
+        axis.ticks = element_blank(),
+        legend.key = element_rect(color = "black")
     )
 
 ggsave(
-    "plots/tas_heatmap_pre_okl_vs_okl.pdf",
+    "plots/tas_heatmap_pre_okl_vs_okl_alternate_colors.pdf",
     p, width = 10, height = 4
+)
+
+tas_heatmaps <- tas_clustered_both_2 %>%
+    group_nest(dataset) %>%
+    mutate(
+        p = map(
+            data,
+            \(x) tas_heatmap(x, lspci_id, hgnc_symbol, tas)+
+                labs(x = "Kinase", y = "Compound", fill = "TAS") +
+                coord_equal() +
+                theme_bw() +
+                guides(fill = guide_legend(override.aes = list(color = "black"))) +
+                theme(
+                    strip.background = element_blank(),
+                    panel.grid.major = element_blank(),
+                    panel.grid.minor = element_blank(),
+                    axis.text.x = element_blank(),
+                    axis.text.y = element_blank(),
+                    axis.ticks = element_blank(),
+                    legend.key = element_rect(color = "black")
+                )
+        )
+    )
+
+pwalk(
+    ps,
+    \(dataset, p, ...) {
+        ggsave(
+            paste0("plots/tas_heatmap_pre_okl_vs_okl_", dataset, ".pdf"),
+            p, width = 5, height = 4
+        )
+    }
+)
+```
+
+```{r}
+margin_plot <- \(x, m) {
+    m_sym <- sym(m)
+    x %>%
+        mutate(across(tas, fct_rev)) %>%
+        group_by(!!m_sym, tas) %>%
+        summarize(n = n(), .groups = "drop") %>%
+        ggplot(aes(!!m_sym, n, fill = tas)) +
+            geom_col() +
+            scale_fill_manual(values = tas_colors, guide = "none") +
+            theme(
+                strip.background = element_blank(),
+                panel.grid.major = element_blank(),
+                panel.grid.minor = element_blank(),
+                # axis.title = element_blank(),
+                axis.ticks = element_blank()
+            )
+
+}
+
+tas_heatmaps_margins <- tas_heatmaps %>%
+    mutate(
+        p_col = map(
+            data,
+            \(x) margin_plot(x, "hgnc_symbol") +
+                theme(axis.text.x = element_blank())
+        ),
+        p_row = map(
+            data,
+            \(x) margin_plot(x, "lspci_id") +
+                coord_flip() +
+                scale_y_reverse() +
+                theme(axis.text.y = element_blank())
+        ),
+        p_combined = pmap(
+            list(p, p_col, p_row),
+            \(p, p_col, p_row) {
+                # cowplot::plot_grid(
+                #     NULL, p_col,
+                #     p_row, p,
+                #     nrow = 2, ncol = 2,
+                #     rel_heights = c(.2, 1),
+                #     rel_widths = c(.4, 1),
+                #     align = "hv", axis = "lrtb"
+                # )
+                cowplot::plot_grid(
+                    NULL, p_col + theme(plot.margin = unit(c(0,0,0,0), "pt")) + labs(x = NULL, y = "Frequency"),
+                    p_row + theme(plot.margin = unit(c(0,0,0,0), "pt")) + labs(x = "Compound", y = "Frequency"), p + theme(plot.margin = unit(c(0,0,0,0), "pt")) + coord_cartesian(clip = "off") + labs(y = NULL),
+                    nrow = 2, ncol = 2,
+                    rel_widths = c(.2, 1),
+                    rel_heights = c(.2, 1),
+                    align = "hv", axis = "lrtb"
+                )
+            }
+        ),
+        p_combined2 = pmap(
+            list(p, p_col, p_row),
+            \(p, p_col, p_row) {
+                patchwork::wrap_plots(
+                    p_col + theme(plot.margin = unit(c(0,0,0,0), "pt")) + labs(x = NULL, y = NULL),
+                    p_row + theme(plot.margin = unit(c(0,0,0,0), "pt")) + labs(x = "Compound", y = "Frequency"), p + theme(plot.margin = unit(c(0,0,0,0), "pt")) + coord_cartesian(clip = "off") + labs(y = NULL),
+                    design = "#A\nBC",
+                    byrow = TRUE,
+                    nrow = 2, ncol = 2,
+                    widths = c(.2, 1),
+                    heights = c(.2, 1)
+                )
+            }
+        )
+    )
+
+pwalk(
+    tas_heatmaps_margins,
+    \(dataset, p_combined, p_combined2, ...) {
+        ggsave(
+            paste0("plots/tas_heatmap_pre_okl_vs_okl_", dataset, "_margins.pdf"),
+            p_combined2, width = 10, height = 10
+        )
+    }
 )
 ```
 
@@ -229,17 +340,15 @@ then going up again) so the pseudo Kd is NA.
 library(ggalluvial)
 
 tas_clustered_both_alluvial <- tas_clustered_both_2 %>%
-    complete(dataset, lspci_id, hgnc_symbol) %>%
     mutate(
-        across(tas, \(x) fct_na_value_to_level(x, "missing")),
-        dataset = factor(dataset, levels = c("pre_okl", "okl"), labels = c("Pre-OKL", "OKL"))
+        dataset = factor(dataset, levels = c("Pre-OKL", "OKL"))
     ) %>%
     select(dataset, lspci_id, hgnc_symbol, tas) %>%
     pivot_wider(names_from = dataset, values_from = tas) %>%
     count(`OKL`, `Pre-OKL`, sort = TRUE, name = "freq") %>%
     mutate(
         added = factor(
-            if_else(`OKL` != "missing" & `Pre-OKL` == "missing", "added", "existing"),
+            if_else(`OKL` != "no data" & `Pre-OKL` == "no data", "added", "existing"),
             levels = c("added", "existing")
         )
     )
@@ -253,6 +362,9 @@ tas_clustered_both_alluvial_long <- tas_clustered_both_alluvial %>%
     )
 
 p <- tas_clustered_both_alluvial_long %>%
+    mutate(
+        Dataset = fct_recode(Dataset, `Original\nTAS` = "Pre-OKL", `Final\nTAS` = "OKL")
+    ) %>%
     filter(freq > 200) %>%
     ggplot(
         aes(x = Dataset, y = freq, stratum = TAS, alluvium = alluvium)
@@ -260,12 +372,17 @@ p <- tas_clustered_both_alluvial_long %>%
     scale_x_discrete(expand = c(0.05, 0.05)) +
     geom_alluvium(aes(fill = added), width = 1/10) +
     labs(fill = NULL) +
+    scale_fill_manual(
+        values = c(existing = "#a2a2a2", added = "#c81919"),
+        guide = "none"
+    ) +
     ggnewscale::new_scale_fill() +
     scale_fill_manual(values = tas_colors, guide = "none") +
-    geom_stratum(aes(fill = TAS), width = 1/10) +
-    geom_label(stat = "stratum", aes(label = after_stat(stratum))) +
+    geom_stratum(aes(fill = TAS), width = 1/6) +
+    # geom_text(stat = "stratum", aes(label = after_stat(stratum))) +
+    geom_label(stat = "stratum", aes(label = after_stat(stratum)), label.size = 0) +
     theme_minimal() +
-    labs(y = "Frequency", fill = NA) +
+    labs(y = "Data points", fill = NA) +
     theme(
         panel.grid.major.x = element_blank()
     ) +
@@ -273,7 +390,7 @@ p <- tas_clustered_both_alluvial_long %>%
 
 ggsave(
     "plots/tas_alluvial.pdf",
-    p, width = 4, height = 7
+    p, width = 3, height = 5
 )
 ```
 
