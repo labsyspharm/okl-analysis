@@ -30,6 +30,9 @@ compound_mapping <- syn("syn26260389") %>%
 chembl_kd_raw <- syn("syn52854574") %>%
   read_csv()
 
+coral_map <- syn("syn61680422") %>%
+  read_csv()
+
 # qpcr_misses <- syn("syn33531640") %>%
 #   readxl::read_excel() %>%
 #   left_join(
@@ -1785,6 +1788,15 @@ single_dose_comp_rocs <- single_dose_comp_binned_filtered %>%
     )
   )
 
+single_dose_comp_aucs <- single_dose_comp_rocs %>%
+  mutate(
+    auc = map_dbl(roc, "AUC")
+  )
+
+single_dose_comp_best_doses <- single_dose_comp_aucs %>%
+  group_by(kd_threshold) %>%
+  slice_max(auc) %>%
+  ungroup()
 
 single_dose_comp_roc_values <- single_dose_comp_rocs %>%
   transmute(
@@ -1848,6 +1860,28 @@ single_dose_comp_scores_weighted_diagnostic_optim <- single_dose_comp_scores_wei
           slice_max(df, value)
         else
           slice_min(df, value)
+      }
+    )
+  ) %>%
+  unnest(data)
+
+single_dose_comp_scores_weighted_diagnostic_optim_and_flat <- single_dose_comp_scores_weighted_diagnostics %>%
+  filter(str_starts(variable, "score")) %>%
+  group_nest(
+    variable, `Compound Concentration (nM)`, kd_threshold, weight_name
+  ) %>%
+  crossing(optim = c("flat", "optim")) %>%
+  mutate(
+    data = pmap(
+      .,
+      \(data, variable, optim, ...) {
+        if (optim == "optim") {
+          if (variable == "score")
+            slice_max(data, value)
+          else
+            slice_min(data, value)
+        } else
+          slice(data, which.min(abs(Cutoff - 35)))
       }
     )
   ) %>%
@@ -1982,7 +2016,7 @@ param_order <- c(
   "Cutoff", "FP", "FN", "SENS", "SPEC", "PREC"
 )
 
-optimal_params_table <- single_dose_comp_scores_weighted_diagnostics %>%
+optimal_params_table_raw <- single_dose_comp_scores_weighted_diagnostics %>%
   inner_join(
     single_dose_comp_scores_weighted_diagnostic_optim %>%
       filter(variable == "score") %>%
@@ -2005,7 +2039,9 @@ optimal_params_table <- single_dose_comp_scores_weighted_diagnostics %>%
   select(
     `Compound Concentration (nM)`, kd_threshold,
     variable, value
-  ) %>%
+  )
+
+optimal_params_table <- optimal_params_table_raw %>%
   mutate(
     value = case_when(
       variable %in% c("SENS", "SPEC", "PREC") ~ sprintf("%.2f", value),
@@ -2175,6 +2211,322 @@ pwalk(
 
 
 ```
+
+Coral plots highlighting kinases which would be missed as false negatives
+or false positives
+
+
+```{r}
+param_order <- c(
+  "Cutoff", "FP", "FN", "SENS", "SPEC", "PREC"
+)
+
+param_comparison_table <- single_dose_comp_scores_weighted_diagnostic_optim %>%
+  filter(variable == "score", weight_name == "equal") %>%
+  select(-variable, -value, -Depth, -weight_name, -fn_fp_weight) %>%
+  mutate(optim = "optim") %>%
+  bind_rows(
+    select(., -Cutoff) %>%
+    distinct() %>%
+    crossing(
+      Cutoff = c(1, 10, 20, 35, 50, 60, 70)
+    ) %>%
+    mutate(optim = "flat")
+  ) %>%
+  # Make sure Cutoffs are not present twice (once in optim and once in flat)
+  group_by(`Compound Concentration (nM)`, kd_threshold, Cutoff) %>%
+  filter(
+    if (uniqueN(optim) == 1 || cur_group()$Cutoff == 35)
+      TRUE
+    else
+      optim == "optim"
+  ) %>%
+  ungroup() %>%
+  power_inner_join(
+    single_dose_comp_binned_filtered,
+    by = c("Compound Concentration (nM)")
+  ) %>%
+  mutate(
+    hit_kinomescan = `Percent Control` <= Cutoff,
+    hit_chembl = chembl_kd <= kd_threshold,
+    hit_class = case_when(
+      hit_kinomescan & hit_chembl ~ "TP",
+      hit_kinomescan & !hit_chembl ~ "FP",
+      !hit_kinomescan & hit_chembl ~ "FN",
+      TRUE ~ "TN"
+    )
+  )
+
+param_comparison_table_optim_vs_flat <- param_comparison_table %>%
+  select(
+    `Compound Concentration (nM)`, kd_threshold, optim, Cutoff,
+    lspci_id, hmsl_id, name, library, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
+    starts_with("hit")
+  ) %>%
+  filter(optim == "optim" | Cutoff == 35) %>%
+  select(-Cutoff) %>%
+  pivot_wider(
+    names_from = optim,
+    values_from = starts_with("hit")
+  ) %>%
+  mutate(
+    change_class = if_else(
+      hit_class_flat == hit_class_optim,
+      "same",
+      paste(
+        hit_class_flat, hit_class_optim,
+        sep = "->"
+      )
+    )
+  )
+
+param_comparison_table_optim_vs_flat_best_doses <- param_comparison_table_optim_vs_flat %>%
+  semi_join(
+    single_dose_comp_best_doses,
+    by = c("Compound Concentration (nM)", "kd_threshold")
+  )
+
+param_comparison_table_optim_vs_flat_best_doses_coral <- param_comparison_table_optim_vs_flat_best_doses %>%
+  power_inner_join(
+    coral_map %>%
+      distinct(`DiscoveRx Gene Symbol`, CORAL) %>%
+      drop_na(CORAL),
+    by = c("DiscoveRx Gene Symbol"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+param_comparison_table_optim_vs_flat_best_doses_coral_classes_wide <- param_comparison_table_optim_vs_flat_best_doses_coral %>%
+  count(
+    name, kd_threshold, change_class
+  ) %>%
+  pivot_wider(
+    names_from = change_class,
+    values_from = n,
+    values_fill = list(n = 0)
+  ) %>%
+  mutate(
+    n_optim_better = `FN->TP` + `FP->TN`,
+    n_flat_better = `TN->FP` + `TP->FN`,
+    n_diff = n_optim_better - n_flat_better
+  )
+
+param_comparison_table_optim_vs_flat_best_doses_coral_classes_wide %>%
+  arrange(desc(`FN->TP`), desc(n_diff)) %>%
+  View()
+
+param_comparison_table_optim_vs_flat_best_doses_coral %>%
+  filter(name == "RUXOLITINIB", kd_threshold == 1000) %>%
+  select(
+    CORAL, change_class
+  ) %>%
+  clipr::write_clip()
+
+param_comparison_table_optim_vs_flat_best_doses_coral %>%
+  filter(name == "RUXOLITINIB", kd_threshold == 1000) %>%
+  transmute(
+    CORAL, size = if_else(change_class == "same", 1, 100)
+  ) %>%
+  clipr::write_clip()
+
+param_comparison_table_optim_vs_flat_best_doses_coral %>%
+  group_nest(kd_threshold)
+```
+
+Make heatmap how status changes as Cutoff is changed
+
+```{r}
+
+library(seriation)
+cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
+  # browser()
+  mat <- df %>%
+    select({{row_var}}, {{col_var}}, {{value_var}}) %>%
+    pivot_wider(names_from = {{col_var}}, values_from = {{value_var}}, values_fill = values_fill) %>%
+    column_to_rownames(rlang::as_name(rlang::enquo(row_var)))
+  # browser()
+  if (rlang::is_bare_numeric(pull(df, {{value_var}}))) {
+    dist_rows <- dist(mat, method = "euclidian")
+    dist_cols <- dist(t(mat), method = "euclidian")
+  } else {
+    # browser()
+    dist_rows <- cluster::daisy(mat, metric = "gower")
+    dist_cols <- t(mat) %>%
+      as.data.frame() %>%
+      mutate(across(everything(), \(x) factor(x, levels = levels(pull(df, {{value_var}}))))) %>%
+      cluster::daisy(metric = "gower")
+  }
+  clust_rows <- hclust(dist_rows, method = "average") %>%
+      reorder(dist_rows, method = "olo")
+  clust_cols <- hclust(dist_cols, method = "average") %>%
+      reorder(dist_cols, method = "olo")
+  df %>%
+    mutate(
+      "{{row_var}}" := factor({{row_var}}, levels = clust_rows$labels[clust_rows$order]),
+      "{{col_var}}" := factor({{col_var}}, levels = clust_cols$labels[clust_cols$order])
+    )
+}
+
+p <- param_comparison_table %>%
+  filter(name == "TAE-684", kd_threshold == 10) %>%
+  semi_join(
+    single_dose_comp_best_doses,
+    by = c("Compound Concentration (nM)", "kd_threshold")
+  ) %>%
+  mutate(
+    across(hit_class, \(x) factor(as.character(x), levels = c(unique(x), "NA")))
+  ) %>%
+  cluster_df(Cutoff, `DiscoveRx Gene Symbol`, hit_class, values_fill = "NA") %>%
+  mutate(
+    Cutoff = fct_inseq(as.character(Cutoff), ordered = TRUE),
+    false_hit = hit_chembl != hit_kinomescan
+  ) %>%
+  ggplot(
+    aes(
+      x = Cutoff,
+      y = `DiscoveRx Gene Symbol`,
+      fill = hit_class
+      # fill = hit_chembl,
+      # alpha = false_hit
+    )
+  ) +
+    geom_raster() +
+    scale_fill_manual(
+      values = c(
+        "TP" = alpha("blue", .9),
+        "FN" = alpha("blue", .5),
+        "FP" = alpha("red", .5),
+        "TN" = alpha("red", .9)
+      )
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.y = element_blank()
+    )
+    # scale_fill_manual(values = c(`TRUE` = "red", `FALSE` = "blue")) +
+    # scale_alpha_manual(values = c(`TRUE` = .9, `FALSE` = .5))
+
+ggsave(
+  "plots/heatmap_fp_fn_tae_684_10.pdf",
+  p, width = 8, height = 6
+)
+
+single_dose_comp_scores_weighted_diagnostics %>%
+  filter(variable == "score", weight_name == "equal") %>%
+  filter(
+    name == "TAE-684", kd_threshold == 10
+  ) %>%
+  semi_join(
+    single_dose_comp_best_doses,
+    by = c("Compound Concentration (nM)", "kd_threshold")
+  ) %>%
+  select(`Compound Concentration (nM)`, kd_threshold, Cutoff, variable, value) %>%
+  pivot_wider(
+    names_from = "variable",
+    values_from = value
+  )
+```
+
+Try doing per-compound ROC curves instead of the heatmap
+
+```{r}
+
+rocs_per_compound <- single_dose_comp_binned_filtered %>%
+  crossing(
+    kd_threshold = KD_THRESHOLDS
+  ) %>%
+  group_by(lspci_id, hmsl_id, name, `Compound Concentration (nM)`, kd_threshold) %>%
+  summarize(
+    roc = possibly(rocit)(
+      100 - `Percent Control`,
+      # `Percent Control`,
+      chembl_kd < cur_group()$kd_threshold,
+      method = "empirical"
+    ) %>%
+      list(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # roc_ci = map(roc, ciROC),
+    roc_measures = map(
+      roc,
+      ~possibly(measureit)(.x, measure = c("SENS", "SPEC", "PREC", "PPV")) %>%
+        unclass() %>%
+        as_tibble()
+    ),
+    roc_values = map(
+      roc,
+      possibly(
+        \(x) plot(x)
+      )
+    )
+  )
+
+single_dose_comp_aucs <- single_dose_comp_rocs %>%
+  mutate(
+    auc = map_dbl(roc, "AUC")
+  )
+
+single_dose_comp_best_doses <- single_dose_comp_aucs %>%
+  group_by(kd_threshold) %>%
+  slice_max(auc) %>%
+  ungroup()
+
+single_dose_comp_roc_values <- single_dose_comp_rocs %>%
+  transmute(
+    `Compound Concentration (nM)`,
+    kd_threshold = fct_inorder(
+      paste(kd_threshold, "nM")
+    ),
+    roc_values = map(roc, plot)
+  )
+
+fn_fp_weights <- c("2xFN" = 2/3, "equal" = .5, "2xFP" = 1/3)
+compute_weighted_score <- function(df, fn_fp_weight) {
+  df %>%
+    mutate(
+      score = 2 * (fn_fp_weight * (TP / (TP + FN)) + (1 - fn_fp_weight) * (TN / (TN + FP))) - 1,
+      score_naive = fn_fp_weight * FN + (1 - fn_fp_weight) * FP
+    )
+}
+
+single_dose_comp_scores_weighted <- single_dose_comp_rocs %>%
+  cross_join(
+    enframe(
+      fn_fp_weights,
+      name = "weight_name",
+      value = "fn_fp_weight"
+    )
+  ) %>%
+  mutate(
+    scores = map2(roc_measures, fn_fp_weight, compute_weighted_score)
+  ) %>%
+  select(-roc, -roc_measures)
+
+
+single_dose_comp_scores_weighted_diagnostics <- single_dose_comp_scores_weighted %>%
+  unnest(scores) %>%
+  pivot_longer(
+    c(TP, TN, FP, FN, score, score_naive, SENS, SPEC, PREC, PPV),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  filter(
+    case_when(
+      variable %in% c("score", "score_naive") ~ TRUE,
+      TRUE ~ weight_name == "equal"
+    )
+  ) %>%
+  mutate(
+    Cutoff = 100 - Cutoff
+  )
+
+
+```
+
 
 Plot precision-recall curves
 
