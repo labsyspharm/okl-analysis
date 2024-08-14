@@ -55,7 +55,7 @@ pseudo_kds_dedup <- pseudo_kds %>%
     !exclude_target,
     library == "OKL"
   ) %>%
-  group_by(lspci_id, hgnc_symbol) %>%
+  group_by(lspci_id, hgnc_symbol, `DiscoveRx Gene Symbol`) %>%
   slice_min(
     pseudo_kd,
     with_ties = FALSE,
@@ -64,10 +64,10 @@ pseudo_kds_dedup <- pseudo_kds %>%
   ungroup()
 
 CUTOFFS <- c(100, 1000)
-TOP_N <- 20
+TOP_N <- 15
 
 most_inhibited_raw <- pseudo_kds_dedup %>%
-  group_by(hgnc_symbol) %>%
+  group_by(hgnc_symbol, `DiscoveRx Gene Symbol`) %>%
   summarize(
     n_inhibitors = map_int(
       set_names(CUTOFFS),
@@ -97,7 +97,8 @@ most_inhibited_inhibitors <- most_inhibited %>%
   ungroup() %>%
   inner_join(
     pseudo_kds_dedup,
-    by = "hgnc_symbol"
+    by = c("DiscoveRx Gene Symbol", "hgnc_symbol"),
+    relationship = "many-to-many"
   ) %>%
   mutate(
     inhibited = pseudo_kd <= cutoff
@@ -107,12 +108,12 @@ most_inhibited_inhibitors <- most_inhibited %>%
   ungroup()
 
 most_inhibited_inhibitors_mats <- most_inhibited_inhibitors %>%
-  select(name, lspci_id, hgnc_symbol, cutoff, inhibited) %>%
+  select(name, lspci_id, `DiscoveRx Gene Symbol`, cutoff, inhibited) %>%
   group_nest(cutoff) %>%
   mutate(
     data = map(
       data,
-      \(x) pivot_wider(x, names_from = hgnc_symbol, values_from = inhibited, values_fill = FALSE)
+      \(x) pivot_wider(x, names_from = `DiscoveRx Gene Symbol`, values_from = inhibited, values_fill = FALSE)
     )
   )
 
@@ -121,10 +122,10 @@ most_inhibited_inhibitors_mats <- most_inhibited_inhibitors %>%
 ```{r}
 most_inhibited_inhibitors_table <- most_inhibited_inhibitors %>%
   filter(inhibited) %>%
-  arrange(cutoff, lspci_id, hgnc_symbol) %>%
+  arrange(cutoff, lspci_id, `DiscoveRx Gene Symbol`) %>%
   group_by(cutoff, lspci_id, name) %>%
   summarize(
-    inhibited = list(hgnc_symbol),
+    inhibited = list(`DiscoveRx Gene Symbol`),
     .groups = "drop"
   ) %>%
   group_by(cutoff, inhibited) %>%
@@ -153,14 +154,20 @@ ps <- most_inhibited_inhibitors_mats %>%
   mutate(
     p = map(
       data,
-      \(x) ComplexUpset::upset(
-        select(x, -name, -lspci_id) %>%
-          as.data.frame(),
-        colnames(x) %>%
-          setdiff(c("name", "lspci_id")),
-        min_size = 3,
-        name = "Compound targets"
-      )
+      \(x) {
+        # browser()
+        colnames(x) <- str_replace(colnames(x), fixed("JH1domain-"), "")
+        ComplexUpset::upset(
+          select(x, -name, -lspci_id) %>%
+            as.data.frame(),
+          colnames(x) %>%
+            setdiff(c("name", "lspci_id")),
+          min_size = 2,
+          name = "Compound targets",
+          height_ratio = 1.5,
+          width_ratio = .25
+        )
+      }
     )
   )
 
@@ -169,12 +176,67 @@ pwalk(
   function(p, cutoff, ...) {
     ggsave(
       here("plots", paste0("upset_top", TOP_N, "_kinase_targets_cutoff_", cutoff, ".pdf")),
-      p, width = 7, height = 5
+      p, width = 5.5, height = 4
     )
   }
 )
 
 ```
+
+```{r}
+library(seriation)
+library(ComplexHeatmap)
+
+clust_fun <- function(m) {
+  d <- dist(m, method = "euclidian")
+  hclust(d, method = "average") %>%
+    reorder(d, method = "olo")
+}
+
+most_inhibited_inhibitors_hms <- most_inhibited_inhibitors_mats %>%
+  mutate(
+    hm = map2(
+      data, cutoff,
+      \(x, co) {
+        m <- select(
+          x, -name, -lspci_id
+        ) %>%
+         as.matrix()
+        # m_ <- m[rowSums(m) > 0, ] * 1
+        m_ <- m[rowSums(m) > 0, ] %>%
+          magrittr::set_colnames(str_replace(colnames(.), fixed("JH1domain-"), ""))
+        # browser()
+        Heatmap(
+          ifelse(m_, "hit", "miss"),
+          col = c(hit = "#ec4e4ec1", miss = "#cbd4ff"),
+          cluster_columns = clust_fun(t(m_)),
+          cluster_rows = clust_fun(m_),
+          name = " "
+        )
+        # pheatmap::pheatmap(
+        #   m_,
+        #   cluster_cols = clust_fun(t(m_)),
+        #   cluster_rows = clust_fun(m_),
+        #   main = co
+        # )
+      }
+    )
+  )
+
+pwalk(
+  most_inhibited_inhibitors_hms,
+  function(hm, cutoff, ...) {
+    withr::with_pdf(
+      here("plots", paste0("upset_top", TOP_N, "_kinase_targets_cutoff_", cutoff, "_heatmap.pdf")),
+      print(hm), width = 4, height = 4
+    )
+  }
+)
+
+
+```
+
+
 
 ```{r}
 
