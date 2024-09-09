@@ -1763,6 +1763,141 @@ single_dose_comp_binned_filtered <- single_dose_comp_binned %>%
     !exclude_target
   )
 
+library(qs)
+qsave(
+  single_dose_comp_binned_filtered,
+  file.path("classification", "okl_eurofins_single_dose_chembl_kd_comparison_roc.qs")
+)
+write_csv(
+  single_dose_comp_binned_filtered,
+  file.path("classification", "okl_eurofins_single_dose_chembl_kd_comparison_roc.csv.gz")
+)
+
+synStoreMany(
+  c(
+    "classification/okl_eurofins_single_dose_chembl_kd_comparison_roc.qs",
+    "classification/okl_eurofins_single_dose_chembl_kd_comparison_roc.csv.gz"
+  ),
+  parentId = "syn18508401"
+)
+```
+
+## Use pROC
+
+```{r}
+
+single_dose_comp_proc <- single_dose_comp_binned_filtered %>%
+  crossing(
+    kd_threshold = KD_THRESHOLDS
+  ) %>%
+  group_by(`Compound Concentration (nM)`, kd_threshold) %>%
+  summarize(
+    roc = pROC::roc(
+      chembl_kd < cur_group()$kd_threshold,
+      `Percent Control`,
+      direction = ">",
+      smooth = FALSE,
+      plot = FALSE
+    ) %>%
+      list(),
+    .groups = "drop"
+  ) %>%
+  # cross_join(
+  #   enframe(
+  #     fn_fp_weights,
+  #     name = "weight_name",
+  #     value = "fn_fp_weight"
+  #   )
+  # ) %>%
+  mutate(
+    # fn_fp_weight = (1 - fn_fp_weight) / fn_fp_weight,
+    fn_fp_weight = 1,
+    scores = map2(
+      roc,
+      fn_fp_weight,
+      \(x, w) pROC::coords(
+        x, x = "all", ret = "all"
+      ) %>%
+        as_tibble() %>%
+        mutate(
+          f1 = 2 * ppv * tpr / (ppv + tpr),
+          # https://en.wikipedia.org/wiki/P4-metric
+          p4 = 4 * tp * tn / (4 * tp * tn + (tp + tn) * (fp + fn))
+        )
+    )
+  )
+
+single_dose_comp_proc_scores <- single_dose_comp_proc %>%
+  select(`Compound Concentration (nM)`, kd_threshold, scores) %>%
+  unnest(scores)
+
+single_dose_comp_proc_scores_long <- single_dose_comp_proc_scores %>%
+  pivot_longer(
+    -c(`Compound Concentration (nM)`, kd_threshold, threshold),
+    names_to = "measure",
+    values_to = "value"
+  )
+
+single_dose_comp_proc_scores_long_best <- single_dose_comp_proc_scores_long %>%
+  filter(
+    measure %in% c("youden", "closest.topleft", "f1", "p4")
+  ) %>%
+  group_by(`Compound Concentration (nM)`, kd_threshold, measure) %>%
+  slice(
+    if (cur_group()$measure %in% c("youden", "f1", "p4"))
+      which.max(value)
+    else
+      which.min(value)
+  ) %>%
+  ungroup()
+
+p <- single_dose_comp_proc_scores_long %>%
+  filter(
+    measure %in% c("youden", "closest.topleft", "f1", "p4")
+  ) %>%
+  group_by(`Compound Concentration (nM)`, kd_threshold, measure) %>%
+  mutate(
+    best = if_else(
+      measure %in% c("youden", "f1", "p4"),
+      value == max(value, na.rm = TRUE),
+      value == min(value, na.rm = TRUE)
+    )
+  ) %>%
+  ungroup() %>%
+  ggplot(
+    aes(threshold, value, color = measure)
+  ) +
+    geom_line() +
+    geom_point(
+      data = \(x) x %>% filter(best)
+    ) +
+    facet_grid(
+      `Compound Concentration (nM)` ~ kd_threshold
+    )
+```
+
+```{r}
+p <- single_dose_comp_proc_scores %>%
+  ggplot(
+    aes(precision, recall)
+  ) +
+    geom_line() +
+    geom_point(
+      aes(color = measure),
+      data = \(x) x %>%
+        inner_join(
+          single_dose_comp_proc_scores_long_best,
+          by = join_by(`Compound Concentration (nM)`, kd_threshold, threshold)
+        )
+    ) +
+    facet_grid(
+      `Compound Concentration (nM)` ~ kd_threshold
+    )
+
+```
+
+
+```{r}
 single_dose_comp_rocs <- single_dose_comp_binned_filtered %>%
   crossing(
     kd_threshold = KD_THRESHOLDS
@@ -2264,10 +2399,10 @@ param_comparison_table_optim_vs_flat <- param_comparison_table %>%
     starts_with("hit")
   ) %>%
   filter(optim == "optim" | Cutoff == 35) %>%
-  select(-Cutoff) %>%
+  # select(-Cutoff) %>%
   pivot_wider(
     names_from = optim,
-    values_from = starts_with("hit")
+    values_from = c(Cutoff, starts_with("hit"))
   ) %>%
   mutate(
     change_class = if_else(
