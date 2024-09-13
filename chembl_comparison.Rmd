@@ -5,6 +5,7 @@ library(synExtra)
 library(fst)
 library(data.table)
 library(powerjoin)
+library(ggbeeswarm)
 
 synapser::synLogin()
 
@@ -389,7 +390,12 @@ pseudo_kd_kd_comp <- kinomescan_pseudo_kds %>%
       !nominal_target ~ "offtarget",
       TRUE ~ "ontarget"
     ) %>%
-      factor(levels = c("ontarget", "offtarget", "no"))
+      factor(levels = c("ontarget", "offtarget", "no")),
+    tas_pseudo_kd = cut(
+        pseudo_kd,
+        breaks = c(-Inf, 100, 999, 9999, Inf),
+        labels = c("1", "2", "3", "10")
+    )
   )
 
 ```
@@ -439,7 +445,7 @@ p_scatter <- pseudo_kd_kd_comp %>%
   scale_color_manual(
     values = c(
       `ontarget` = alpha("black", .9),
-      `offtarget` = alpha("blue", 0),
+      `offtarget` = alpha("black", 0),
       `no` = alpha("purple", 0)
     ),
     guide = "none"
@@ -490,10 +496,10 @@ p_beeswarm <- pseudo_kd_kd_comp %>%
   theme(axis.text.y = element_markdown()) +
   labs(x = "Kd (ChEMBL)", y = NULL)
 
-ggsave(
-    "plots/chembl_kd_by_kinomescan_class_beeswarm.pdf", p_beeswarm,
-    width = 7, height = 3
-)
+# ggsave(
+#     "plots/chembl_kd_by_kinomescan_class_beeswarm.pdf", p_beeswarm,
+#     width = 7, height = 3
+# )
 
 p_combined <- egg::ggarrange(
     p_scatter +
@@ -516,6 +522,390 @@ p_combined <- egg::ggarrange(
 
 ggsave(
     "plots/chembl_kd_by_comparison_combined_new2_with_nominal_fda.pdf", p_combined,
+    width = 6, height = 4.5
+)
+```
+
+### color by tas
+
+```{r}
+tas_colors <- c(`1` = "#b2182b", `2` = "#ef8a62", `3` = "#fddbc7", `10` = "#2166ac", `no data` = "#ffffff")
+
+p_scatter <- pseudo_kd_kd_comp %>%
+  drop_na(pseudo_kd) %>%
+  filter(
+    # pseudo_ic50_relation == "=",
+    pseudo_kd_concordant == "concordant",
+    classification != "discordant"
+  ) %>%
+  mutate(chembl_kd = pmin(chembl_kd, 10000)) %>%
+  arrange(desc(fda_target)) %>%
+  ggplot(
+    aes(chembl_kd, pseudo_kd, fill = tas_pseudo_kd)
+  ) +
+  geom_point(
+    aes(size = fda_target, shape = pseudo_kd_relation, color = fda_target),
+  ) +
+  geom_text(
+    aes(label = label),
+    data = \(df) df %>%
+      mutate(across(c(chembl_kd, pseudo_kd), \(x) -log10(x))) %>%
+      summarize(
+        res = cor.test(
+          chembl_kd, pseudo_kd
+        ) %>%
+          broom::tidy() %>%
+          list()
+      ) %>%
+      unnest(res) %>%
+      mutate(label = paste("italic(R)^2 ==", signif(estimate**2, 2))),
+    x = -Inf, y = Inf, hjust = 0, vjust = 1,
+    inherit.aes = FALSE, parse = TRUE
+  ) +
+  scale_shape_manual(
+    values = c(
+      `<` = 25, `>` = 24, `=` = 21
+    ),
+    guide = "none"
+  ) +
+  scale_fill_manual(
+    values = map_chr(tas_colors, \(x) alpha(x, alpha = 0.5)),
+    guide = guide_legend(override.aes = list(color = alpha("white", 0), shape = 21, alpha = 1))
+  ) +
+  scale_color_manual(
+    values = c(
+      `ontarget` = alpha("black", .9),
+      `offtarget` = alpha("black", .1),
+      `no` = alpha("purple", 0)
+    ),
+    guide = "none"
+  ) +
+  scale_size_manual(
+    values = c(`ontarget` = 1.5, `offtarget` = 1, `no` = 1),
+    guide = "none"
+  ) +
+  # Limiting to between 1 and 10000 because barely any data outside this range
+  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
+  scale_y_log10(labels = scales::label_number(big.mark = "")) +
+  coord_equal() +
+  labs(
+    x = "Kd (ChEMBL)",
+    y = "Pseudo-Kd (KINOMEscan)",
+    fill = "TAS"
+  )
+# NA warning comes from values outside of plotted range
+
+# ggsave(
+#     "plots/chembl_kd_vs_kinomescan_pseudo_kd_tas_with_fda.pdf", p_scatter,
+#     width = 8, height = 4
+# )
+
+p_beeswarm <- pseudo_kd_kd_comp %>%
+  filter(
+    pseudo_kd_concordant == "concordant",
+    # pseudo_ic50_relation == "=",
+    classification != "discordant"
+  ) %>%
+  mutate(
+    tas_pseudo_kd = fct_rev(tas_pseudo_kd) %>%
+      fct_relabel(\(x) paste("TAS", x)),
+    chembl_kd = pmin(chembl_kd, 10000)
+  ) %>%
+  ggplot(
+    aes(chembl_kd, tas_pseudo_kd, color = tas_pseudo_kd)
+  ) +
+  geom_quasirandom(orientation = "y", shape = 16, size = 1, alpha = 0.5, width = 0.3) +
+  geom_boxplot(fill = NA, outlier.shape = NA) +
+  scale_color_manual(values = set_names(tas_colors, paste("TAS", names(tas_colors)))) +
+  guides(color = "none") +
+  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
+  # scale_y_discrete(labels = class_labels) +
+  # theme(axis.text.y = element_markdown()) +
+  labs(x = "Kd (ChEMBL)", y = NULL)
+
+# ggsave(
+#     "plots/chembl_kd_by_kinomescan_class_beeswarm.pdf", p_beeswarm,
+#     width = 7, height = 3
+# )
+
+p_combined <- egg::ggarrange(
+    p_scatter +
+        labs(x = NULL) +
+        guides(color = "none") +
+        theme(
+            axis.text.x = element_blank(),
+            plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
+        ),
+    p_beeswarm +
+        coord_fixed(ratio = .32) +
+        theme(
+            plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm"),
+            legend.position = "bottom"
+        ),
+    nrow = 2,
+    heights = c(2, 1.2),
+    draw = FALSE
+)
+
+ggsave(
+    "plots/chembl_kd_by_comparison_combined_tas_with_fda.pdf", p_combined,
+    width = 6, height = 4.5
+)
+```
+
+### color by tas without fda
+
+```{r}
+tas_colors <- c(`1` = "#b2182b", `2` = "#ef8a62", `3` = "#fddbc7", `10` = "#2166ac", `no data` = "#ffffff")
+
+p_scatter <- pseudo_kd_kd_comp %>%
+  drop_na(pseudo_kd) %>%
+  filter(
+    # pseudo_ic50_relation == "=",
+    pseudo_kd_concordant == "concordant",
+    classification != "discordant"
+  ) %>%
+  mutate(chembl_kd = pmin(chembl_kd, 10000)) %>%
+  arrange(desc(fda_target)) %>%
+  ggplot(
+    aes(chembl_kd, pseudo_kd, fill = tas_pseudo_kd)
+  ) +
+  geom_point(
+    aes(shape = pseudo_kd_relation),
+    color = alpha("black", 0), size = 1
+  ) +
+  geom_text(
+    aes(label = label),
+    data = \(df) df %>%
+      mutate(across(c(chembl_kd, pseudo_kd), \(x) -log10(x))) %>%
+      summarize(
+        res = cor.test(
+          chembl_kd, pseudo_kd
+        ) %>%
+          broom::tidy() %>%
+          list()
+      ) %>%
+      unnest(res) %>%
+      mutate(label = paste("italic(R)^2 ==", signif(estimate**2, 2))),
+    x = -Inf, y = Inf, hjust = 0, vjust = 1,
+    inherit.aes = FALSE, parse = TRUE
+  ) +
+  scale_shape_manual(
+    values = c(
+      `<` = 25, `>` = 24, `=` = 21
+    ),
+    guide = "none"
+  ) +
+  scale_fill_manual(
+    values = map_chr(tas_colors, \(x) alpha(x, alpha = 0.5)),
+    guide = guide_legend(override.aes = list(color = alpha("white", 0), shape = 21, alpha = 1))
+  ) +
+  # scale_color_manual(
+  #   values = c(
+  #     `ontarget` = alpha("black", .9),
+  #     `offtarget` = alpha("black", .1),
+  #     `no` = alpha("purple", 0)
+  #   ),
+  #   guide = "none"
+  # ) +
+  # scale_size_manual(
+  #   values = c(`ontarget` = 1.5, `offtarget` = 1, `no` = 1),
+  #   guide = "none"
+  # ) +
+  # Limiting to between 1 and 10000 because barely any data outside this range
+  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
+  scale_y_log10(labels = scales::label_number(big.mark = "")) +
+  coord_equal() +
+  labs(
+    x = "Kd (ChEMBL)",
+    y = "Pseudo-Kd (KINOMEscan)",
+    fill = "TAS"
+  )
+# NA warning comes from values outside of plotted range
+
+# ggsave(
+#     "plots/chembl_kd_vs_kinomescan_pseudo_kd_tas_with_fda.pdf", p_scatter,
+#     width = 8, height = 4
+# )
+
+p_beeswarm <- pseudo_kd_kd_comp %>%
+  filter(
+    pseudo_kd_concordant == "concordant",
+    # pseudo_ic50_relation == "=",
+    classification != "discordant"
+  ) %>%
+  mutate(
+    tas_pseudo_kd = fct_rev(tas_pseudo_kd) %>%
+      fct_relabel(\(x) paste("TAS", x)),
+    chembl_kd = pmin(chembl_kd, 10000)
+  ) %>%
+  ggplot(
+    aes(chembl_kd, tas_pseudo_kd, color = tas_pseudo_kd)
+  ) +
+  geom_quasirandom(orientation = "y", shape = 16, size = 1, alpha = 0.5, width = 0.3) +
+  geom_boxplot(fill = NA, outlier.shape = NA) +
+  scale_color_manual(values = set_names(tas_colors, paste("TAS", names(tas_colors)))) +
+  guides(color = "none") +
+  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
+  # scale_y_discrete(labels = class_labels) +
+  # theme(axis.text.y = element_markdown()) +
+  labs(x = "Kd (ChEMBL)", y = NULL)
+
+# ggsave(
+#     "plots/chembl_kd_by_kinomescan_class_beeswarm.pdf", p_beeswarm,
+#     width = 7, height = 3
+# )
+
+p_combined <- egg::ggarrange(
+    p_scatter +
+        labs(x = NULL) +
+        guides(color = "none") +
+        theme(
+            axis.text.x = element_blank(),
+            plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
+        ),
+    p_beeswarm +
+        coord_fixed(ratio = .32) +
+        theme(
+            plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm"),
+            legend.position = "bottom"
+        ),
+    nrow = 2,
+    heights = c(2, 1.2),
+    draw = FALSE
+)
+
+ggsave(
+    "plots/chembl_kd_by_comparison_combined_tas_no_fda.pdf", p_combined,
+    width = 6, height = 4.5
+)
+```
+
+### color by tas fda only
+
+```{r}
+tas_colors <- c(`1` = "#b2182b", `2` = "#ef8a62", `3` = "#fddbc7", `10` = "#2166ac", `no data` = "#ffffff")
+
+p_scatter <- pseudo_kd_kd_comp %>%
+  drop_na(pseudo_kd) %>%
+  filter(
+    # pseudo_ic50_relation == "=",
+    pseudo_kd_concordant == "concordant",
+    classification != "discordant",
+    fda_approved
+  ) %>%
+  mutate(chembl_kd = pmin(chembl_kd, 10000)) %>%
+  arrange(desc(fda_target)) %>%
+  ggplot(
+    aes(chembl_kd, pseudo_kd, fill = tas_pseudo_kd)
+  ) +
+  geom_point(
+    aes(shape = pseudo_kd_relation, color = fda_target, size = fda_target),
+  ) +
+  geom_text(
+    aes(label = label),
+    data = \(df) df %>%
+      mutate(across(c(chembl_kd, pseudo_kd), \(x) -log10(x))) %>%
+      summarize(
+        res = cor.test(
+          chembl_kd, pseudo_kd
+        ) %>%
+          broom::tidy() %>%
+          list()
+      ) %>%
+      unnest(res) %>%
+      mutate(label = paste("italic(R)^2 ==", signif(estimate**2, 2))),
+    x = -Inf, y = Inf, hjust = 0, vjust = 1,
+    inherit.aes = FALSE, parse = TRUE
+  ) +
+  scale_shape_manual(
+    values = c(
+      `<` = 25, `>` = 24, `=` = 21
+    ),
+    guide = "none"
+  ) +
+  scale_fill_manual(
+    values = map_chr(tas_colors, \(x) alpha(x, alpha = 0.5)),
+    guide = guide_legend(override.aes = list(color = alpha("white", 0), shape = 21, alpha = 1))
+  ) +
+  scale_color_manual(
+    values = c(
+      `ontarget` = alpha("black", .9),
+      `offtarget` = alpha("black", .0),
+      `no` = alpha("purple", 0)
+    ),
+    guide = "none"
+  ) +
+  scale_size_manual(
+    values = c(`ontarget` = 1.5, `offtarget` = 1, `no` = 1),
+    guide = "none"
+  ) +
+  # Limiting to between 1 and 10000 because barely any data outside this range
+  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
+  scale_y_log10(labels = scales::label_number(big.mark = "")) +
+  coord_equal() +
+  labs(
+    x = "Kd (ChEMBL)",
+    y = "Pseudo-Kd (KINOMEscan)",
+    fill = "TAS"
+  )
+# NA warning comes from values outside of plotted range
+
+# ggsave(
+#     "plots/chembl_kd_vs_kinomescan_pseudo_kd_tas_with_fda.pdf", p_scatter,
+#     width = 8, height = 4
+# )
+
+p_beeswarm <- pseudo_kd_kd_comp %>%
+  filter(
+    pseudo_kd_concordant == "concordant",
+    # pseudo_ic50_relation == "=",
+    classification != "discordant",
+    fda_approved
+  ) %>%
+  mutate(
+    tas_pseudo_kd = fct_rev(tas_pseudo_kd) %>%
+      fct_relabel(\(x) paste("TAS", x)),
+    chembl_kd = pmin(chembl_kd, 10000)
+  ) %>%
+  ggplot(
+    aes(chembl_kd, tas_pseudo_kd, color = tas_pseudo_kd)
+  ) +
+  geom_quasirandom(orientation = "y", shape = 16, size = 1, alpha = 0.5, width = 0.3) +
+  geom_boxplot(fill = NA, outlier.shape = NA) +
+  scale_color_manual(values = set_names(tas_colors, paste("TAS", names(tas_colors)))) +
+  guides(color = "none") +
+  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
+  # scale_y_discrete(labels = class_labels) +
+  # theme(axis.text.y = element_markdown()) +
+  labs(x = "Kd (ChEMBL)", y = NULL)
+
+# ggsave(
+#     "plots/chembl_kd_by_kinomescan_class_beeswarm.pdf", p_beeswarm,
+#     width = 7, height = 3
+# )
+
+p_combined <- egg::ggarrange(
+    p_scatter +
+        labs(x = NULL) +
+        guides(color = "none") +
+        theme(
+            axis.text.x = element_blank(),
+            plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
+        ),
+    p_beeswarm +
+        coord_fixed(ratio = .32) +
+        theme(
+            plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm"),
+            legend.position = "bottom"
+        ),
+    nrow = 2,
+    heights = c(2, 1.2),
+    draw = FALSE
+)
+
+ggsave(
+    "plots/chembl_kd_by_comparison_combined_tas_fda_only.pdf", p_combined,
     width = 6, height = 4.5
 )
 ```
