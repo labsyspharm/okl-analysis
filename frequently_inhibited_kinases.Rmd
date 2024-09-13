@@ -32,8 +32,27 @@ input_files <- map(
   inputs, syn
 )
 
+single_dose <- input_files[["okl_single_dose_datasets"]] %>%
+  read_csv() %>%
+  filter(dataset == "original_repeat_replaced")
+
 kinase_info <- input_files[["kinase_info"]] %>%
-  read_csv()
+  read_csv() %>%
+  filter(`DiscoveRx Gene Symbol` %in% single_dose$`DiscoveRx Gene Symbol`)
+
+mutant_panel <- kinase_info %>%
+  mutate(
+    mutant = str_detect(`Kinase Form`, "Mutation")
+  ) %>%
+  filter(mutant) %>%
+  bind_rows(
+    filter(
+      kinase_info,
+      `Kinase Form` == "Wild Type",
+      hgnc_symbol %in% .$hgnc_symbol
+    ) %>%
+      mutate(mutant = FALSE)
+  )
 
 pseudo_kds <- input_files[["okl_pseudo_kds"]] %>%
   fread() %>%
@@ -85,6 +104,22 @@ most_inhibited <- most_inhibited_raw %>%
 most_inhibited %>%
   count(cutoff, n_inhibitors) %>%
   View()
+
+most_targets_raw <- pseudo_kds_dedup %>%
+  group_by(lspci_id, hmsl_id, library, name) %>%
+  summarize(
+    n_targets = map_int(
+      set_names(CUTOFFS),
+      ~ sum(pseudo_kd <= as.numeric(.x), na.rm = TRUE)
+    ) %>%
+      list(),
+    .groups = "drop"
+  )
+
+most_targets <- most_targets_raw %>%
+  unnest_longer(n_targets, indices_to = "cutoff", values_to = "n_targets") %>%
+  mutate(across(cutoff, as.numeric)) %>%
+  arrange(desc(n_targets))
 ```
 
 
@@ -558,5 +593,189 @@ random_and_real_1000_n_overlap_top_15_kinases_n_inhibs_per_group_p <- random_and
   ) %>%
   group_by(n_kinases) %>%
   summarize(p = sum(n_inhibitors >= n_inhibitors_real) / n(), .groups = "drop")
+
+```
+
+Heatmap of mutant panel
+
+```{r}
+library(ComplexHeatmap)
+library(seriation)
+
+cluster_fun_eucl <- function(mat) {
+  # browser()
+  dist_mat <- dist(mat)
+  # dist_mat <- as.dist(mat)
+  clust <- hclust(dist_mat, method = "average")
+  reorder(clust, dist_mat, method = "OLO")
+}
+
+createAnnotation <- function(df, colors = list(), which = "column") {
+  # Load necessary libraries
+  library(ComplexHeatmap)
+  library(circlize)
+  library(rlang)
+
+  color_maps <- list()
+
+  # Iterate over each column in the dataframe
+  for (col_name in names(df)) {
+    # Check if the column is numeric
+    if (is.numeric(df[[col_name]])) {
+      # Create a color mapping function for numeric columns
+      col_fun <- colors[[col_name]] %||% colorRamp2(seq(from = min(df[[col_name]]), to = max(df[[col_name]]), length.out = 2),
+                            c("white", "red"))
+      color_maps[[col_name]] <- col_fun
+    } else {
+      if (is.character(colors[[col_name]])) {
+        color_maps[[col_name]] <- colors[[col_name]]
+        next
+      }
+      col_fun <- colors[[col_name]] %||% rainbow
+      # Create a named vector of colors for categorical columns
+      values <- df[[col_name]]
+      unique_values <- if (is.factor(values)) levels(values) else unique(df[[col_name]])
+      named_colors <- setNames(col_fun(length(unique_values)), unique_values)
+      color_maps[[col_name]] <- named_colors
+    }
+  }
+
+  # Combine all annotations
+  combined_annotations <- HeatmapAnnotation(df = df, col = color_maps, which = which)
+
+  return(combined_annotations)
+}
+```
+
+Redo computation with all kinases included, even mutant ones
+
+```{r}
+pseudo_kds_dedup_no <- pseudo_kds %>%
+  filter(
+    hgnc_symbol != "",
+    classification != "discordant",
+    pseudo_kd_concordant != "discordant",
+    library == "OKL"
+  ) %>%
+  group_by(lspci_id, hgnc_symbol, `DiscoveRx Gene Symbol`) %>%
+  slice_min(
+    pseudo_kd,
+    with_ties = FALSE,
+    na_rm = TRUE
+  ) %>%
+  ungroup()
+
+CUTOFFS <- c(100, 1000)
+TOP_N <- 15
+
+most_inhibited_raw_no <- pseudo_kds_dedup_no %>%
+  group_by(hgnc_symbol, `DiscoveRx Gene Symbol`) %>%
+  summarize(
+    n_inhibitors = map_int(
+      set_names(CUTOFFS),
+      ~ sum(pseudo_kd <= as.numeric(.x), na.rm = TRUE)
+    ) %>%
+      list(),
+    .groups = "drop"
+  )
+
+most_inhibited_no <- most_inhibited_raw_no %>%
+  unnest_longer(n_inhibitors, indices_to = "cutoff", values_to = "n_inhibitors") %>%
+  mutate(across(cutoff, as.numeric)) %>%
+  arrange(desc(n_inhibitors))
+
+most_targets_raw_no <- pseudo_kds_dedup_no %>%
+  group_by(lspci_id, hmsl_id, library, name) %>%
+  summarize(
+    n_targets = map_int(
+      set_names(CUTOFFS),
+      ~ sum(pseudo_kd <= as.numeric(.x), na.rm = TRUE)
+    ) %>%
+      list(),
+    .groups = "drop"
+  )
+
+most_targets_no <- most_targets_raw_no %>%
+  unnest_longer(n_targets, indices_to = "cutoff", values_to = "n_targets") %>%
+  mutate(across(cutoff, as.numeric)) %>%
+  arrange(desc(n_targets))
+```
+
+
+```{r}
+better_contrast <- function(
+  colors1, colors2, threshold = 0
+) {
+  # browser()
+  farver::compare_colour(
+    farver::decode_colour(colors1),
+    farver::decode_colour(colors2),
+    from_space = "rgb",
+    method = "cie2000"
+  ) %>% {
+      .[, 1] < (1 + threshold) * .[, 2]
+    } %>%
+    if_else(colors2[2], colors2[1])
+}
+
+mutant_hm_data <- tibble(
+  cutoff = CUTOFFS
+) %>%
+  mutate(
+    hm = map(
+      cutoff,
+      \(cu) {
+        mat <- pseudo_kds_dedup_no %>%
+          filter(`DiscoveRx Gene Symbol` %in% mutant_panel$`DiscoveRx Gene Symbol`) %>%
+          transmute(`DiscoveRx Gene Symbol`, lspci_id, pseudo_kd = log10(pseudo_kd)) %>%
+          pivot_wider(names_from = lspci_id, values_from = pseudo_kd) %>%
+          column_to_rownames("DiscoveRx Gene Symbol") %>%
+          as.matrix()
+        mutant_panel_sub <- mutant_panel %>%
+          slice(match(rownames(mat), `DiscoveRx Gene Symbol`))
+        row_anno <- mutant_panel %>%
+          left_join(
+            most_inhibited_no %>%
+              filter(cutoff == cu) %>%
+              select(`DiscoveRx Gene Symbol`, n_inhibitors),
+            by = "DiscoveRx Gene Symbol"
+          ) %>%
+          select(`DiscoveRx Gene Symbol`, Group, mutant, n_inhibitors) %>%
+          slice(match(rownames(mat), `DiscoveRx Gene Symbol`)) %>%
+          column_to_rownames("DiscoveRx Gene Symbol")
+        col_anno <- most_targets_no %>%
+          filter(cutoff == cu) %>%
+          select(lspci_id, n_targets) %>%
+          slice(match(colnames(mat), lspci_id)) %>%
+          column_to_rownames("lspci_id")
+        # browser()
+        Heatmap(
+          mat,
+          name = "Pseudo Kd",
+          col = viridisLite::viridis(100, direction = -1),
+          cluster_columns = cluster_fun_eucl,
+          cluster_rows = cluster_fun_eucl,
+          row_split = mutant_panel_sub$hgnc_symbol,
+          left_annotation = createAnnotation(
+            row_anno,
+            which = "row",
+            colors = list(Group = \(x) RColorBrewer::brewer.pal(x, "Set2"))
+          ),
+          top_annotation = createAnnotation(
+            col_anno,
+            which = "column"
+          ),
+          show_column_names = FALSE,
+          # cell_fun = \(j, i, x, y, width, height, fill) {
+          #   # browser()
+          #   if (!is.na(mat[i, j]) && mat[i, j] < log10(cu))
+          #     grid.text("*", x, y, gp = gpar(fontsize = 10, col = better_contrast(fill, c("white", "black"))))
+          # }
+        )
+      }
+    )
+  )
+
+
 
 ```
