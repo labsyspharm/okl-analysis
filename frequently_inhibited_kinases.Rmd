@@ -25,7 +25,8 @@ inputs <- list(
   okl_single_dose_datasets = "syn52504516",
   kinase_info = "syn51286743",
   okl_pseudo_kds = "syn51080578",
-  partition_index_max = "syn52576129"
+  partition_index_max = "syn52576129",
+  okl_metadata = "syn63303526"
 )
 
 input_files <- map(
@@ -62,6 +63,13 @@ pseudo_kds <- input_files[["okl_pseudo_kds"]] %>%
 partition_index_max <- input_files[["partition_index_max"]] %>%
   read_csv() %>%
   filter(dataset == "original_repeat_replaced")
+
+okl_metadata <- input_files[["okl_metadata"]] %>%
+  read_csv() %>%
+  mutate(
+    type_combined = str_remove(type, fixed(" (our ratio)")) %>%
+      factor(levels = c("i", "ii", "iii", "iv"))
+  )
 ```
 
 
@@ -601,21 +609,29 @@ Heatmap of mutant panel
 ```{r}
 library(ComplexHeatmap)
 library(seriation)
+library(impute)
 
-cluster_fun_eucl <- function(mat) {
+cluster_fun_eucl <- function(mat, sample_in_col = TRUE) {
+  if (!sample_in_col) {
+    mat <- t(mat)
+  }
+  mat_imp <- impute.knn(
+    mat, rng.seed = 42
+  )[["data"]]
+  if (!sample_in_col) {
+    mat_imp <- t(mat_imp)
+    mat <- t(mat)
+  }
   # browser()
-  dist_mat <- dist(mat)
+  dist_mat <- dist(mat_imp)
   # dist_mat <- as.dist(mat)
   clust <- hclust(dist_mat, method = "average")
   reorder(clust, dist_mat, method = "OLO")
 }
 
+
 createAnnotation <- function(df, colors = list(), which = "column") {
   # Load necessary libraries
-  library(ComplexHeatmap)
-  library(circlize)
-  library(rlang)
-
   color_maps <- list()
 
   # Iterate over each column in the dataframe
@@ -623,8 +639,25 @@ createAnnotation <- function(df, colors = list(), which = "column") {
     # Check if the column is numeric
     if (is.numeric(df[[col_name]])) {
       # Create a color mapping function for numeric columns
-      col_fun <- colors[[col_name]] %||% colorRamp2(seq(from = min(df[[col_name]]), to = max(df[[col_name]]), length.out = 2),
-                            c("white", "red"))
+      if (is.null(colors[[col_name]]))
+        colors[[col_name]] <- c("white", "red")
+      if (is.function(colors[[col_name]])) {
+        col_fun <- colors[[col_name]]
+      } else if (is.character(colors[[col_name]])) {
+        n <- length(colors[[col_name]])
+        if (n == 1) {
+          col_fun <- circlize::colorRamp2(
+            seq(from = min(df[[col_name]]), to = max(df[[col_name]]), length.out = 100),
+            viridis(100, option = colors[[col_name]])
+          )
+        } else {
+          col_fun <- circlize::colorRamp2(
+            seq(from = min(df[[col_name]]), to = max(df[[col_name]]), length.out = n),
+            colors[[col_name]]
+          )
+        }
+      } else
+        stop("Dont know how to handle colors for column ", col_name)
       color_maps[[col_name]] <- col_fun
     } else {
       if (is.character(colors[[col_name]])) {
@@ -776,6 +809,136 @@ mutant_hm_data <- tibble(
     )
   )
 
+pwalk(
+  mutant_hm_data,
+  \(cutoff, hm) {
+    withr::with_pdf(
+      here("plots", paste0("mutant_panel_pseudo_kd_heatmap_cutoff_", cutoff, ".pdf")),
+      print(hm), width = 10, height = 13
+    )
+  }
+)
 
+```
+
+```{r}
+
+mutant_hm_data <- crossing(
+  cutoff = CUTOFFS,
+  hgnc_symbol = unique(mutant_panel$hgnc_symbol)
+) %>%
+  mutate(
+    hm = map2(
+      cutoff, hgnc_symbol,
+      \(cu, g) {
+        # browser()
+        row_anno <- mutant_panel %>%
+          filter(hgnc_symbol == g) %>%
+          power_left_join(
+            most_inhibited_no %>%
+              filter(cutoff == cu) %>%
+              select(`DiscoveRx Gene Symbol`, n_inhibitors),
+            by = "DiscoveRx Gene Symbol",
+            check = check_specs(
+              unmatched_keys_left = "warn",
+              duplicate_keys_left = "warn",
+              duplicate_keys_right = "warn"
+            )
+          ) %>%
+          mutate(
+            target_name = if_else(mutant, `DiscoveRx Gene Symbol`, str_replace(`DiscoveRx Gene Symbol`, g, "WT")) %>%
+              str_remove(paste0("^", g, "-?")) %>%
+              str_remove_all("[\\(\\)]") %>%
+              str_replace_all(fixed("phosphorylated"), "p")
+          )
+        col_anno <- pseudo_kds_dedup_no %>%
+          filter(
+            `DiscoveRx Gene Symbol` %in% mutant_panel$`DiscoveRx Gene Symbol`,
+            hgnc_symbol == g
+          ) %>%
+          group_by(lspci_id) %>%
+          filter(sum(pseudo_kd <= cu) >= 1) %>%
+          ungroup() %>%
+          distinct(name, lspci_id, hmsl_id) %>%
+          mutate(cutoff = cu) %>%
+          power_left_join(
+            select(okl_metadata, hmsl_id = HMSLID, type_combined),
+            by = "hmsl_id",
+            check = check_specs(
+              unmatched_keys_left = "warn",
+              duplicate_keys_left = "warn",
+              duplicate_keys_right = "warn"
+            )
+          ) %>%
+          power_left_join(
+            select(most_targets_no, lspci_id, cutoff, n_targets),
+            by = join_by(lspci_id, cutoff),
+            check = check_specs(
+              unmatched_keys_left = "warn",
+              duplicate_keys_left = "warn",
+              duplicate_keys_right = "warn"
+            )
+          )
+        mat <- pseudo_kds_dedup_no %>%
+          filter(
+            `DiscoveRx Gene Symbol` %in% row_anno$`DiscoveRx Gene Symbol`,
+            lspci_id %in% col_anno$lspci_id
+          ) %>%
+          transmute(`DiscoveRx Gene Symbol`, lspci_id, pseudo_kd = log10(pseudo_kd)) %>%
+          pivot_wider(names_from = lspci_id, values_from = pseudo_kd) %>%
+          column_to_rownames("DiscoveRx Gene Symbol") %>%
+          as.matrix()
+        # browser()
+        subset_mat <- mat[row_anno$`DiscoveRx Gene Symbol`, as.character(col_anno$lspci_id)]
+        # browser()
+        Heatmap(
+          subset_mat,
+          name = "Pseudo Kd",
+          column_title = g,
+          col = viridisLite::viridis(100, direction = -1),
+          cluster_columns = cluster_fun_eucl,
+          cluster_rows = cluster_fun_eucl,
+          row_labels = row_anno$target_name,
+          # row_split = mutant_panel_sub$hgnc_symbol,
+          left_annotation = createAnnotation(
+            row_anno %>%
+              select(`DiscoveRx Gene Symbol`, Mutant = mutant, `N inhibitors` = n_inhibitors) %>%
+              column_to_rownames("DiscoveRx Gene Symbol"),
+            which = "row",
+            colors = list(`N inhibitors` = rev(paletteer::paletteer_c("grDevices::Blues 3", 30)))
+          ),
+          top_annotation = createAnnotation(
+            col_anno %>%
+              select(lspci_id, `N targets` = n_targets, Type = type_combined) %>%
+              column_to_rownames("lspci_id"),
+            which = "column",
+            colors = list(
+              `N targets` = rev(paletteer::paletteer_c("grDevices::Reds 3", 30)),
+              Type = \(x) RColorBrewer::brewer.pal(x, "Set2")
+            )
+          ),
+          # column_labels = col_anno$name,
+          show_column_names = FALSE,
+          width = ncol(subset_mat) * unit(2, "mm"),
+          height = nrow(subset_mat) * unit(5, "mm")
+        )
+      }
+    )
+  )
+
+pwalk(
+  mutant_hm_data,
+  \(cutoff, hgnc_symbol, hm) {
+    hm <- draw(hm)
+    w <- ComplexHeatmap:::width(hm) %>%
+      convertX(unit = "inch", valueOnly = TRUE)
+    h <- ComplexHeatmap:::height(hm) %>%
+      convertY(unit = "inch", valueOnly = TRUE)
+    withr::with_pdf(
+      here("plots", paste0("mutant_panel_", hgnc_symbol, "_pseudo_kd_heatmap_cutoff_", cutoff, ".pdf")),
+      print(hm), width = w, height = h
+    )
+  }
+)
 
 ```
