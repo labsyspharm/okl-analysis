@@ -1559,7 +1559,9 @@ single_dose_comp <- single_dose_trans %>%
       select(lspci_id, chembl_kd, chembl_kd_relation, `DiscoveRx Gene Symbol`),
     by = c("lspci_id", "DiscoveRx Gene Symbol")
   )
+```
 
+```{r}
 p <- single_dose_comp %>%
   mutate(
     percent_control_zero = `Percent Control` == 0,
@@ -2428,6 +2430,44 @@ single_dose_comp_scores_weighted_diagnostics %>%
 Try doing per-compound ROC curves instead of the heatmap
 
 ```{r}
+single_dose_comp_binned <- single_dose_comp %>%
+  filter(dataset == "original_repeat_replaced") %>%
+  mutate(
+    percent_control_bin = cut(
+      `Percent Control`,
+      breaks = c(-Inf, seq(from = 10, to = 90, by = 10), Inf)
+    ),
+    kd_bin = cut(
+      chembl_kd,
+      breaks = c(-Inf, 10**seq(-1, 4), Inf)
+    )
+  )
+
+single_dose_comp_binned_filtered <- single_dose_comp_binned %>%
+  group_by(`Compound Concentration (nM)`) %>%
+  filter(n() > 1000) %>%
+  ungroup() %>%
+  mutate(
+    across(
+      `Compound Concentration (nM)`,
+      ~ordered(
+        .x,
+        levels = sort(unique(.x)),
+        labels = paste0(sort(unique(.x)), " nM")
+      )
+    )
+  ) %>%
+  filter(
+    classification != "discordant",
+    !qpcr_miss,
+    !exclude_target
+  )
+```
+
+
+```{r}
+library(ROCit)
+KD_THRESHOLDS <- c(10, 100, 1000, 5000)
 
 rocs_per_compound <- single_dose_comp_binned_filtered %>%
   crossing(
