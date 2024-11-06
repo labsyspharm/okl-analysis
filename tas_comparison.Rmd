@@ -257,6 +257,7 @@ margin_plot <- \(x, m) {
         ggplot(aes(!!m_sym, n, fill = tas)) +
             geom_col() +
             scale_fill_manual(values = tas_colors, guide = "none") +
+            coord_cartesian(clip = "off") +
             theme(
                 strip.background = element_blank(),
                 panel.grid.major = element_blank(),
@@ -306,13 +307,13 @@ tas_heatmaps_margins <- tas_heatmaps %>%
             list(p, p_col, p_row),
             \(p, p_col, p_row) {
                 patchwork::wrap_plots(
-                    p_col + theme(plot.margin = unit(c(0,0,0,0), "pt")) + labs(x = NULL, y = NULL),
+                    p_col + theme(plot.margin = unit(c(0,0,0,0), "pt")) + labs(x = NULL, y = "Frequency"),
                     p_row + theme(plot.margin = unit(c(0,0,0,0), "pt")) + labs(x = "Compound", y = "Frequency"), p + theme(plot.margin = unit(c(0,0,0,0), "pt")) + coord_cartesian(clip = "off") + labs(y = NULL),
                     design = "#A\nBC",
                     byrow = TRUE,
                     nrow = 2, ncol = 2,
                     widths = c(.2, 1),
-                    heights = c(.2, 1)
+                    heights = c(.25, 1)
                 )
             }
         )
@@ -323,7 +324,7 @@ pwalk(
     \(dataset, p_combined, p_combined2, ...) {
         ggsave(
             paste0("plots/tas_heatmap_pre_okl_vs_okl_", dataset, "_margins.pdf"),
-            p_combined2, width = 10, height = 10
+            p_combined2, width = 9, height = 4
         )
     }
 )
