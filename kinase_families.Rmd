@@ -25,6 +25,13 @@ kinomescan_kinase_info <- syn("syn51286743") %>%
 single_dose <- syn("syn26486828") %>%
   fread()
 
+partition_index_max <- syn("syn52576129") %>%
+  read_csv() %>%
+  filter(dataset == "original_repeat_replaced")
+
+structural_similarity_clusters <- syn("syn63660132") %>%
+  read_csv()
+
 download.file("https://github.com/sorgerlab/famplex/raw/43732660e42fd1746c2d1e61552bda0a90cbd664/relations.csv", destfile = "~/data/famplex_relations.csv")
 famplex_relations <- read_csv("~/data/famplex_relations.csv", col_names = c("namespace", "id", "relation", "family_namespace", "family"))
 ```
@@ -102,7 +109,7 @@ kinomescan_pseudo_kds_clean <- kinomescan_pseudo_kds %>%
 Compute number of compounds inhibiting each kinase
 
 ```{r}
-kinase_stats <- pseudo_ic50s_clean %>%
+kinase_stats <- kinomescan_pseudo_kds_clean %>%
   group_by(hgnc_symbol, family, `DiscoveRx Gene Symbol`) %>%
   summarize(
     n_binding = sum(classification == "binding"),
@@ -276,13 +283,22 @@ walk(
 ## CDK upset
 
 ```{r}
+cdk_whitelist <- c(
+  "CDK4", "CDK6", "CDK7",
+  # "PFTAIRE2", "PFTAIRE1",
+  "CDK14", "CDK15",
+  "CDK16", "CDK17",
+  "CDK18", "CDK3",
+  "CDK2", "CDK5",
+  "CDK13", "CDK8",
+  "CDK8", "CDK19"
+)
+setdiff(cdk_whitelist, kinomescan_kinase_info$hgnc_symbol)
+
 kinomescan_pseudo_kds_cdk <- kinomescan_pseudo_kds %>%
   filter(
-    classification != "discordant"
-  ) %>%
-  semi_join(
-    famplex_kinases %>%
-      filter(family == "CDK")
+    classification != "discordant",
+    hgnc_symbol %in% cdk_whitelist
   ) %>%
   mutate(
     symbol = if_else(
@@ -387,15 +403,25 @@ library(circlize)
 library(rlang)
 library(seriation)
 library(viridisLite)
+library(impute)
 
-cluster_fun_eucl <- function(mat) {
+cluster_fun_eucl <- function(mat, sample_in_col = TRUE) {
+  if (!sample_in_col) {
+    mat <- t(mat)
+  }
+  mat_imp <- impute.knn(
+    mat, rng.seed = 42
+  )[["data"]]
+  if (!sample_in_col) {
+    mat_imp <- t(mat_imp)
+    mat <- t(mat)
+  }
   # browser()
-  dist_mat <- dist(mat)
+  dist_mat <- dist(mat_imp)
   # dist_mat <- as.dist(mat)
   clust <- hclust(dist_mat, method = "average")
   reorder(clust, dist_mat, method = "OLO")
 }
-
 
 createAnnotation <- function(df, colors = list(), which = "column") {
   # Load necessary libraries
@@ -435,7 +461,7 @@ createAnnotation <- function(df, colors = list(), which = "column") {
       # Create a named vector of colors for categorical columns
       values <- df[[col_name]]
       unique_values <- if (is.factor(values)) levels(values) else unique(df[[col_name]])
-      named_colors <- setNames(col_fun(length(unique_values)), unique_values)
+      named_colors <- set_names(col_fun(length(unique_values)), unique_values)
       color_maps[[col_name]] <- named_colors
     }
   }
@@ -540,10 +566,95 @@ pwalk(
   function(hm, kd_cutoff, ...) {
     withr::with_pdf(
       file.path("plots", paste0("cdk_heatmap_", kd_cutoff, ".pdf")),
-      print(hm), width = 10, height = 8
+      print(hm), width = 8, height = 5
     )
   }
 )
 
 ```
 
+```{r}
+kd_log_mat <- kinomescan_pseudo_kds_clean %>%
+  filter(lspci_id %in% structural_similarity_clusters$lspci_id) %>%
+  select(lspci_id, `DiscoveRx Gene Symbol`, pseudo_kd) %>%
+  pivot_wider(names_from = `DiscoveRx Gene Symbol`, values_from = pseudo_kd) %>%
+  column_to_rownames("lspci_id") %>%
+  as.matrix() %>%
+  log10()
+
+row_anno_data <- partition_index_max %>%
+  distinct(
+    lspci_id,
+    name,
+    partition_index
+  ) %>%
+  power_left_join(
+    most_targets %>%
+      filter(cutoff == 100) %>%
+      select(lspci_id, n_targets),
+    by = "lspci_id",
+    check = check_specs(
+      duplicate_keys_right = "warn",
+      duplicate_keys_left = "warn",
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  power_inner_join(
+    structural_similarity_clusters %>%
+      transmute(
+        lspci_id,
+        cluster = factor(cluster)
+      ),
+    by = "lspci_id",
+    check = check_specs(
+      duplicate_keys_right = "warn",
+      duplicate_keys_left = "warn",
+      unmatched_keys_right = "warn"
+    )
+  ) %>%
+  slice(match(rownames(kd_log_mat), lspci_id))
+
+row_anno <- createAnnotation(
+  row_anno_data %>%
+    select(-name) %>%
+    column_to_rownames("lspci_id"),
+  which = "row",
+  colors = list(
+    cluster = \(x) ggokabeito::palette_okabe_ito(seq_len(x))
+    # cluster = \(x) RColorBrewer::brewer.pal(x, "Set2")
+  )
+)
+
+col_anno_data <- most_inhibited %>%
+  filter(cutoff == 100) %>%
+  select(`DiscoveRx Gene Symbol`, n_inhibitors) %>%
+  power_inner_join(
+    kinomescan_kinase_info %>%
+      select(`DiscoveRx Gene Symbol`, Group),
+    by = "DiscoveRx Gene Symbol",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      duplicate_keys_left = "warn",
+    )
+  ) %>%
+  slice(match(colnames(kd_log_mat), `DiscoveRx Gene Symbol`))
+
+col_anno <- createAnnotation(
+  col_anno_data %>%
+    column_to_rownames("DiscoveRx Gene Symbol"),
+  which = "column"
+)
+
+hm <- Heatmap(
+  kd_log_mat,
+  name = "log10 Pseudo Kd",
+  col = viridisLite::viridis(100, direction = -1),
+  cluster_columns = \(x) cluster_fun_eucl(x, sample_in_col = FALSE),
+  cluster_rows = \(x) cluster_fun_eucl(x, sample_in_col = FALSE),
+  left_annotation = row_anno,
+  top_annotation = col_anno,
+  show_column_names = FALSE,
+  show_row_names = FALSE
+)
+```
