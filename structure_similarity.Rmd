@@ -1,0 +1,682 @@
+```{r}
+library(tidyverse)
+library(synExtra)
+library(fst)
+library(data.table)
+library(powerjoin)
+library(qs)
+library(morgancpp)
+library(ComplexHeatmap)
+
+synapser::synLogin()
+
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+```{r}
+kinomescan_pseudo_kds <- syn("syn51080578") %>%
+  read_csv() %>%
+  filter(dataset == "original_repeat_replaced")
+
+compound_props <- kinomescan_pseudo_kds %>%
+  distinct(lspci_id, hmsl_id, name, library)
+
+# kinomescan_classes <- syn("syn51080579") %>%
+#   read_csv()
+
+kinomescan_kinase_info <- syn("syn51286743") %>%
+  read_csv()
+
+fingerprints <- MorganFPS$new(syn("syn26262157"), from_file = TRUE)
+
+compound_dictionary <- syn("syn26260332") %>%
+  fst()
+```
+
+
+
+```{r}
+okl_compound_info <- kinomescan_pseudo_kds %>%
+  filter(library == "OKL") %>%
+  distinct(
+    lspci_id, hmsl_id, name, library
+  )
+
+okl_tanimoto_similarities <- fingerprints$tanimoto_subset(
+  okl_compound_info$lspci_id, okl_compound_info$lspci_id
+) %>%
+  as_tibble() %>%
+  power_inner_join(
+    okl_compound_info %>%
+      select(lspci_id, name_1 = name),
+    by = c("id_1" = "lspci_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  power_inner_join(
+    okl_compound_info %>%
+      select(lspci_id, name_2 = name),
+    by = c("id_2" = "lspci_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+```
+
+
+```{r}
+library(ComplexHeatmap)
+library(seriation)
+library(impute)
+
+cluster_fun_eucl <- function(mat, sample_in_col = TRUE) {
+  if (!sample_in_col) {
+    mat <- t(mat)
+  }
+  mat_imp <- impute.knn(
+    mat, rng.seed = 42
+  )[["data"]]
+  if (!sample_in_col) {
+    mat_imp <- t(mat_imp)
+    mat <- t(mat)
+  }
+  # browser()
+  dist_mat <- dist(mat_imp)
+  # dist_mat <- as.dist(mat)
+  clust <- hclust(dist_mat, method = "average")
+  reorder(clust, dist_mat, method = "OLO")
+}
+
+
+createAnnotation <- function(df, colors = list(), which = "column", ...) {
+  # Load necessary libraries
+  color_maps <- list()
+
+  # Iterate over each column in the dataframe
+  for (col_name in names(df)) {
+    # Check if the column is numeric
+    if (is.numeric(df[[col_name]])) {
+      # Create a color mapping function for numeric columns
+      if (is.null(colors[[col_name]]))
+        colors[[col_name]] <- c("white", "red")
+      if (is.function(colors[[col_name]])) {
+        col_fun <- colors[[col_name]]
+      } else if (is.character(colors[[col_name]])) {
+        n <- length(colors[[col_name]])
+        if (n == 1) {
+          col_fun <- circlize::colorRamp2(
+            seq(from = min(df[[col_name]]), to = max(df[[col_name]]), length.out = 100),
+            viridis(100, option = colors[[col_name]])
+          )
+        } else {
+          col_fun <- circlize::colorRamp2(
+            seq(from = min(df[[col_name]]), to = max(df[[col_name]]), length.out = n),
+            colors[[col_name]]
+          )
+        }
+      } else
+        stop("Dont know how to handle colors for column ", col_name)
+      color_maps[[col_name]] <- col_fun
+    } else {
+      if (is.character(colors[[col_name]])) {
+        color_maps[[col_name]] <- colors[[col_name]]
+        next
+      }
+      col_fun <- colors[[col_name]] %||% rainbow
+      # Create a named vector of colors for categorical columns
+      values <- df[[col_name]]
+      unique_values <- if (is.factor(values)) levels(values) else unique(df[[col_name]])
+      named_colors <- setNames(col_fun(length(unique_values)), unique_values)
+      color_maps[[col_name]] <- named_colors
+    }
+  }
+
+  # Combine all annotations
+  combined_annotations <- HeatmapAnnotation(df = df, col = color_maps, which = which, ...)
+
+  return(combined_annotations)
+}
+
+
+```
+
+
+```{r}
+okl_tanimoto_mat <- okl_tanimoto_similarities %>%
+  select(id_1, id_2, similarity) %>%
+  pivot_wider(
+    names_from = id_2, values_from = similarity
+  ) %>%
+  column_to_rownames("id_1") %>%
+  as.matrix()
+
+withr::with_seed(
+  42,
+  clust <- cluster_fun_eucl(okl_tanimoto_mat)
+)
+
+clust_cut <- cutree(clust, k = 8) %>%
+  enframe(name = "lspci_id", value = "cluster") %>%
+  mutate(across(lspci_id, as.integer)) %>%
+  power_left_join(
+    okl_compound_info %>%
+      select(lspci_id, name),
+    by = "lspci_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+cluster_of_interest <- c(8, 7, 3, 4, 6)
+
+clust_cut %>%
+  arrange(cluster) %>%
+  filter(cluster %in% cluster_of_interest) %>%
+  View()
+```
+
+
+```{r}
+library(lspcheminf)
+
+cluster_cut_structures <- clust_cut %>%
+  arrange(cluster) %>%
+  # filter(cluster %in% cluster_of_interest) %>%
+  mutate(
+    inchi = compound_dictionary[["inchi"]][match(as.integer(lspci_id), compound_dictionary[["lspci_id"]])]
+  )
+```
+
+
+```{r}
+clust_medoids <- clust_cut %>%
+  group_by(cluster) %>%
+  summarize(
+    medoid = {
+      message("Processing cluster ", cluster[1])
+      total_sims <- okl_tanimoto_mat[as.character(lspci_id), as.character(lspci_id)] %>%
+        rowSums() %>%
+        sort(decreasing = TRUE)
+      message(paste(names(total_sims), signif(total_sims, 3), collapse = " "))
+      names(which.max(total_sims))
+    },
+    .groups = "drop"
+  ) %>%
+  power_left_join(
+    okl_compound_info %>%
+      transmute(lspci_id = as.character(lspci_id), name),
+    by = c("medoid" = "lspci_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  power_left_join(
+    cluster_cut_structures %>%
+      transmute(lspci_id = as.character(lspci_id), inchi),
+    by = c("medoid" = "lspci_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+```
+
+```{r}
+pwalk(
+  clust_medoids,
+  \(medoid, lspci_id, name, inchi, cluster, ...) {
+    tmp <- tempfile(fileext = ".svg")
+    draw_compound_grid(
+      set_names(inchi, ""),
+      tmp
+    )
+    rsvg::rsvg_svg(
+      tmp,
+      file.path("plots", paste0("structure_similarity_medoid_cluster_", cluster, "_", name, ".svg"))
+    )
+  }
+)
+
+```
+
+
+```{r}
+mat_compound_info <- okl_compound_info %>%
+  # mutate(across(lspci_id, as.character)) %>%
+  slice(match(rownames(okl_tanimoto_mat), lspci_id)) %>%
+  power_inner_join(
+    select(clust_cut, lspci_id, cluster),
+    by = "lspci_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  mutate(
+    across(cluster, \(x) fct_inseq(as.character(x)))
+  )
+
+col_anno <- createAnnotation(
+  mat_compound_info %>%
+    select(lspci_id, cluster) %>%
+    column_to_rownames("lspci_id"),
+  which = "column",
+  colors = list(
+    # cluster = \(x) RColorBrewer::brewer.pal(x, "Set2")
+    cluster = \(x) ggokabeito::palette_okabe_ito(seq_len(x))
+  ),
+  simple_anno_size = unit(2, "mm")
+)
+
+cluster_col_map <- c(`1` = "#E69F00FF", `2` = "#56B4E9FF", `3` = "#009E73FF", `4` = "#F0E442FF",
+`5` = "#0072B2FF", `6` = "#D55E00FF", `7` = "#CC79A7FF", `8` = "#999999FF"
+)
+
+
+clust_cut_of_interest <- clust_cut %>%
+  mutate(row_id = seq_len(n())) %>%
+  filter(cluster %in% cluster_of_interest)
+
+write_csv(
+  clust_cut,
+  "data/okl_structural_similarity_clusters.csv"
+)
+
+
+row_anno <- createAnnotation(
+  mat_compound_info %>%
+    select(lspci_id, cluster) %>%
+    column_to_rownames("lspci_id"),
+  which = "row",
+  colors = list(cluster = \(x) ggokabeito::palette_okabe_ito(seq_len(x))),
+  structures = anno_zoom(
+    clust_cut_of_interest %>%
+      slice(
+        match(clust$order, row_id)
+      ) %>%
+      mutate(across(cluster, \(x) fct_inorder(as.character(x)))) %>%
+      split(.$cluster) %>%
+      map("row_id"),
+    \(index, nm) {
+      pushViewport(viewport(xscale = c(0, 1), yscale = c(0, 1)))
+      # grid.rect(gp = gpar(fill = "gray95", col = NA))
+      # grid.rect(
+      #   gp = gpar(
+      #     fill = cluster_col_map[nm],
+      #     col = NA,
+      #     alpha = .5
+      #   )
+      # )
+      grid.text(
+        clust_medoids$name[clust_medoids$cluster == nm],
+        x = unit(.5, "npc"), y = unit(1, "npc"),
+        just = c("center", "top"),
+        gp = gpar(fontsize = 8)
+      )
+      struct <- grImport2::readPicture(
+        file.path("plots", paste0("structure_similarity_medoid_cluster_", nm, "_", clust_medoids$name[clust_medoids$cluster == nm], ".svg"))
+      )
+      grImport2::grid.picture(
+        struct,
+        x = unit(0, "npc"), y = unit(.5, "npc"),
+        just = c("left", "center"),
+        width = unit(4, "npc"), height = unit(4, "npc")
+      )
+      popViewport()
+    },
+    which = "row", side = "right",
+    gap = unit(1, "mm"),
+    size = unit(1.5, "cm"), width = unit(3, "cm"),
+    link_gp = gpar(fill = "gray95", col = NA)
+  ),
+  annotation_width = unit(c(30, 2), "mm"),
+  gap = unit(0, "mm")
+)
+
+# Reorder annotations
+row_anno@anno_list <- rev(row_anno@anno_list)
+row_anno@anno_size <- rev(row_anno@anno_size)
+
+cluster_interpretations <- tribble(
+  ~cluster, ~interpretation,
+  3, "EGFR, VGFR, FLT3...?",
+  4, "MEK?",
+  6, "Sporines",
+  7, "Tyrosine kinase",
+  8, "Barasertib"
+)
+```
+
+```{r}
+library(dendextend)
+
+dend <- as.dendrogram(clust) %>%
+  branches_attr_by_clusters(
+    clusters = clust_cut$cluster[clust$order],
+    values = cluster_col_map[unique(clust_cut$cluster[clust$order])]
+  )
+
+```
+
+
+```{r}
+okl_tanimoto_mat_l <- okl_tanimoto_mat[clust$order, clust$order]
+okl_tanimoto_mat_l[upper.tri(okl_tanimoto_mat_l)] <- NA
+# Invert ordering again to original
+rev_order <- order(clust$order)
+okl_tanimoto_mat_l <- okl_tanimoto_mat_l[rev_order, rev_order]
+
+withr::with_pdf(
+  NULL,
+  hm <- Heatmap(
+    okl_tanimoto_mat_l,
+    name = "Tanimoto similarity",
+    # col = circlize::colorRamp2(c(0, .1, .2, .3, .4), rev(RColorBrewer::brewer.pal(5, "RdBu"))),
+    col = circlize::colorRamp2(c(0, .4), c("blue", "red")),
+    cluster_rows = dend,
+    cluster_columns = dend,
+    top_annotation = col_anno,
+    right_annotation = row_anno,
+    # left_annotation = row_anno,
+    # right_annotation = right_anno,
+    show_row_names = FALSE,
+    show_column_names = FALSE,
+    width = unit(.5, "mm") * nrow(okl_tanimoto_mat),
+    height = unit(.5, "mm") * nrow(okl_tanimoto_mat),
+    row_dend_width = unit(3, "mm"),
+    column_dend_height = unit(3, "mm")
+  ) %>%
+    draw()
+)
+
+wh <- c(convertX(ComplexHeatmap:::width(hm), "inch", valueOnly = TRUE), convertY(ComplexHeatmap:::height(hm), "inch", valueOnly = TRUE))
+
+withr::with_pdf(
+  "plots/compound_similarity_heatmap6.pdf",
+  draw(hm),
+  width = wh[1], height = wh[2]
+)
+```
+
+```{r}
+clust_cut %>%
+  filter(cluster == 3) %>%
+  pull(name) %>%
+  paste(collapse = ", ") %>%
+  clipr::write_clip()
+
+```
+
+
+```{r}
+cluster_cut_smiles <- convert_compound_descriptor(
+  with(
+    cluster_cut_structures,
+    set_names(inchi, name)
+  ),
+  "smiles"
+)
+
+cluster_cut_structures_smiles <- cluster_cut_structures %>%
+  left_join(
+    cluster_cut_smiles %>%
+      select(name = names, smiles = compounds),
+    by = "name"
+  )
+cluster_cut_structures_mcs <- cluster_cut_structures_smiles %>%
+  filter(cluster != 6) %>%
+  group_by(cluster) %>%
+  summarize(
+    mcs = {
+    message("Processing cluster ", cluster[1])
+    maximum_common_substructure(
+      with(
+        cur_data(),
+        compounds(
+          set_names(smiles, name),
+          descriptor = "smiles"
+        )
+      )
+    )
+    },
+    .groups = "drop"
+  ) %>%
+  # Manually add back sporins again
+  bind_rows(
+    cluster_cut_structures_smiles %>%
+      filter(name == "STAUROSPORINE") %>%
+      select(cluster, mcs = smiles)
+  )
+
+```
+
+```{r}
+draw_compound_grid(
+  with(
+    cluster_cut_structures_mcs,
+    compounds(
+      set_names(mcs, cluster),
+      descriptor = "smiles"
+    )
+  ),
+  file.path("plots", paste0("structural_similarity_clusters_mcs.svg"))
+  # draw_args = list(subImgSize = c(300, 300))
+  # common_core = compounds(common_substructure, descriptor = "smiles")
+)
+
+```
+
+
+```{r}
+group_walk(
+  group_by(cluster_cut_structures, cluster),
+  \(x, y) {
+    message("Processing cluster ", y$cluster)
+    # converted <- convert_compound_descriptor(
+    #   with(
+    #     x,
+    #     set_names(inchi, name)
+    #   ),
+    #   "smiles"
+    # )
+    # common_substructure <- maximum_common_substructure(
+    #   compounds(
+    #     with(
+    #       converted,
+    #       set_names(compounds, names)
+    #     ),
+    #     descriptor = "smiles"
+    #   )
+    # )
+    draw_compound_grid(
+      with(
+        x,
+        set_names(inchi, name)
+      ),
+      file.path("plots", paste0("structural_similarity_cluster_", y$cluster, "_structures.svg")),
+      draw_args = list(subImgSize = c(300, 300))
+      # common_core = compounds(common_substructure, descriptor = "smiles")
+    )
+  }
+)
+
+
+```
+
+
+```{r}
+log_kd_mat <- kinomescan_pseudo_kds %>%
+  transmute(
+    lspci_id, `DiscoveRx Gene Symbol`,
+    across(pseudo_kd, log10)
+  ) %>%
+  pivot_wider(
+    names_from = `DiscoveRx Gene Symbol`, values_from = pseudo_kd
+  ) %>%
+  column_to_rownames("lspci_id") %>%
+  as.matrix()
+
+log_kd_mat_imp <- impute.knn(
+  t(log_kd_mat), rng.seed = 42
+)[["data"]] %>%
+  t()
+
+log_kd_diff_mat <- dist(log_kd_mat_imp)
+
+log_kd_diff_df <- as.matrix(log_kd_diff_mat) %>%
+  as.data.frame() %>%
+  rownames_to_column("lspci_id_1") %>%
+  pivot_longer(
+    -lspci_id_1, names_to = "lspci_id_2", values_to = "kd_distance"
+  ) %>%
+  mutate(
+    across(starts_with("lspci_id"), as.integer)
+  )
+
+# Tanimoto similarities only contain OKL compounds, Kd similarities still all compounds
+# therefore inner_join with some missing matches
+kd_diff_vs_sim <- log_kd_diff_df %>%
+  power_inner_join(
+    okl_tanimoto_similarities %>%
+      select(lspci_id_1 = id_1, lspci_id_2 = id_2, starts_with("name_"), similarity),
+    by = c("lspci_id_1", "lspci_id_2"),
+    check = check_specs(
+      # unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  arrange(
+    match(lspci_id_1, rownames(log_kd_mat))
+  ) %>%
+  mutate(
+    across(
+      c(name_1, name_2),
+      \(x) factor(x, levels = unique(name_1))
+    )
+  )
+
+kd_diff_vs_sim_upper <- kd_diff_vs_sim %>%
+  filter(
+    as.integer(name_1) > as.integer(name_2)
+  ) %>%
+  mutate(
+    density = MASS::kde2d(
+      similarity, kd_distance,
+      n = 100
+    ) %>%
+    fields::interp.surface(
+      cbind(similarity, kd_distance)
+    )
+  ) %>%
+  power_left_join(
+    clust_cut %>%
+      select(lspci_id_1 = lspci_id, cluster_1 = cluster),
+    by = "lspci_id_1",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  power_left_join(
+    clust_cut %>%
+      select(lspci_id_2 = lspci_id, cluster_2 = cluster),
+    by = "lspci_id_2",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  mutate(
+    cluster_both = if_else(cluster_1 == cluster_2, as.character(cluster_1), "different")
+  )
+```
+
+```{r}
+kd_diff_vs_sim_lm <- lm(
+  kd_distance ~ similarity,
+  data = kd_diff_vs_sim_upper
+)
+p <- kd_diff_vs_sim_upper %>%
+  arrange(density) %>%
+  ggplot(
+    aes(
+      similarity, kd_distance, color = density
+    )
+  ) +
+  ggrastr::rasterize(geom_point(
+    shape = 16, alpha = .5, size = 1
+  ), dpi = 300) +
+  scale_color_viridis_c() +
+  labs(
+    x = "Tanimoto similarity\nMorgan fingerprints",
+    y = "RMS difference log10(pseudo Kd)"
+  )
+
+ggsave(
+  "plots/kd_diff_vs_structural_sim.pdf", p,
+  width = 4, height = 3
+)
+
+p <- kd_diff_vs_sim_upper %>%
+  mutate(
+    cluster_both = factor(cluster_both, levels = c("different", as.character(sort(unique(cluster_1)))))
+  ) %>%
+  filter(
+    cluster_1 %in% cluster_of_interest | cluster_2 %in% cluster_of_interest
+  ) %>%
+  arrange(desc(cluster_both == "different")) %>%
+  # filter(cluster_both %in% as.character(cluster_of_interest)) %>%
+  # arrange(cluster_both) %>%
+  ggplot(
+    aes(
+      similarity, kd_distance, color = cluster_both
+    )
+  ) +
+  ggrastr::rasterize(geom_point(
+    shape = 16, alpha = .8, size = 1
+  ), dpi = 300) +
+  ggokabeito::scale_color_okabe_ito() +
+  labs(
+    x = "Tanimoto similarity\nMorgan fingerprints",
+    y = "RMS difference log10(pseudo Kd)"
+  )
+
+ggsave(
+  "plots/kd_diff_vs_structural_sim_cluster_color.pdf", p,
+  width = 4, height = 3
+)
+
+
+
+```
+
+
+
+```{r}
+synStoreMany(
+  c("data/okl_structural_similarity_clusters.csv"),
+  parentId = "syn18508401",
+  forceVersion = FALSE
+)
+
+```
+
+
+
+```{r}
+
+
+```
+
+
