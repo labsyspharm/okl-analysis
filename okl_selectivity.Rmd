@@ -199,6 +199,8 @@ Check if any of our compounds fits the criteria for chemical probes. Potency <10
 and CATDSmax >.5
 
 ```{r}
+
+
 chemical_probes <- catds_max %>%
   power_inner_join(
     pseudo_kd %>%
@@ -215,6 +217,53 @@ chemical_probes <- catds_max %>%
   )
 
 
+write_csv(
+  chemical_probes %>%
+    select(where(negate(is.list))),
+  "classification/okl_eurofins_chemical_probes.csv"
+)
+
+chemical_probe_kd <- pseudo_kd %>%
+  filter(dataset == "original_repeat_replaced") %>%
+  semi_join(
+    chemical_probes,
+    by = c("lspci_id")
+  ) %>%
+  arrange(pseudo_kd) %>%
+  mutate(
+    across(`DiscoveRx Gene Symbol`, fct_inorder)
+  )
+
+p <- chemical_probe_kd %>%
+  ggplot(aes(`DiscoveRx Gene Symbol`, pseudo_kd)) +
+    geom_step() +
+    geom_point() +
+    ggrepel::geom_text_repel(
+      aes(label = paste(`DiscoveRx Gene Symbol`, signif(pseudo_kd, 2))),
+      data = \(x) filter(x, pseudo_kd < 1000),
+      max.overlaps = Inf
+    ) +
+    scale_y_log10() +
+    theme_minimal() +
+    theme(axis.text.x = element_blank(), panel.grid.major.x = element_blank())
+
+ggsave(
+  file.path("plots", "chemical_probes_kd_tak_333.pdf"),
+  p, width = 7, height = 4
+)
+
+catds %>%
+  filter(dataset == "original_repeat_replaced") %>%
+  semi_join(
+    chemical_probes,
+    by = c("lspci_id")
+  ) %>%
+  arrange(catds) %>%
+  View()
+
+catds %>%
+  count(dataset, `DiscoveRx Gene Symbol`, lspci_id, `Compound Concentration (nM)`) %>%
+  count(n)
 ```
 
 ## Partition index
