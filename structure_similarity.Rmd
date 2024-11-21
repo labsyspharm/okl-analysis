@@ -18,6 +18,9 @@ kinomescan_pseudo_kds <- syn("syn51080578") %>%
   read_csv() %>%
   filter(dataset == "original_repeat_replaced")
 
+kinomescan_classes <- syn("syn51080579") %>%
+  read_csv()
+
 compound_props <- kinomescan_pseudo_kds %>%
   distinct(lspci_id, hmsl_id, name, library)
 
@@ -146,6 +149,14 @@ createAnnotation <- function(df, colors = list(), which = "column", ...) {
 
 
 ```{r}
+kinomescan_pseudo_kds_clean <- kinomescan_pseudo_kds %>%
+  filter(
+    classification != "discordant"
+  )
+```
+
+
+```{r}
 okl_tanimoto_mat <- okl_tanimoto_similarities %>%
   select(id_1, id_2, similarity) %>%
   pivot_wider(
@@ -178,6 +189,56 @@ clust_cut %>%
   arrange(cluster) %>%
   filter(cluster %in% cluster_of_interest) %>%
   View()
+```
+
+
+```{r}
+log_kd_mat <- kinomescan_pseudo_kds_clean %>%
+  transmute(
+    lspci_id, `DiscoveRx Gene Symbol`,
+    across(pseudo_kd, log10)
+  ) %>%
+  pivot_wider(
+    names_from = `DiscoveRx Gene Symbol`, values_from = pseudo_kd
+  ) %>%
+  column_to_rownames("lspci_id") %>%
+  as.matrix()
+
+log_kd_mat_imp <- impute.knn(
+  t(log_kd_mat), rng.seed = 42
+)[["data"]] %>%
+  t()
+```
+
+```{r}
+log_kd_mat_cor <- log_kd_mat_imp %>%
+  t() %>%
+  cor(method = "kendall") %>%
+  magrittr::extract(clust$labels, clust$labels)
+
+log_kd_mat_cor_pearson <- log_kd_mat_imp %>%
+  t() %>%
+  cor(method = "pearson") %>%
+  magrittr::extract(clust$labels, clust$labels)
+
+withr::with_seed(
+  42,
+  clust_kd <- cluster_fun_eucl(2 - log_kd_mat_cor)
+)
+
+clust_cut_kd <- cutree(clust_kd, k = 8) %>%
+  enframe(name = "lspci_id", value = "cluster") %>%
+  mutate(across(lspci_id, as.integer)) %>%
+  power_left_join(
+    okl_compound_info %>%
+      select(lspci_id, name),
+    by = "lspci_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
 ```
 
 
@@ -252,7 +313,17 @@ mat_compound_info <- okl_compound_info %>%
   # mutate(across(lspci_id, as.character)) %>%
   slice(match(rownames(okl_tanimoto_mat), lspci_id)) %>%
   power_inner_join(
-    select(clust_cut, lspci_id, cluster),
+    select(clust_cut, lspci_id, cluster_tanimoto = cluster),
+    by = "lspci_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  power_inner_join(
+    select(clust_cut_kd, lspci_id, cluster_kd = cluster),
     by = "lspci_id",
     check = check_specs(
       unmatched_keys_left = "warn",
@@ -262,12 +333,12 @@ mat_compound_info <- okl_compound_info %>%
     )
   ) %>%
   mutate(
-    across(cluster, \(x) fct_inseq(as.character(x)))
+    across(starts_with("cluster"), \(x) fct_inseq(as.character(x)))
   )
 
 col_anno <- createAnnotation(
   mat_compound_info %>%
-    select(lspci_id, cluster) %>%
+    select(lspci_id, starts_with("cluster")) %>%
     column_to_rownames("lspci_id"),
   which = "column",
   colors = list(
@@ -294,10 +365,13 @@ write_csv(
 
 row_anno <- createAnnotation(
   mat_compound_info %>%
-    select(lspci_id, cluster) %>%
+    select(lspci_id, starts_with("cluster")) %>%
     column_to_rownames("lspci_id"),
   which = "row",
-  colors = list(cluster = \(x) ggokabeito::palette_okabe_ito(seq_len(x))),
+  colors = list(
+    cluster_kd = \(x) ggokabeito::palette_okabe_ito(seq_len(x)),
+    cluster_tanimoto = \(x) ggokabeito::palette_okabe_ito(seq_len(x))
+  ),
   structures = anno_zoom(
     clust_cut_of_interest %>%
       slice(
@@ -338,7 +412,7 @@ row_anno <- createAnnotation(
     size = unit(1.5, "cm"), width = unit(3, "cm"),
     link_gp = gpar(fill = "gray95", col = NA)
   ),
-  annotation_width = unit(c(30, 2), "mm"),
+  annotation_width = unit(c(30, 2, 2), "mm"),
   gap = unit(0, "mm")
 )
 
@@ -365,6 +439,11 @@ dend <- as.dendrogram(clust) %>%
     values = cluster_col_map[unique(clust_cut$cluster[clust$order])]
   )
 
+dend_kd <- as.dendrogram(clust_kd) %>%
+  branches_attr_by_clusters(
+    clusters = clust_cut_kd$cluster[clust_kd$order],
+    values = cluster_col_map[unique(clust_cut_kd$cluster[clust_kd$order])]
+  )
 ```
 
 
@@ -381,7 +460,7 @@ withr::with_pdf(
     okl_tanimoto_mat_l,
     name = "Tanimoto similarity",
     # col = circlize::colorRamp2(c(0, .1, .2, .3, .4), rev(RColorBrewer::brewer.pal(5, "RdBu"))),
-    col = circlize::colorRamp2(c(0, .4), c("blue", "red")),
+    col = circlize::colorRamp2(c(0, .2, .4), c("blue", "white", "red")),
     cluster_rows = dend,
     cluster_columns = dend,
     top_annotation = col_anno,
@@ -401,11 +480,53 @@ withr::with_pdf(
 wh <- c(convertX(ComplexHeatmap:::width(hm), "inch", valueOnly = TRUE), convertY(ComplexHeatmap:::height(hm), "inch", valueOnly = TRUE))
 
 withr::with_pdf(
-  "plots/compound_similarity_heatmap6.pdf",
+  "plots/compound_similarity_heatmap7.pdf",
   draw(hm),
   width = wh[1], height = wh[2]
 )
 ```
+
+
+
+```{r}
+okl_tanimoto_mat_l <- okl_tanimoto_mat[clust_kd$order, clust_kd$order]
+okl_tanimoto_mat_l[upper.tri(okl_tanimoto_mat_l)] <- NA
+# Invert ordering again to original
+rev_order <- order(clust_kd$order)
+okl_tanimoto_mat_l <- okl_tanimoto_mat_l[rev_order, rev_order]
+
+withr::with_pdf(
+  NULL,
+  hm <- Heatmap(
+    okl_tanimoto_mat_l,
+    name = "Tanimoto similarity",
+    # col = circlize::colorRamp2(c(0, .1, .2, .3, .4), rev(RColorBrewer::brewer.pal(5, "RdBu"))),
+    col = circlize::colorRamp2(c(0, .2, .4), c("blue", "white", "red")),
+    cluster_rows = dend_kd,
+    cluster_columns = dend_kd,
+    top_annotation = col_anno,
+    right_annotation = row_anno,
+    # left_annotation = row_anno,
+    # right_annotation = right_anno,
+    show_row_names = FALSE,
+    show_column_names = FALSE,
+    width = unit(.5, "mm") * nrow(okl_tanimoto_mat),
+    height = unit(.5, "mm") * nrow(okl_tanimoto_mat),
+    row_dend_width = unit(3, "mm"),
+    column_dend_height = unit(3, "mm")
+  ) %>%
+    draw()
+)
+
+wh <- c(convertX(ComplexHeatmap:::width(hm), "inch", valueOnly = TRUE), convertY(ComplexHeatmap:::height(hm), "inch", valueOnly = TRUE))
+
+withr::with_pdf(
+  "plots/compound_similarity_heatmap_kd_order.pdf",
+  draw(hm),
+  width = wh[1], height = wh[2]
+)
+```
+
 
 ```{r}
 clust_cut %>%
@@ -512,23 +633,274 @@ group_walk(
 
 ```
 
+```{r}
+clust_lspci_order <- clust$labels[clust$order]
+
+hm_lims <- log_kd_mat_cor_pearson[clust$labels, clust$labels] %>%
+  {.[upper.tri(.)]} %>%
+  quantile(c(.02, .98)) %>%
+  abs() %>%
+  max() %>%
+  magrittr::multiply_by(c(-1, 1))
+
+col_fun_cor <- circlize::colorRamp2(c(hm_lims[1], 0, hm_lims[2]), c("blue", "white", "red"))
+
+withr::with_pdf(
+  NULL,
+  hm <- Heatmap(
+    log_kd_mat_cor_pearson[clust$labels, clust$labels],
+    name = "Pearson correlation",
+    # col = circlize::colorRamp2(c(0, .1, .2, .3, .4), rev(RColorBrewer::brewer.pal(5, "RdBu"))),
+    col = col_fun_cor,
+    cluster_rows = dend,
+    cluster_columns = dend,
+    top_annotation = col_anno,
+    right_annotation = row_anno,
+    # left_annotation = row_anno,
+    # right_annotation = right_anno,
+    show_row_names = FALSE,
+    show_column_names = FALSE,
+    width = unit(.5, "mm") * length(clust_lspci_order),
+    height = unit(.5, "mm") * length(clust_lspci_order),
+    row_dend_width = unit(3, "mm"),
+    column_dend_height = unit(3, "mm")
+  ) %>%
+    draw()
+)
+
+# pheatmap(log_kd_mat_cor[clust_lspci_order, clust_lspci_order], cluster_rows = FALSE, cluster_cols = FALSE)
+
+wh <- c(convertX(ComplexHeatmap:::width(hm), "inch", valueOnly = TRUE), convertY(ComplexHeatmap:::height(hm), "inch", valueOnly = TRUE))
+
+withr::with_pdf(
+  "plots/compound_similarity_heatmap_kd_cor_pearson.pdf",
+  draw(hm),
+  width = wh[1], height = wh[2]
+)
+
+log_kd_mat_cor_pearson_l <- log_kd_mat_cor_pearson[clust_lspci_order, clust_lspci_order]
+log_kd_mat_cor_pearson_l[lower.tri(log_kd_mat_cor_pearson_l)] <- NA
+# Invert ordering again to original
+rev_order <- order(clust$order)
+log_kd_mat_cor_pearson_l <- log_kd_mat_cor_pearson_l[clust$labels, clust$labels]
+
+
+withr::with_pdf(
+  NULL,
+  hm <- Heatmap(
+    log_kd_mat_cor_pearson_l,
+    name = "Pearson correlation",
+    # col = circlize::colorRamp2(c(0, .1, .2, .3, .4), rev(RColorBrewer::brewer.pal(5, "RdBu"))),
+    col = col_fun_cor,
+    cluster_rows = dend,
+    cluster_columns = dend,
+    top_annotation = col_anno,
+    right_annotation = row_anno,
+    # left_annotation = row_anno,
+    # right_annotation = right_anno,
+    show_row_names = FALSE,
+    show_column_names = FALSE,
+    width = unit(.5, "mm") * length(clust_lspci_order),
+    height = unit(.5, "mm") * length(clust_lspci_order),
+    row_dend_width = unit(3, "mm"),
+    column_dend_height = unit(3, "mm")
+  ) %>%
+    draw()
+)
+
+# pheatmap(log_kd_mat_cor[clust_lspci_order, clust_lspci_order], cluster_rows = FALSE, cluster_cols = FALSE)
+
+withr::with_pdf(
+  "plots/compound_similarity_heatmap_kd_cor_pearson_l.pdf",
+  draw(hm),
+  width = wh[1], height = wh[2]
+)
+
+```
+
 
 ```{r}
-log_kd_mat <- kinomescan_pseudo_kds %>%
-  transmute(
-    lspci_id, `DiscoveRx Gene Symbol`,
-    across(pseudo_kd, log10)
-  ) %>%
-  pivot_wider(
-    names_from = `DiscoveRx Gene Symbol`, values_from = pseudo_kd
-  ) %>%
-  column_to_rownames("lspci_id") %>%
-  as.matrix()
+log_kd_mat_cor <- log_kd_mat_imp %>%
+  t() %>%
+  cor(method = "kendall")
 
-log_kd_mat_imp <- impute.knn(
-  t(log_kd_mat), rng.seed = 42
-)[["data"]] %>%
-  t()
+log_kd_mat_cor_pearson <- log_kd_mat_imp %>%
+  t() %>%
+  cor(method = "pearson")
+
+clust_lspci_order <- clust$labels[clust$order]
+
+hm_lims <- log_kd_mat_cor[clust$labels, clust$labels] %>%
+  {.[upper.tri(.)]} %>%
+  quantile(c(.02, .98)) %>%
+  abs() %>%
+  max() %>%
+  magrittr::multiply_by(c(-1, 1))
+
+col_fun_cor <- circlize::colorRamp2(c(hm_lims[1], 0, hm_lims[2]), c("blue", "white", "red"))
+
+withr::with_pdf(
+  NULL,
+  hm <- Heatmap(
+    log_kd_mat_cor[clust$labels, clust$labels],
+    name = "Pearson correlation",
+    # col = circlize::colorRamp2(c(0, .1, .2, .3, .4), rev(RColorBrewer::brewer.pal(5, "RdBu"))),
+    col = col_fun_cor,
+    cluster_rows = dend,
+    cluster_columns = dend,
+    top_annotation = col_anno,
+    right_annotation = row_anno,
+    # left_annotation = row_anno,
+    # right_annotation = right_anno,
+    show_row_names = FALSE,
+    show_column_names = FALSE,
+    width = unit(.5, "mm") * length(clust_lspci_order),
+    height = unit(.5, "mm") * length(clust_lspci_order),
+    row_dend_width = unit(3, "mm"),
+    column_dend_height = unit(3, "mm")
+  ) %>%
+    draw()
+)
+
+# pheatmap(log_kd_mat_cor[clust_lspci_order, clust_lspci_order], cluster_rows = FALSE, cluster_cols = FALSE)
+
+wh <- c(convertX(ComplexHeatmap:::width(hm), "inch", valueOnly = TRUE), convertY(ComplexHeatmap:::height(hm), "inch", valueOnly = TRUE))
+
+withr::with_pdf(
+  "plots/compound_similarity_heatmap_kd_cor.pdf",
+  draw(hm),
+  width = wh[1], height = wh[2]
+)
+
+log_kd_mat_cor_l <- log_kd_mat_cor[clust_lspci_order, clust_lspci_order]
+log_kd_mat_cor_l[lower.tri(log_kd_mat_cor_l)] <- NA
+# Invert ordering again to original
+rev_order <- order(clust$order)
+log_kd_mat_cor_l <- log_kd_mat_cor_l[clust$labels, clust$labels]
+
+
+withr::with_pdf(
+  NULL,
+  hm <- Heatmap(
+    log_kd_mat_cor_l,
+    name = "Pearson correlation",
+    # col = circlize::colorRamp2(c(0, .1, .2, .3, .4), rev(RColorBrewer::brewer.pal(5, "RdBu"))),
+    col = col_fun_cor,
+    cluster_rows = dend,
+    cluster_columns = dend,
+    top_annotation = col_anno,
+    right_annotation = row_anno,
+    # left_annotation = row_anno,
+    # right_annotation = right_anno,
+    show_row_names = FALSE,
+    show_column_names = FALSE,
+    width = unit(.5, "mm") * length(clust_lspci_order),
+    height = unit(.5, "mm") * length(clust_lspci_order),
+    row_dend_width = unit(3, "mm"),
+    column_dend_height = unit(3, "mm")
+  ) %>%
+    draw()
+)
+
+# pheatmap(log_kd_mat_cor[clust_lspci_order, clust_lspci_order], cluster_rows = FALSE, cluster_cols = FALSE)
+
+withr::with_pdf(
+  "plots/compound_similarity_heatmap_kd_cor_l.pdf",
+  draw(hm),
+  width = wh[1], height = wh[2]
+)
+
+```
+
+
+```{r}
+clust_lspci_order <- clust_kd$labels[clust_kd$order]
+
+hm_lims <- log_kd_mat_cor[clust_kd$labels, clust_kd$labels] %>%
+  {.[upper.tri(.)]} %>%
+  quantile(c(.02, .98)) %>%
+  abs() %>%
+  max() %>%
+  magrittr::multiply_by(c(-1, 1))
+
+col_fun_cor <- circlize::colorRamp2(c(hm_lims[1], 0, hm_lims[2]), c("blue", "white", "red"))
+
+withr::with_pdf(
+  NULL,
+  hm <- Heatmap(
+    log_kd_mat_cor[clust_kd$labels, clust_kd$labels],
+    name = "Pearson correlation",
+    # col = circlize::colorRamp2(c(0, .1, .2, .3, .4), rev(RColorBrewer::brewer.pal(5, "RdBu"))),
+    col = col_fun_cor,
+    cluster_rows = dend_kd,
+    cluster_columns = dend_kd,
+    top_annotation = col_anno,
+    right_annotation = row_anno,
+    # left_annotation = row_anno,
+    # right_annotation = right_anno,
+    show_row_names = FALSE,
+    show_column_names = FALSE,
+    width = unit(.5, "mm") * length(clust_lspci_order),
+    height = unit(.5, "mm") * length(clust_lspci_order),
+    row_dend_width = unit(3, "mm"),
+    column_dend_height = unit(3, "mm")
+  ) %>%
+    draw()
+)
+
+# pheatmap(log_kd_mat_cor[clust_lspci_order, clust_lspci_order], cluster_rows = FALSE, cluster_cols = FALSE)
+
+wh <- c(convertX(ComplexHeatmap:::width(hm), "inch", valueOnly = TRUE), convertY(ComplexHeatmap:::height(hm), "inch", valueOnly = TRUE))
+
+withr::with_pdf(
+  "plots/compound_similarity_heatmap_kd_cor_kd_order.pdf",
+  draw(hm),
+  width = wh[1], height = wh[2]
+)
+
+log_kd_mat_cor_l <- log_kd_mat_cor[clust_lspci_order, clust_lspci_order]
+log_kd_mat_cor_l[lower.tri(log_kd_mat_cor_l)] <- NA
+# Invert ordering again to original
+rev_order <- order(clust_kd$order)
+log_kd_mat_cor_l <- log_kd_mat_cor_l[clust_kd$labels, clust_kd$labels]
+
+
+withr::with_pdf(
+  NULL,
+  hm <- Heatmap(
+    log_kd_mat_cor_l,
+    name = "Pearson correlation",
+    # col = circlize::colorRamp2(c(0, .1, .2, .3, .4), rev(RColorBrewer::brewer.pal(5, "RdBu"))),
+    col = col_fun_cor,
+    cluster_rows = dend_kd,
+    cluster_columns = dend_kd,
+    top_annotation = col_anno,
+    right_annotation = row_anno,
+    # left_annotation = row_anno,
+    # right_annotation = right_anno,
+    show_row_names = FALSE,
+    show_column_names = FALSE,
+    width = unit(.5, "mm") * length(clust_lspci_order),
+    height = unit(.5, "mm") * length(clust_lspci_order),
+    row_dend_width = unit(3, "mm"),
+    column_dend_height = unit(3, "mm")
+  ) %>%
+    draw()
+)
+
+# pheatmap(log_kd_mat_cor[clust_lspci_order, clust_lspci_order], cluster_rows = FALSE, cluster_cols = FALSE)
+
+withr::with_pdf(
+  "plots/compound_similarity_heatmap_kd_cor_l_kd_order.pdf",
+  draw(hm),
+  width = wh[1], height = wh[2]
+)
+
+```
+
+
+
+```{r}
 
 log_kd_diff_mat <- dist(log_kd_mat_imp)
 
