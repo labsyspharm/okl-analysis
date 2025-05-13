@@ -934,6 +934,47 @@ ggsave(
   "classification/class_examples.pdf", p, width = 14, height = 12
 )
 
+
+library(egg)
+set.seed(42)
+p <- single_dose_classification %>%
+  group_by(classification) %>%
+  slice_sample(n = 3) %>%
+  ungroup() %>%
+  mutate(binding_name = paste(name, `Entrez Gene Symbol`, sep = " - ")) %>%
+  unnest(data) %>%
+  ggplot(aes(`Compound Concentration (nM)`, `Percent Control`)) +
+    geom_rect(
+      aes(fill = classification, xmin = 10, xmax = 10000,
+      ymin = 0, ymax = 100),
+      alpha = 0.5,
+      data = ~.x %>%
+        distinct(binding_name, classification),
+      inherit.aes = FALSE
+    ) +
+    geom_point() +
+    geom_line() +
+    scale_x_log10() +
+    geom_hline(yintercept = 35) +
+    facet_wrap(~classification + binding_name) +
+    coord_cartesian(clip = "off")
+    # geom_custom(
+    #   data = ~.x %>%
+    #     distinct(binding_name, classification),
+    #   mapping = aes(fill = classification),
+    #   grob_fun = function(x) rectGrob(gp=gpar(fill=fill,col=NA, alpha=0.5)),
+    #   inherit.aes = TRUE
+    # ) +
+    # geom_text(
+    #   aes(label = paste(round(estimate, digits = 1), signif(p.value, digits = 2))),
+    #   data = ~.x %>%
+    #     distinct(classification, binding_name, estimate, p.value),
+    #   x = 20, y = 20
+    # )
+ggsave(
+  "classification/class_examples_small.pdf", p, width = 7, height = 5.5
+)
+
 single_dose_classification %>%
   filter(
     name == "SILMITASERTIB",
@@ -968,19 +1009,20 @@ p <- single_dose_classification %>%
       max.overlaps = Inf,
       max.iter = 50000,
       max.time = 2,
-      size = 3
+      size = 3,
+      seed = 42
     ) +
     labs(
       x = "Proportion of binding dose-response curves",
       y = "Proportion of discordant dose-response curves",
       title = "Discordant vs binding per compound"
     ) +
-    scale_x_continuous(labels = scales::percent) +
+    scale_x_continuous(labels = scales::percent, expand = expansion(mult = c(.15, .05))) +
     scale_y_continuous(labels = scales::percent) +
     facet_wrap(~dataset)
 
 ggsave(
-  "classification/discordant_vs_binding.pdf", p, width = 12, height = 7
+  "classification/discordant_vs_binding.pdf", p, width = 10, height = 5
 )
 
 
@@ -1010,19 +1052,20 @@ p <- single_dose_classification %>%
       max.overlaps = Inf,
       max.iter = 50000,
       max.time = 2,
-      size = 3
+      size = 3,
+      seed = 42
     ) +
     labs(
       x = "Proportion of binding dose-response curves",
       y = "Proportion of discordant dose-response curves",
       title = "Discordant vs binding per kinase"
     ) +
-    scale_x_continuous(labels = scales::percent) +
+    scale_x_continuous(labels = scales::percent, expand = expansion(mult = c(.1, .05))) +
     scale_y_continuous(labels = scales::percent) +
     facet_wrap(~dataset)
 
 ggsave(
-  "classification/discordant_vs_binding_kinases.pdf", p, width = 12, height = 7
+  "classification/discordant_vs_binding_kinases.pdf", p, width = 10, height = 5
 )
 
 ```

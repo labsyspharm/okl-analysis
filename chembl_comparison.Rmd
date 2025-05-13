@@ -2657,6 +2657,7 @@ single_dose_comp_roc_plots <- single_dose_comp_proc_scores_best_and_series_and_a
     # force = 2,
     seed = 42,
     max.overlaps = Inf
+    # size = 2
   ) +
   # ggokabeito::scale_color_okabe_ito() +
   scale_color_brewer(palette = "Set2") +
@@ -2664,6 +2665,109 @@ single_dose_comp_roc_plots <- single_dose_comp_proc_scores_best_and_series_and_a
     x = "1 - Specificity TN / (TN + FP)",
     y = "Sensitivity TP / (TP + FN)",
     color = "Assay concentration",
+    title = "ROC curves for prediction of Kd < threshold"
+  ) +
+  facet_wrap(~kd_threshold, nrow = 1) +
+  scale_x_continuous(
+    breaks = seq(from = 0, to = 1, by = 0.2)
+  ) +
+  scale_y_continuous(
+    breaks = seq(from = 0, to = 1, by = 0.2)
+  ) +
+  coord_fixed(
+    xlim = c(-.3, 1),
+    ylim = c(0, 1.3)
+  ) +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(
+  "plots/percent_control_kd_roc_new.pdf",
+  single_dose_comp_roc_plots,
+  width = 16, height = 6
+)
+```
+
+Alternative version with symbols for quartiles
+
+
+```{r}
+
+single_dose_comp_roc_plots <- single_dose_comp_proc_scores_best_and_series_and_all %>%
+  # filter(
+  #   kd_threshold %in% c(100, 1000, 5000)
+  # ) %>%
+  mutate(
+    point_label = case_when(
+      point_type == "series" ~ paste0(threshold_label, "%"),
+      point_type == "best" ~ "optimal",
+      TRUE ~ ""
+    )
+  ) %>%
+  ggplot(
+    aes(
+      1 - specificity, sensitivity,
+      color = fct_inorder(
+        as.character(`Compound Concentration (nM)`)
+      )
+    )
+  ) +
+  geom_line() +
+  geom_point(
+    aes(
+      shape = point_label
+    ),
+    data = \(x) filter(
+      x,
+      point_label != ""
+    ),
+    size = 4,
+    alpha = .8
+  ) +
+  geom_text_repel(
+    aes(
+      label = threshold_label,
+      # fontface = if_else(point_type == "best", "bold", "plain")
+    ),
+    # data = \(x) mutate(
+    #   x,
+    #   threshold_label = if_else(
+    #     point_type == "best",
+    #     threshold_label,
+    #     ""
+    #   )
+    # ),
+    data = \(x) filter(
+      x,
+      point_type == "best"
+    ) %>%
+      mutate(
+        threshold_label = str_replace(threshold_label, fixed("*"), "%")
+      ),
+    box.padding = 0.5,
+    show.legend = FALSE,
+    max.iter = 50000,
+    max.time = 2,
+    # force = 2,
+    seed = 42,
+    max.overlaps = Inf
+  ) +
+  scale_shape_manual(
+    values = c(
+      "optimal" = "\u272d",
+      "25%" = "\u25bc",
+      "50%" = "\u25ef",
+      "75%" = "\u25b2"
+    )
+  ) +
+  # ggokabeito::scale_color_okabe_ito() +
+  scale_color_brewer(palette = "Set2") +
+  labs(
+    x = "1 - Specificity TN / (TN + FP)",
+    y = "Sensitivity TP / (TP + FN)",
+    color = "Assay concentration",
+    shape = "%remaining threshold",
     title = "ROC curves for prediction of Kd < threshold"
   ) +
   facet_wrap(~kd_threshold, nrow = 1) +
@@ -2682,9 +2786,9 @@ single_dose_comp_roc_plots <- single_dose_comp_proc_scores_best_and_series_and_a
   )
 
 ggsave(
-  "plots/percent_control_kd_roc_new.pdf",
+  "plots/percent_control_kd_roc_new_symbols.pdf",
   single_dose_comp_roc_plots,
-  width = 12, height = 4
+  width = 12, height = 4, device = cairo_pdf
 )
-```
 
+```

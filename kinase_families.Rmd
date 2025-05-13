@@ -657,4 +657,9 @@ hm <- Heatmap(
   show_column_names = FALSE,
   show_row_names = FALSE
 )
+
+withr::with_pdf(
+  file.path("plots", "pseudo_kd_heatmap_with_structure_clusters.pdf"),
+  draw(hm), width = 8, height = 10
+)
 ```
