@@ -2365,6 +2365,25 @@ param_comparison_table_optim_vs_flat_best_doses_coral %>%
   count(
     change_class
   )
+# # A tibble: 2 × 2
+#   change_class     n
+#   <chr>        <int>
+# 1 FP->TN          30
+# 2 same           334
+
+param_comparison_table_optim_vs_flat_best_doses_coral %>%
+  filter(name == "RUXOLITINIB", kd_threshold == 1000) %>%
+  count(
+    hit_class_optim, hit_class_flat
+  )
+# # A tibble: 5 × 3
+#   hit_class_optim hit_class_flat     n
+#   <chr>           <chr>          <int>
+# 1 FN              FN                 2
+# 2 FP              FP                64
+# 3 TN              FP                30
+# 4 TN              TN               212
+# 5 TP              TP                56
 
 param_comparison_table_optim_vs_flat_best_doses_coral %>%
   filter(name == "RUXOLITINIB", kd_threshold == 1000) %>%
@@ -2504,9 +2523,9 @@ single_dose_comp_proc_scores_best_and_series_and_all <- single_dose_comp_proc_sc
   ) %>%
   bind_rows(
     anti_join(
-      get_scores_for_thresholds(seq(from = 25, to = 75, by = 25)) %>%
+      get_scores_for_thresholds(35) %>%
         mutate(
-          point_type = "series"
+          point_type = "flat"
         ),
       .,
       by = join_by(`Compound Concentration (nM)`, kd_threshold, threshold)
@@ -2515,13 +2534,13 @@ single_dose_comp_proc_scores_best_and_series_and_all <- single_dose_comp_proc_sc
   mutate(
     point_type = replace_na(point_type, "all"),
     threshold_label = case_when(
-      point_type == "best" ~ paste0(threshold, "*"),
-      point_type == "series" ~ as.character(threshold),
+      point_type == "best" ~ paste0("*", signif(threshold, 2), "%"),
+      point_type == "flat" ~ paste0(as.character(signif(threshold, 2)), "%"),
       TRUE ~ ""
     )
   ) %>%
   left_join(
-    filter(., point_type %in% c("best", "series")) %>%
+    filter(., point_type %in% c("best", "flat")) %>%
       group_by(`Compound Concentration (nM)`, kd_threshold) %>%
       arrange(threshold, .by_group = TRUE) %>%
       mutate(
@@ -2539,7 +2558,7 @@ single_dose_comp_proc_scores_best_and_series_and_all <- single_dose_comp_proc_sc
   )
 
 single_dose_comp_proc_scores_best_and_series <- single_dose_comp_proc_scores_best_and_series_and_all %>%
-  filter(point_type %in% c("best", "series")) %>%
+  filter(point_type %in% c("best", "flat")) %>%
   group_by(`Compound Concentration (nM)`, kd_threshold) %>%
   arrange(threshold, .by_group = TRUE) %>%
   mutate(
@@ -2614,7 +2633,7 @@ single_dose_comp_pr_plots <- single_dose_comp_proc_scores_best_and_series_and_al
   )
 
 ggsave(
-  "plots/percent_control_kd_pr_new.pdf",
+  "plots/percent_control_kd_pr_flat.pdf",
   single_dose_comp_pr_plots,
   width = 12, height = 4
 )
@@ -2683,7 +2702,7 @@ single_dose_comp_roc_plots <- single_dose_comp_proc_scores_best_and_series_and_a
   )
 
 ggsave(
-  "plots/percent_control_kd_roc_new.pdf",
+  "plots/percent_control_kd_roc_flat.pdf",
   single_dose_comp_roc_plots,
   width = 16, height = 6
 )
