@@ -1639,7 +1639,10 @@ ps <- single_dose_comp %>%
         arrange(density) %>%
       # ggplot(cur_data(), aes(value, percent_control_trans, shape = percent_control_zero)) +
       ggplot(aes(chembl_kd, `Percent Control`, color = density)) +
-        geom_point(alpha = 0.8, shape = 16) +
+        ggrastr::rasterize(
+          geom_point(alpha = 0.8, shape = 16),
+          dpi = 300, dev = "ragg"
+        ) +
         scale_color_viridis_c(
           trans = "log10",
           breaks = scales::log_breaks(base = 10),
