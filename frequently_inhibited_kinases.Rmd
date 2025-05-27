@@ -12,6 +12,7 @@ library(here)
 library(fst)
 library(data.table)
 library(powerjoin)
+library(qs)
 # library(dtplyr)
 
 theme_set(theme_minimal())
@@ -494,6 +495,223 @@ pseudo_kds_n_inhibited %>%
   clipr::write_clip()
 ```
 
+```{r}
+pulp_inputs <- list(
+  most_inhibited = most_inhibited,
+  most_targets = most_targets
+) %>%
+  imap(\(x, y) group_nest(x, cutoff, .key = paste0(y, "_data"))) %>%
+  reduce(left_join, by = "cutoff") %>%
+  mutate(
+    pulp_output = here("data", paste("random_matrices_cutoff", cutoff, "nM.csv", sep = "_"))
+  )
+
+library(processx)
+
+pulp_python <- "/opt/miniconda3/envs/pulp/bin/python"
+
+pulp_output <- run(
+  pulp_python,
+  args = c(
+    here("generate_binary_matrix.py"),
+    "--n_matrices", 5,
+    "--rows", paste(pulp_inputs$most_inhibited_data[[1]]$n_inhibitors, collapse = ", "),
+    "--columns", paste(pulp_inputs$most_targets_data[[1]]$n_targets, collapse = ", "),
+    "--output", pulp_inputs$pulp_output[[1]],
+    "--max_workers", 8
+  ),
+  echo = TRUE
+)
+
+x <- read_csv(pulp_inputs$pulp_output[[1]])
+
+pulp_outputs <- pulp_inputs %>%
+  mutate(
+    pulp_output = pmap(
+      .,
+      \(most_inhibited_data, most_targets_data, pulp_output, ...) {
+        run(
+          pulp_python,
+          args = c(
+            here("generate_binary_matrix.py"),
+            "--n_matrices", 1000,
+            "--rows", paste(most_inhibited_data$n_inhibitors, collapse = ", "),
+            "--columns", paste(most_targets_data$n_targets, collapse = ", "),
+            "--output", pulp_output,
+            "--max_workers", 8
+          ),
+          echo = TRUE
+        )
+        read_csv(pulp_output)
+      }
+    )
+  )
+
+qsave(
+  pulp_outputs,
+  here("data", "random_matrices.qs")
+)
+```
+
+
+```{r}
+pulp_outputs_long <- pulp_outputs %>%
+  mutate(
+    pulp_output = pmap(
+      .,
+      \(most_inhibited_data, most_targets_data, pulp_output, ...) {
+        mutate(
+          pulp_output,
+          `DiscoveRx Gene Symbol` = most_inhibited_data$`DiscoveRx Gene Symbol`[Row + 1],
+          lspci_id = most_targets_data$lspci_id[Col + 1],
+        )
+      }
+    )
+  ) %>%
+  select(cutoff, pulp_output) %>%
+  unnest(pulp_output)
+
+```
+
+
+```{r}
+pulp_top15_together <- pulp_outputs_long %>%
+  semi_join(
+    most_inhibited %>%
+      arrange(desc(n_inhibitors)) %>%
+      group_by(cutoff) %>%
+      slice_head(n = TOP_N) %>%
+      ungroup(),
+    by = c("DiscoveRx Gene Symbol", "cutoff")
+  ) %>%
+  count(
+    cutoff, Matrix, lspci_id
+  )
+
+real_top15_together <- pseudo_kds_dedup %>%
+  crossing(cutoff = CUTOFFS) %>%
+  filter(pseudo_kd <= cutoff) %>%
+  semi_join(
+    most_inhibited %>%
+      arrange(desc(n_inhibitors)) %>%
+      group_by(cutoff) %>%
+      slice_head(n = TOP_N) %>%
+      ungroup(),
+    by = c("DiscoveRx Gene Symbol", "cutoff")
+  ) %>%
+  count(
+    cutoff, lspci_id, name
+  )
+
+real_and_pulp_top15_together <- bind_rows(
+  real_top15_together %>%
+    mutate(Matrix = -1) %>%
+    select(-name),
+  pulp_top15_together
+)
+```
+
+
+```{r}
+p <- real_and_pulp_top15_together %>%
+  group_by(
+    n_kinases = n,
+    cutoff, Matrix
+  ) %>%
+  summarize(
+    n_inhibitors = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(
+    aes(fct_inseq(as.character(n_kinases)), n_inhibitors)
+  ) +
+  ggbeeswarm::geom_quasirandom(
+    dodge.width = .5,
+    alpha = 0.5, orientation = "x",
+    shape = 16,
+    data = \(x) filter(x, Matrix >= 0)
+  ) +
+  geom_point(
+    data = \(x) filter(x, Matrix == -1),
+    size = 3,
+    shape = 16,
+    color = "red"
+  ) +
+  facet_wrap(~cutoff) +
+  # geom_text(
+  #   aes(label = signif(p, 2)),
+  #   y = Inf,
+  #   vjust = 1,
+  #   data = random_and_real_1000_n_overlap_top_15_kinases_n_inhibs_per_group_p
+  # ) +
+  labs(
+    x = "Number of top 15 kinases hit",
+    y = "Number of inhibitors"
+  )
+
+ggsave(
+  here("plots", "overlap_stats_real_and_pulp_top15_together_raw_distribution.pdf"),
+  p, width = 8, height = 4
+)
+```
+
+
+
+```{r}
+overlap_stats_real_and_pulp_top15_together <- real_and_pulp_top15_together %>%
+  mutate(
+    over = choose(n, 2)
+  ) %>%
+  group_by(
+    cutoff, Matrix
+  ) %>%
+  summarize(
+    over_sum = sum(over),
+    .groups = "drop"
+  )
+
+overlap_stats_real_and_pulp_top15_together_p <- overlap_stats_real_and_pulp_top15_together %>%
+  group_by(cutoff) %>%
+  summarize(
+    p = (1 + sum(over_sum[Matrix == -1] <= over_sum[Matrix >= 0])) / (n() + 1),
+    .groups = "drop"
+  )
+
+p <- overlap_stats_real_and_pulp_top15_together %>%
+  ggplot(
+    aes(fct_inseq(as.character(cutoff)), over_sum)
+  ) +
+  ggbeeswarm::geom_quasirandom(
+    # dodge.width = .5,
+    alpha = 0.5,
+    orientation = "x",
+    shape = 16,
+    data = \(x) filter(x, Matrix >= 0)
+  ) +
+  geom_point(
+    data = \(x) filter(x, Matrix == -1),
+    size = 3,
+    shape = 16,
+    color = "red"
+  ) +
+  geom_text(
+    aes(label = paste("p =", signif(p, 2))),
+    y = Inf,
+    vjust = 1,
+    hjust = .5,
+    data = overlap_stats_real_and_pulp_top15_together_p
+  ) +
+  labs(
+    x = "Kd cutoff",
+    y = "Pairwise co-inhibition count"
+  )
+p
+
+ggsave(
+  here("plots", "overlap_stats_real_and_pulp_top15_together.pdf"),
+  p, width = 3, height = 3
+)
+```
 
 ```{r}
 hgnc_id_map <- pseudo_kds_inhibited %>%
