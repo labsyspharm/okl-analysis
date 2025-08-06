@@ -53,6 +53,8 @@ lsp_clinical <- syn("syn26260451") %>%
 
 ## Frequency nominal in top X targets
 
+Is this taking care of ties?
+
 ```{r}
 nominal_targets_unique <- nominal_targets %>%
   filter(!is.na(`DiscoveRx Gene Symbol`), `DiscoveRx Gene Symbol` != "n/a") %>%
@@ -95,7 +97,7 @@ pseudo_kds_nominal_target_sorted <- kinomescan_pseudo_kds %>%
   ) %>%
   group_by(lspci_id) %>%
   mutate(
-    rank = seq_len(n())
+    rank = rank(pseudo_kd, ties.method = "first")
   ) %>%
   ungroup()
 
