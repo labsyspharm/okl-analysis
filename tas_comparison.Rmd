@@ -29,6 +29,8 @@ pseudo_kds <- syn("syn51080578") %>%
     read_csv()
 compound_stats <- syn("syn52624367") %>%
     read_csv()
+compound_props <- pseudo_kds %>%
+  distinct(lspci_id, hmsl_id, name, library)
 ```
 
 ```{r}
@@ -52,6 +54,12 @@ tas_reduced %>%
 
 Produce clustered heatmap of TAS values that were available for the
 OKL before we did Kinomescan.
+
+
+
+**Add filter for only OKL compounds**
+**Add average number of measurements going into Pre-OKL calculation**
+**Is discrepancy between Pre-OKL and Post-OKL TAS values due to Klaeger measurements**
 
 ```{r}
 library(seriation)
@@ -393,8 +401,457 @@ ggsave(
     "plots/tas_alluvial.pdf",
     p, width = 3, height = 5
 )
+
+tas_clustered_both_alluvial %>%
+    filter(added == "added")
+
+tas_clustered_both_alluvial %>%
+    filter(OKL != `Pre-OKL`)
+
+tas_clustered_both_alluvial %>%
+    filter(
+        OKL != `Pre-OKL`,
+        OKL != "no data",
+        `Pre-OKL` != "no data"
+    ) %>%
+    inner_join(
+        tas_clustered_both_alluvial %>%
+            group_by(`Pre-OKL`) %>%
+            summarize(
+                total_freq_pre_okl = sum(freq),
+                .groups = "drop"
+            ),
+        by = "Pre-OKL"
+    ) %>%
+    inner_join(
+        tas_clustered_both_alluvial %>%
+            group_by(OKL) %>%
+            summarize(
+                total_freq_okl = sum(freq),
+                .groups = "drop"
+            ),
+        by = "OKL"
+    ) %>%
+    mutate(
+        prop_pre_okl = freq / total_freq_pre_okl,
+        prop_okl = freq / total_freq_okl
+    ) %>%
+    select(`Pre-OKL`, OKL, everything())
+```
+# A tibble: 4 × 4
+  OKL   `Pre-OKL`  freq added
+  <fct> <fct>     <int> <fct>
+1 10    no data   14962 added
+2 3     no data    3860 added
+3 2     no data    2928 added
+4 1     no data    1301 added
+
+# A tibble: 20 × 4
+   OKL     `Pre-OKL`  freq added
+   <fct>   <fct>     <int> <fct>
+ 1 10      no data   14962 added
+ 2 10      3          3870 existing
+ 3 3       no data    3860 added
+ 4 3       10         3247 existing
+ 5 2       no data    2928 added
+ 6 2       10         1721 existing
+ 7 2       3          1376 existing
+ 8 1       no data    1301 added
+ 9 no data 10         1036 existing
+10 1       2           711 existing
+11 1       10          503 existing
+12 3       2           483 existing
+13 2       1           378 existing
+14 no data 3           353 existing
+15 1       3           352 existing
+16 10      2           162 existing
+17 no data 2            99 existing
+18 3       1            51 existing
+19 10      1            30 existing
+20 no data 1            27 existing
+
+# A tibble: 12 × 8
+   `Pre-OKL` OKL    freq added    total_freq_pre_okl total_freq_okl prop_pre_okl prop_okl
+   <fct>     <fct> <int> <fct>                 <int>          <int>        <dbl>    <dbl>
+ 1 3         10     3870 existing               8206          40304       0.472  0.0960
+ 2 10        3      3247 existing              27787           9896       0.117  0.328
+ 3 10        2      1721 existing              27787           7971       0.0619 0.216
+ 4 3         2      1376 existing               8206           7971       0.168  0.173
+ 5 2         1       711 existing               3023           4591       0.235  0.155
+ 6 10        1       503 existing              27787           4591       0.0181 0.110
+ 7 2         3       483 existing               3023           9896       0.160  0.0488
+ 8 1         2       378 existing               2210           7971       0.171  0.0474
+ 9 3         1       352 existing               8206           4591       0.0429 0.0767
+10 2         10      162 existing               3023          40304       0.0536 0.00402
+11 1         3        51 existing               2210           9896       0.0231 0.00515
+12 1         10       30 existing               2210          40304       0.0136 0.000744
+
+range of measurement coverage old / new
+
+proportions of TAS values old/ new
+
+```{r}
+tas_clustered_both_2 %>%
+    group_by(dataset, tas) %>%
+    summarize(
+        n = n(),
+        .groups = "drop"
+    ) %>%
+    group_by(dataset) %>%
+    mutate(
+        frac = signif(n / sum(n), 2),
+        frac_non_missing = signif(if_else(tas == "no data", NA, n) / sum(n[tas != "no data"]), 2)
+    ) %>%
+    ungroup()
+
 ```
 
+# A tibble: 10 × 5
+   dataset tas         n  frac frac_non_missing
+   <chr>   <fct>   <int> <dbl>            <dbl>
+ 1 OKL     1        4591 0.071            0.073
+ 2 OKL     2        7971 0.12             0.13
+ 3 OKL     3        9896 0.15             0.16
+ 4 OKL     10      40304 0.62             0.64
+ 5 OKL     no data  2310 0.035           NA
+ 6 Pre-OKL 1        2210 0.034            0.054
+ 7 Pre-OKL 2        3023 0.046            0.073
+ 8 Pre-OKL 3        8206 0.13             0.2
+ 9 Pre-OKL 10      27787 0.43             0.67
+10 Pre-OKL no data 23846 0.37            NA
+
+
+```{r}
+tas_clustered_both_2 %>%
+    group_by(dataset, lspci_id) %>%
+    summarize(
+        n_tas = sum(tas != "no data"),
+        frac_tas = n_tas / n(),
+        .groups = "drop"
+    ) %>%
+    group_by(dataset) %>%
+    summarize(
+        across(-lspci_id, median)
+    )
+
+tas_clustered_both_2 %>%
+    group_by(dataset, hgnc_symbol) %>%
+    summarize(
+        n_tas = sum(tas != "no data"),
+        frac_tas = n_tas / n(),
+        .groups = "drop"
+    ) %>%
+    group_by(dataset) %>%
+    summarize(
+        across(-hgnc_symbol, median)
+    )
+```
+
+Compound
+# A tibble: 2 × 3
+  dataset n_tas frac_tas
+  <chr>   <dbl>    <dbl>
+1 OKL       382    0.974
+2 Pre-OKL   237    0.605
+
+Kinase
+# A tibble: 2 × 3
+  dataset n_tas frac_tas
+  <chr>   <dbl>    <dbl>
+1 OKL       165    0.994
+2 Pre-OKL   111    0.669
+
+Checking if any kinase or compound are enriched in the set of
+measurements that disagree with the original TAS values.
+
+
+```{r}
+tas_pre_okl_vs_okl <- tas_clustered_both_2 %>%
+    mutate(
+        dataset = factor(dataset, levels = c("Pre-OKL", "OKL")),
+        across(lspci_id, \(x) as.double(as.character(lspci_id)))
+    ) %>%
+    select(dataset, lspci_id, hgnc_symbol, tas) %>%
+    pivot_wider(names_from = dataset, values_from = tas) %>%
+    mutate(
+        binding_OKL = case_when(
+            as.integer(OKL) < 3 ~ "binding",
+            OKL == "10" ~ "non-binding",
+            TRUE ~ "undefined"
+        ),
+        binding_Pre_OKL = case_when(
+            as.integer(`Pre-OKL`) < 3 ~ "binding",
+            `Pre-OKL` == "10" ~ "non-binding",
+            TRUE ~ "undefined"
+        ),
+        switch = case_when(
+            as.integer(OKL) < 3 & `Pre-OKL` == "10" ~ "switch-binding",
+            as.integer(`Pre-OKL`) < 3 & OKL == "10" ~ "switch-non-binding",
+            TRUE ~ "no-switch"
+        )
+    ) %>%
+    power_inner_join(
+        compound_props %>%
+            distinct(lspci_id, hmsl_id, name, library),
+        by = "lspci_id",
+        check = check_specs(
+            unmatched_keys_left = "warn",
+            duplicate_keys_right = "warn"
+        )
+    )
+
+compound_stats <- tas_clustered_both_2 %>%
+    mutate(
+        across(lspci_id, \(x) as.double(as.character(lspci_id)))
+    ) %>%
+    rename(
+        `Pre-OKL` = tas,
+        `OKL` = tas_pseudo_kd
+    ) %>%
+    group_by(lspci_id) %>%
+    summarize(
+        across(
+            c(`Pre-OKL`, OKL),
+            .fns = list(
+                binding = \(x) sum(as.integer(x) < 3, na.rm = TRUE),
+                non_binding = \(x) sum(x == "10", na.rm = TRUE)
+            ),
+            .names = "n_{fn}_{col}"
+        ),
+        .groups = "drop"
+    )
+
+kinase_stats <- tas_clustered_both_2 %>%
+    rename(
+        `Pre-OKL` = tas,
+        `OKL` = tas_pseudo_kd
+    ) %>%
+    group_by(hgnc_symbol) %>%
+    summarize(
+        across(
+            c(`Pre-OKL`, OKL),
+            .fns = list(
+                binding = \(x) sum(as.integer(x) < 3, na.rm = TRUE),
+                non_binding = \(x) sum(x == "10", na.rm = TRUE)
+            ),
+            .names = "n_{fn}_{col}"
+        ),
+        .groups = "drop"
+    )
+
+x <- table(
+    tas_pre_okl_vs_okl %>%
+        filter(lspci_id == 86423) %>%
+        select(
+            binding_OKL, binding_Pre_OKL
+        )
+)
+DescTools::StuartMaxwellTest(x)
+
+y <- table(
+    tas_pre_okl_vs_okl %>%
+        filter(
+            lspci_id == 86423,
+            binding_OKL != "undefined",
+            binding_Pre_OKL != "undefined"
+        ) %>%
+        select(
+            binding_OKL, binding_Pre_OKL
+        )
+)
+fisher.test(y)
+
+switch_stats_compounds <- tas_pre_okl_vs_okl %>%
+    filter(switch != "no-switch") %>%
+    count(lspci_id, name, switch) %>%
+    arrange(desc(n)) %>%
+    power_left_join(
+        compound_stats,
+        by = "lspci_id",
+        check = check_specs(
+            unmatched_keys_left = "warn",
+            duplicate_keys_right = "warn"
+        )
+    ) %>%
+    mutate(
+        across(
+            ends_with(c("OKL")),
+            \(x) n / x,
+            .names = "prop_{str_remove(col, fixed('n_'))}"
+        )
+    )
+
+
+switch_stats_kinases <- tas_pre_okl_vs_okl %>%
+    filter(switch != "no-switch") %>%
+    count(hgnc_symbol, switch) %>%
+    arrange(desc(n)) %>%
+    power_left_join(
+        kinase_stats,
+        by = "hgnc_symbol",
+        check = check_specs(
+            unmatched_keys_left = "warn",
+            duplicate_keys_right = "warn"
+        )
+    ) %>%
+    mutate(
+        across(
+            ends_with(c("OKL")),
+            \(x) n / x,
+            .names = "prop_{str_remove(col, fixed('n_'))}"
+        )
+    )
+
+switch_stats_compounds_long <- switch_stats_compounds %>%
+    pivot_longer(
+        ends_with("OKL"),
+        names_to = "measurement",
+        values_to = "value"
+    ) %>%
+    separate_wider_regex(
+        measurement,
+        patterns = c(variable = "(?:prop|n)", "_", binding = "(?:binding|non_binding)", "_", dataset = ".*")
+    )
+
+
+switch_stats_kinases_long <- switch_stats_kinases %>%
+    pivot_longer(
+        ends_with("OKL"),
+        names_to = "measurement",
+        values_to = "value"
+    ) %>%
+    separate_wider_regex(
+        measurement,
+        patterns = c(variable = "(?:prop|n)", "_", binding = "(?:binding|non_binding)", "_", dataset = ".*")
+    )
+```
+
+Plot bar chart of compounds and kinases with highest proportion of switching relative
+to the original total
+
+
+```{r}
+plot_combinations <- tribble(
+    ~switch, ~binding, ~dataset,
+    "switch-binding", "non_binding", "Pre-OKL",
+    "switch-binding", "binding", "OKL",
+    "switch-non-binding", "binding", "Pre-OKL",
+    "switch-non-binding", "non_binding", "OKL"
+)
+
+
+switch_plots_compounds <- plot_combinations %>%
+    nest_join(
+        switch_stats_compounds_long %>%
+            filter(variable == "prop"),
+        by = c("switch", "binding", "dataset"),
+        name = "data"
+    ) %>%
+    rowwise() %>%
+    mutate(
+        p = {
+            p <- ggplot(
+                data,
+                aes(
+                    x = fct_reorder(name, value),
+                    y = value
+                )
+            ) +
+                geom_col() +
+                geom_text(
+                    aes(label = n),
+                    vjust = 0
+                ) +
+                scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+                theme(
+                    axis.text.x = element_text(angle = 90, hjust = 1)
+                ) +
+
+                labs(
+                    x = NULL,
+                    y = "Proportion of switching measurements",
+                    title = paste(
+                        if (switch == "switch-binding") "non-binding -> binding" else "binding -> non-binding",
+                        ", proportion out of all", binding, dataset
+                    )
+                )
+            list(p)
+        },
+        p_small = list(
+            p %+% {arrange(data, value) %>% slice_tail(n = 30)}
+        )
+    ) %>%
+    ungroup()
+
+switch_plots_kinases <- plot_combinations %>%
+    nest_join(
+        switch_stats_kinases_long %>%
+            filter(variable == "prop"),
+        by = c("switch", "binding", "dataset"),
+        name = "data"
+    ) %>%
+    rowwise() %>%
+    mutate(
+        p = {
+            p <- ggplot(
+                data,
+                aes(
+                    x = fct_reorder(hgnc_symbol, value),
+                    y = value
+                )
+            ) +
+                geom_col() +
+                geom_text(
+                    aes(label = n),
+                    vjust = 0
+                ) +
+                # envalysis::theme_publish() +
+                scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+                theme(
+                    axis.text.x = element_text(angle = 90, hjust = 1)
+                ) +
+                labs(
+                    x = NULL,
+                    y = "Proportion of switching measurements",
+                    title = paste(
+                        if (switch == "switch-binding") "non-binding -> binding" else "binding -> non-binding",
+                        ", proportion out of all", binding, dataset
+                    )
+                )
+            list(p)
+        },
+        p_small = list(
+            p %+% {arrange(data, value) %>% slice_tail(n = 30)}
+        )
+    ) %>%
+    ungroup()
+```
+
+```{r}
+switch_plots_compounds$p_small
+switch_plots_kinases$p_small
+
+
+pwalk(
+    switch_plots_compounds,
+    \(switch, binding, dataset, p_small, ...) {
+        ggsave(
+            paste0("plots/switch_compounds_props_", switch, "_", binding, "_", dataset, ".pdf"),
+            p_small, width = 6, height = 4
+        )
+    }
+)
+
+pwalk(
+    switch_plots_kinases,
+    \(switch, binding, dataset, p_small, ...) {
+        ggsave(
+            paste0("plots/switch_kinases_props_", switch, "_", binding, "_", dataset, ".pdf"),
+            p_small, width = 6, height = 4
+        )
+    }
+)
+```
 
 ```{r}
 library(cvms)
