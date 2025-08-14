@@ -1,6 +1,6 @@
 from collections import defaultdict
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import json
 import contextlib
@@ -13,6 +13,7 @@ import pytensor
 import numpy as np
 import pandas as pd
 import pymc as pm
+import nutpie
 import pystow
 import tqdm
 import matplotlib
@@ -56,8 +57,8 @@ def simulated_data(kd, hill_slope, doses, error_std):
     return doses, responses, data_errors
 
 
-def train_model(doses, responses):
-    # Build the Bayesian model
+def create_model_template():
+    """Create a PyMC model template that can handle varying numbers of data points."""
     with pm.Model() as model:
         # Priors for kd and hill_slope using lognormal (via normal on log)
         kd_log = pm.Normal('kd_log', mu=np.log(1e-6), sigma=3)
@@ -66,20 +67,47 @@ def train_model(doses, responses):
         hill_slope_log = pm.Normal('hill_slope_log', mu=0, sigma=1)
         hill_slope = pm.Deterministic('hill_slope', pm.math.exp(hill_slope_log))
 
-        mu = model_predict(kd, hill_slope, doses)
+        # Use mutable data containers that can be updated with different shapes
+        doses_data = pm.Data('doses_data', np.array([1e-9]))
+        responses_data = pm.Data('responses_data', np.array([0.0]))
+
+        mu = model_predict(kd, hill_slope, doses_data)
 
         # Likelihood of observed data:
         sigma = error_model(mu)
-        obs = pm.Normal('obs', mu=mu, sigma=sigma, observed=responses)
+        obs = pm.Normal('obs', mu=mu, sigma=sigma, observed=responses_data)
 
-        # Run MCMC sampling
-        trace = pm.sample(draws=2000, tune=1000, target_accept=0.9, chains=4, cores=1, progressbar=False)
+    return model
 
-    # Posterior predictive checks for plotting
-    # with model:
-    #     ppc = pm.sample_posterior_predictive(trace, var_names=["obs"])
 
-    return trace, None
+def train_model(doses, responses, compiled_sampler=None):
+    """Train the model using a pre-compiled sampler to avoid recompilation.
+
+    Args:
+        doses: Array of dose values
+        responses: Array of response values
+        compiled_sampler: Pre-compiled nutpie sampler, if None will create new one
+
+    Returns:
+        trace: PyMC trace object
+        compiled_sampler: The compiled sampler (for reuse)
+    """
+    if compiled_sampler is None:
+        # Create the model template and compile it
+        model = create_model_template()
+        compiled_sampler = nutpie.compile_pymc_model(model)
+
+    # Sample using the compiled sampler
+    trace = nutpie.sample(
+        compiled_sampler.with_data(doses_data=doses, responses_data=responses),
+        draws=2000,
+        tune=1000,
+        chains=4,
+        cores=1,
+        progress_bar=False
+    )
+
+    return trace, compiled_sampler
 
 
 def _get_db_connection(db_path: str) -> sqlite3.Connection:
@@ -238,15 +266,18 @@ def plot_results(trace, dose_range, doses, responses, pseudo_kd, fname):
     plt.close(fig)
 
 
-def process_target(drug_id, target, target_data, pseudo_kd, dose_range):
+def process_target(drug_id, target, target_data, pseudo_kd, dose_range, compiled_sampler=None):
     pseudo_kd *= 1e-9
     doses = np.array([d * 1e-9 for d in target_data['doses']])
     responses = np.array(target_data['responses'])
-    trace, _ = train_model(doses, responses)
+
+    # Use compiled sampler
+    trace, compiled_sampler = train_model(doses, responses, compiled_sampler)
+
     # import ipdb; ipdb.set_trace()
     # sigma_obs = np.mean(trace.posterior.sigma.values.reshape(-1))
-    kd_samples = trace.posterior.kd.values.reshape(-1)
-    hill_slope_samples = trace.posterior.hill_slope.values.reshape(-1)
+    kd_samples = trace.posterior['kd'].values.reshape(-1)
+    hill_slope_samples = trace.posterior['hill_slope'].values.reshape(-1)
     kd_means = np.mean(kd_samples)
     kd_std = np.std(kd_samples)
     hill_slope_means = np.mean(hill_slope_samples)
@@ -276,7 +307,7 @@ def process_target(drug_id, target, target_data, pseudo_kd, dose_range):
         'trace_path': trace_fname,
         'plot_path': plot_fname,
         'summary_json': summary_json,
-    }
+    }, compiled_sampler
 
 
 def get_drugs_by_dose(data):
@@ -304,13 +335,7 @@ dose_range = np.logspace(-10, 0, 50)  # from 1 nM to 1 mM
 # Load and process the data
 data, gene_mappings = process_data(OKL_SINGLE_DOSE_DATA)
 
-#drugs_by_dose = get_drugs_by_dose(data)
-#data_to_train = filter_to_dose_missing(data, drugs_by_dose, 1000)
 data_to_train = data
-
-# drug, drug_data = next(iter(data_to_train.items()))
-# target, target_data = next(iter(drug_data.items()))
-# x1, x2, x3, res = process_target(drug, target, drug_data, OKL_PSEUDO_KD_DATA, dose_range)
 
 # Initialize SQLite persistence and pre-load existing (compound_id, target) pairs
 conn = _get_db_connection(DB_PATH)
@@ -318,35 +343,49 @@ existing_pairs = _fetch_existing_pairs(conn)
 print(f"Found {len(existing_pairs)} existing (compound_id, target) pairs in DB.")
 _writes_since_commit = 0
 
+# Pre-compile the sampler once using dummy data to avoid recompilation
+print("Pre-compiling the Bayesian model...")
+dummy_doses = np.array([1e-9, 1e-8, 1e-7])
+dummy_responses = np.array([10.0, 50.0, 90.0])
+model_template = create_model_template()
+global_compiled_sampler = nutpie.compile_pymc_model(model_template, backend="numba")
+print("Model compilation complete.")
 
-def process_batch(batch_items, pseudo_kd_map, dose_range):
+
+def process_batch(batch_items, pseudo_kd_map, dose_range, compiled_sampler):
     """Process a batch of (drug_id, target, target_data) tuples."""
     results = []
+
     for drug_id, target, target_data in batch_items:
         with open(os.devnull, 'w') as fnull, contextlib.redirect_stdout(fnull), contextlib.redirect_stderr(fnull):
-            try:
-                _, _, result = process_target(drug_id, target, target_data, pseudo_kd_map[(drug_id, target)], dose_range)
-                record = {
-                    'compound_id': drug_id,
-                    'target': target,
-                    **result,
-                }
-                results.append(record)
-            except Exception as e:
-                # Log error and continue with other items in the batch
-                error_record = {
-                    'compound_id': drug_id,
-                    'target': target,
-                    'status': f'error: {str(e)}',
-                    'kd': None,
-                    'kd_std': None,
-                    'hill_slope': None,
-                    'hill_slope_std': None,
-                    'trace_path': None,
-                    'plot_path': None,
-                    'summary_json': None,
-                }
-                results.append(error_record)
+            # try:
+            _, _, result, _ = process_target(
+                drug_id, target, target_data,
+                pseudo_kd_map[(drug_id, target)],
+                dose_range,
+                compiled_sampler
+            )
+            record = {
+                'compound_id': drug_id,
+                'target': target,
+                **result,
+            }
+            results.append(record)
+            # except Exception as e:
+            #     # Log error and continue with other items in the batch
+            #     error_record = {
+            #         'compound_id': drug_id,
+            #         'target': target,
+            #         'status': f'error: {str(e)}',
+            #         'kd': None,
+            #         'kd_std': None,
+            #         'hill_slope': None,
+            #         'hill_slope_std': None,
+            #         'trace_path': None,
+            #         'plot_path': None,
+            #         'summary_json': None,
+            #     }
+            #     results.append(error_record)
     return results
 
 
@@ -371,12 +410,12 @@ if PARALLELIZE:
     print(f"Created {len(batches)} batches of size {BATCH_SIZE}")
 
     # Process batches in parallel
-    with ProcessPoolExecutor(max_workers=18) as executor:
+    with ThreadPoolExecutor(max_workers=18) as executor:
         futures = []
         for batch in batches:
             pseudo_kd_map_sub = {k: pseudo_kd_map[k] for k in (b[0:2] for b in batch)}
             futures.append(
-                executor.submit(process_batch, batch, pseudo_kd_map_sub, dose_range)
+                executor.submit(process_batch, batch, pseudo_kd_map_sub, dose_range, global_compiled_sampler)
             )
 
         # Collect results from all batches
@@ -394,8 +433,12 @@ else:
         for target, target_data in drug_data.items():
             if (drug_id, target) in existing_pairs:
                 continue
-            _, _, result = process_target(drug_id, target, target_data,
-                                          OKL_PSEUDO_KD_DATA, dose_range)
+            _, _, result, _ = process_target(
+                drug_id, target, target_data,
+                pseudo_kd_map[(drug_id, target)],
+                dose_range,
+                global_compiled_sampler
+            )
             record = {
                 'compound_id': drug_id,
                 'target': target,
@@ -406,3 +449,26 @@ else:
             if _writes_since_commit % 50 == 0:
                 conn.commit()
     conn.commit()
+
+    # Query for drug_id, target pairs with errors
+error_query = """
+SELECT compound_id, target, status
+FROM fits
+WHERE status LIKE 'error:%'
+ORDER BY compound_id, target
+"""
+
+error_pairs = conn.execute(error_query).fetchall()
+print(f"Found {len(error_pairs)} drug/target pairs with errors:")
+for compound_id, target, status in error_pairs:
+print(f"  {compound_id}, {target}: {status}")
+
+# Remove all errored combinations from the database
+delete_query = """
+DELETE FROM fits
+WHERE status LIKE 'error:%'
+"""
+
+deleted_count = conn.execute(delete_query).rowcount
+conn.commit()
+print(f"Removed {deleted_count} errored drug/target combinations from the database.")
