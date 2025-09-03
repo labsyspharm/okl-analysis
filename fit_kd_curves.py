@@ -369,7 +369,7 @@ for _, row in OKL_PSEUDO_KD_DATA.iterrows():
 dose_range = np.logspace(-10, 0, 50)  # from 1 nM to 1 mM
 
 # Load and process the data
-data, gene_mappings = process_data(OKL_SINGLE_DOSE_DATA)
+data, gene_mappings = process_data(OKL_SINGLE_DOSE_DATA, okl_only=False)
 
 data_to_train = data
 
@@ -378,14 +378,6 @@ conn = _get_db_connection(DB_PATH)
 existing_pairs = _fetch_existing_pairs(conn)
 print(f"Found {len(existing_pairs)} existing (compound_id, target) pairs in DB.")
 _writes_since_commit = 0
-
-# Pre-compile the sampler once using dummy data to avoid recompilation
-print("Pre-compiling the Bayesian model...")
-dummy_doses = np.array([1e-9, 1e-8, 1e-7])
-dummy_responses = np.array([10.0, 50.0, 90.0])
-model_template = create_model_template()
-global_compiled_sampler = nutpie.compile_pymc_model(model_template, backend="numba")
-print("Model compilation complete.")
 
 
 def worker_process(work_queue, result_queue, pseudo_kd_map, dose_range):
@@ -470,7 +462,7 @@ if PARALLELIZE:
 
     if items_to_process:
         # Create queues for work distribution and result collection
-        num_workers = min(mp.cpu_count(), 18)  # Limit to 18 workers
+        num_workers = min(mp.cpu_count(), 11)
         work_queue = Queue()
         result_queue = Queue()
 
@@ -547,7 +539,7 @@ else:
                 conn.commit()
     conn.commit()
 
-    # Query for drug_id, target pairs with errors
+# Query for drug_id, target pairs with errors
 error_query = """
 SELECT compound_id, target, status
 FROM fits
@@ -560,28 +552,22 @@ print(f"Found {len(error_pairs)} drug/target pairs with errors:")
 for compound_id, target, status in error_pairs:
     print(f"  {compound_id}, {target}: {status}")
 
-# Remove all errored combinations from the database
-delete_query = """
-DELETE FROM fits
-WHERE status LIKE 'error:%'
-"""
+from io import StringIO
 
-deleted_count = conn.execute(delete_query).rowcount
-conn.commit()
-print(f"Removed {deleted_count} errored drug/target combinations from the database.")
+df = pd.read_sql_query("SELECT * FROM fits", conn)
+# Parse the summary_json column into nested dataframes
+df['summary_parsed'] = df['summary_json'].apply(
+    lambda x: pd.read_json(StringIO(x), orient='table')
+)
+with gzip.open(BASE.join("results", name = "fits_summary.pkl.gz").as_posix(), "wb") as fh:
+    df.to_pickle(fh)
 
-# Query for drug_id, target pairs created within the last two hours
-two_hours_ago = int(time.time()) - 1000
+with sqlite3.connect(os.path.expanduser("~/scratch/okl/fits_old.sqlite")) as conn:
+    df_old = pd.read_sql_query("SELECT * FROM fits", conn)
 
-recent_query = """
-SELECT compound_id, target, updated_at, status
-FROM fits
-WHERE updated_at > ?
-ORDER BY updated_at DESC
-"""
+del df['summary_parsed']
 
-recent_pairs = conn.execute(recent_query, (two_hours_ago,)).fetchall()
-print(f"Found {len(recent_pairs)} drug/target pairs created within the last two hours:")
-for compound_id, target, updated_at, status in recent_pairs:
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(updated_at))
-    print(f"  {compound_id}, {target}: {status} (created at {timestamp})")
+df.to_csv(
+    BASE.join("results", name="fits_summary.csv.gz").as_posix(),
+    index=False,
+)

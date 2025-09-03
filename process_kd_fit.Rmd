@@ -1,0 +1,345 @@
+---
+title: "Compare fit Kd vs pseudo Kd"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup}
+library(tidyverse)
+library(synExtra)
+library(here)
+library(powerjoin)
+library(jsonlite)
+
+theme_set(theme_minimal())
+
+synapser::synLogin()
+syn <- synDownloader("~/data/", .cache = TRUE)
+```
+
+```{r loading}
+inputs <- list(
+  kd_fits_raw = "syn68898214",
+  okl_pseudo_kds = "syn51080578",
+  okl_single_dose = "syn52504516"
+)
+
+input_files <- map(
+  inputs, syn
+)
+
+kd_fits_raw <- input_files$kd_fits_raw %>%
+  read_csv() %>%
+  mutate(
+    across(c(kd, kd_std), \(x) x * 1e9)
+  )
+
+kd_fits_parsed <- kd_fits_raw %>%
+  mutate(
+    across(
+      summary_json,
+      \(x) map(x, \(y) fromJSON(y)$data %>% as_tibble())
+    )
+  )
+
+kd_fits_summaries <- kd_fits_parsed %>%
+  select(compound_id, target, summary_json) %>%
+  unnest(summary_json)
+
+okl_pseudo_kds <- input_files$okl_pseudo_kds %>%
+  read_csv() %>%
+  filter(
+    dataset == "original_repeat_replaced"
+  )
+
+okl_single_dose <- input_files$okl_single_dose %>%
+  read_csv() %>%
+  filter(
+    dataset == "original_repeat_replaced"
+  )
+```
+
+
+```{r}
+kd_comp <- okl_pseudo_kds %>%
+  power_left_join(
+    kd_fits_raw %>%
+      select(compound_id, target, kd, kd_std),
+    by = c("hmsl_id" = "compound_id", "DiscoveRx Gene Symbol" = "target"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+```
+
+Make Kd dataframe for synapse. Us
+
+```{r}
+kd_fit_metrics <- kd_fits_summaries %>%
+  filter(index %in% c("kd_log", "hill_slope")) %>%
+  pivot_wider(
+    names_from = index,
+    values_from = -c(compound_id, target, index)
+  ) %>%
+  transmute(
+    compound_id, target,
+    kd_log = mean_kd_log / log(10),
+    kd_log_lower = `hdi_3%_kd_log` / log(10),
+    kd_log_upper = `hdi_97%_kd_log` / log(10),
+    kd = exp(mean_kd_log) * 1e9,
+    kd_lower = exp(`hdi_3%_kd_log`) * 1e9,
+    kd_upper = exp(`hdi_97%_kd_log`) * 1e9,
+    hill_slope = mean_hill_slope,
+    rhat = r_hat_kd_log,
+    ess_tail = ess_tail_kd_log,
+    ess_bulk = ess_bulk_kd_log
+  )
+
+kd_table <- okl_pseudo_kds %>%
+  select(
+    dataset, lspci_id, hmsl_id, library, name, `DiscoveRx Gene Symbol`,
+    `Entrez Gene Symbol`, entrezgene_id, ensembl_gene_id, hgnc_symbol,
+    exclude_target, inhib_concordant,
+    classification
+  ) %>%
+  power_left_join(
+    kd_fit_metrics,
+    by = c("hmsl_id" = "compound_id", "DiscoveRx Gene Symbol" = "target"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+write_csv(
+  kd_table,
+  "classification/okl_eurofins_kd_fits.csv.gz"
+)
+```
+
+
+```{r}
+synStoreMany(
+  c(
+    "classification/okl_eurofins_kd_fits.csv.gz"
+  ),
+  parentId = "syn18508401",
+  forceVersion = FALSE
+)
+
+```
+
+
+```{r}
+class_colors <- c(
+    "binding" = "firebrick1",
+    "weakly-binding" = "darkorange",
+    "undetermined" = "gray",
+    "non-binding" = "black",
+    "discordant" = "blue"
+)
+
+p <- ggplot(
+  kd_comp %>%
+    filter(
+      library == "OKL",
+      pseudo_kd_concordant == "concordant",
+      classification != "discordant"
+    ) %>%
+    mutate(
+      across(kd, \(x) pmin(x, 25000))
+    ),
+  aes(
+    x = pseudo_kd,
+    y = kd,
+    shape = pseudo_kd_relation,
+    color = classification
+  )
+) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    color = "gray"
+  ) +
+  geom_point(
+    alpha = .7
+  ) +
+  scale_shape_manual(
+    values = c("=" = "\u25CF", "<" = "\u25C0", ">" = "\u25B6"),  # ● ◀ ▶,
+    na.value = "x"
+  ) +
+  scale_color_manual(
+    values = class_colors
+  ) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    x = "Pseudo Kd (nM)",
+    y = "Bayesian Kd (nM)"
+  )
+
+p
+```
+
+
+```{r}
+
+filter_drug <- function(name, data) {
+  data_filtered <- if (is.numeric(name))
+    data %>%
+      filter(lspci_id == .env$name)
+  else if (str_starts(name, "HMSL"))
+    data %>%
+      filter(hmsl_id == .env$name)
+  else
+    data %>%
+      filter(name == .env$name)
+  data_filtered
+}
+
+plot_beeswarm_single_drug <- function(name) {
+  library(ggbeeswarm)
+  lspci_id <- if (is.numeric(name))
+    name
+  else if (str_starts(name, "HMSL"))
+    compound_mapping[external_id == name][["lspci_id"]][1]
+  else
+    compound_dictionary[pref_name == name][["lspci_id"]][1, 1]
+  single_dose %>%
+    filter(lspci_id == .env$lspci_id) %>%
+    ggplot(aes(as.ordered(`Compound Concentration (nM)`), `Percent Control`)) +
+      geom_quasirandom()
+}
+
+library(seriation)
+cluster_fun <- function(x) {
+  d <- dist(x)
+  #   d <- as.dist(1 - cor(t(x)))
+  # browser()
+  clust <- hclust(d, method = "average")
+  reorder(clust, dist = d, method = "olo")
+}
+
+viridis_map <- viridis::viridis(100)
+
+plot_heatmap_single_drug <- function(name, data) {
+  library(ggbeeswarm)
+  data_filtered <- filter_drug(name, data)
+  d <- data_filtered %>%
+    mutate(across(`Compound Concentration (nM)`, ~fct_inseq(as.character(.x)))) %>%
+    arrange(`Compound Concentration (nM)`) %>%
+    select(`DiscoveRx Gene Symbol`, `Compound Concentration (nM)`, `Percent Control`) %>%
+    pivot_wider(names_from = `Compound Concentration (nM)`, values_from = `Percent Control`) %>%
+    column_to_rownames("DiscoveRx Gene Symbol")
+  ComplexHeatmap::Heatmap(
+    as.matrix(d),
+    show_column_names = TRUE,
+    cluster_columns = FALSE,
+    cluster_rows = cluster_fun,
+    col = rev(viridis_map)
+  )
+  # pheatmap(
+  #   d, show_rownames = TRUE, show_colnames = FALSE,
+  #   cluster_rows = FALSE,
+  #   color = rev(viridis_map)
+  # )
+    # ggplot(
+    #   aes(
+    #     `DiscoveRx Gene Symbol`,
+    #     as.ordered(`Compound Concentration (nM)`),
+    #     fill = `Percent Control`
+    #   )
+    # ) +
+    # geom_tile() +
+    # scale_fill_viridis_c(direction = -1)
+}
+
+plot_single_drug <- function(drug, target, data, point_aes = NULL) {
+  library(ggbeeswarm)
+  data_filtered <- filter_drug(drug, data) %>%
+    filter(str_detect(`DiscoveRx Gene Symbol`, target))
+  p <- data_filtered %>%
+    ggplot(aes(as.ordered(`Compound Concentration (nM)`), `Percent Control`)) +
+      geom_quasirandom(
+        mapping = point_aes,
+        groupOnX = TRUE,
+        data = ~filter(.x, !qpcr_miss)
+      ) +
+      geom_point(
+        data = ~filter(.x, qpcr_miss),
+        y = 100, color = "red", size = 3, shape = 8
+      )
+  if (length(unique(data_filtered$`DiscoveRx Gene Symbol`)) > 1)
+    p <- p +
+      facet_wrap(~`DiscoveRx Gene Symbol`)
+  p
+}
+
+p <- plot_single_drug(
+  "HMSL10285", "PDPK1",
+  okl_single_dose %>%
+    filter(
+      # hmsl_id == "HMSL11820",
+      # `Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)
+    )
+)
+p
+
+
+kd_comp %>%
+  filter(
+    pseudo_kd < 100,
+    classification == "non-binding"
+  ) %>%
+  select(hmsl_id, `DiscoveRx Gene Symbol`, pseudo_kd)
+
+```
+
+
+## Explore QC metrics
+
+
+```{r}
+kd_fits_summaries %>%
+  filter(index == "kd_log") %>%
+  arrange(desc(r_hat))
+```
+
+
+```{r}
+kd_fits_summaries_vs_classification <- kd_fits_summaries %>%
+  power_inner_join(
+    okl_pseudo_kds %>%
+      select(hmsl_id, `DiscoveRx Gene Symbol`, classification, pseudo_kd_concordant),
+    by = c("compound_id" = "hmsl_id", "target" = "DiscoveRx Gene Symbol"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+
+p <- ggplot(
+  kd_fits_summaries_vs_classification,
+  aes(
+    x = classification,
+    y = r_hat
+  )
+) +
+  geom_boxplot(
+    outlier.shape = NA
+  ) +
+  geom_quasirandom() +
+  facet_wrap(~index)
+p
+```
+
+```{r}
+
+
+```
