@@ -26,7 +26,7 @@ inputs <- list(
   kinase_info = "syn51286743",
   klaeger_ic50s = "syn51288931",
   nominal_targets = "syn52947779",
-  okl_pseudo_kds = "syn51080578",
+  okl_kds = "syn69680641",
   okl_classification = "syn51080579"
 )
 
@@ -58,7 +58,7 @@ nominal_targets <- input_files[["nominal_targets"]] %>%
     )
   )
 
-pseudo_kd <- input_files[["okl_pseudo_kds"]] %>%
+kds <- input_files[["okl_kds"]] %>%
   fread() %>%
   as_tibble()
 
@@ -275,7 +275,13 @@ Alan C Cheng  1 , John Eksterowicz, Stephanie Geuns-Meyer, Yaxiong Sun
 
 
 ```{r}
-partition_index <- pseudo_kd %>%
+kds_thresholded <- kds %>%
+  mutate(
+    kd = pmin(kd, 10000)
+  )
+
+
+partition_index <- kds_thresholded %>%
   # filter(pseudo_ic50_relation == "=") %>%
   filter(
     !exclude_target,
@@ -284,7 +290,7 @@ partition_index <- pseudo_kd %>%
   group_by(dataset, lspci_id) %>%
   filter(n() > 50) %>%
   mutate(
-    partition_index = (1 / pseudo_kd) / sum(1 / pseudo_kd, na.rm = TRUE)
+    partition_index = (1 / kd) / sum(1 / kd, na.rm = TRUE)
   ) %>%
   ungroup()
 
@@ -297,7 +303,8 @@ partition_index_max <- partition_index %>%
     n = 1,
     na_rm = TRUE,
     with_ties = TRUE
-  )
+  ) %>%
+  ungroup()
 
 write_csv(
   partition_index %>%
@@ -316,12 +323,12 @@ Same as CATDSmax, partition_index_max can include ties.
 
 ```{r}
 partition_index_max %>%
-  ggplot(aes(partition_index_max)) +
+  ggplot(aes(partition_index)) +
     geom_histogram() +
     facet_wrap(~dataset + library)
 
 partition_index_max %>%
-  ggplot(aes(partition_index_max, color = dataset)) +
+  ggplot(aes(partition_index, color = dataset)) +
     stat_ecdf() +
     lims(x = c(0, 1)) +
     facet_wrap(~library)
