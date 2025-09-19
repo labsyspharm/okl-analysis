@@ -113,6 +113,13 @@ kd_table <- okl_pseudo_kds %>%
       duplicate_keys_left = "warn",
       duplicate_keys_right = "warn"
     )
+  ) %>%
+  mutate(
+    tas_kd = cut(
+        kd,
+        breaks = c(-Inf, 100, 1000, 10000, Inf),
+        labels = c("1", "2", "3", "10")
+    )
   )
 
 write_csv(
