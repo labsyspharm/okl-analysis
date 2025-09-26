@@ -12,7 +12,7 @@ syn <- synDownloader("~/data", .cache = TRUE)
 ```
 
 ```{r}
-kinomescan_pseudo_kds <- syn("syn51080578") %>%
+kinomescan_kds <- syn("syn69680641") %>%
   read_csv()
 
 kinomescan_classes <- syn("syn51080579") %>%
@@ -36,7 +36,7 @@ lsp_biochem <- syn("syn25173511") %>%
 nominal_targets <- syn("syn52947779") %>%
   read_csv() %>%
   power_inner_join(
-    kinomescan_pseudo_kds %>%
+    kinomescan_kds %>%
       distinct(lspci_id, hmsl_id),
     by = c("HMSLID" = "hmsl_id"),
     check = check_specs(
@@ -45,15 +45,17 @@ nominal_targets <- syn("syn52947779") %>%
     )
   )
 
-lsp_clinical <- syn("syn26260451") %>%
-  read_fst() %>%
-  as_tibble()
+# lsp_clinical <- syn("syn26260451") %>%
+#   read_fst() %>%
+#   as_tibble()
+
+okl_clinical <- syn("syn63303526") %>%
+  read_csv()
 ```
 
+Use updated `okl_clinical` instead. Hand-assembled by Caitlin
 
 ## Frequency nominal in top X targets
-
-Is this taking care of ties?
 
 ```{r}
 nominal_targets_unique <- nominal_targets %>%
@@ -61,7 +63,7 @@ nominal_targets_unique <- nominal_targets %>%
   transmute(lspci_id, `DiscoveRx Gene Symbol`, nominal_target = TRUE) %>%
   distinct()
 
-pseudo_kds_nominal_target_sorted <- kinomescan_pseudo_kds %>%
+kds_nominal_target_sorted <- kinomescan_kds %>%
   filter(
     dataset == "original_repeat_replaced",
     lspci_id %in% nominal_targets_unique$lspci_id
@@ -74,14 +76,14 @@ pseudo_kds_nominal_target_sorted <- kinomescan_pseudo_kds %>%
     )
   ) %>%
   power_left_join(
-    lsp_clinical %>%
-      group_by(lspci_id) %>%
+    okl_clinical %>%
+      group_by(hmsl_id = HMSLID) %>%
       summarize(
-        max_phase = max(max_phase),
+        approved = if_else(any(status == "approved"), "Approved", "Not approved"),
         .groups = "drop"
       ) %>%
-      select(lspci_id, max_phase),
-    by = "lspci_id",
+      select(hmsl_id, approved),
+    by = "hmsl_id",
     check = check_specs(
       duplicate_keys_right = "warn"
     )
@@ -89,26 +91,31 @@ pseudo_kds_nominal_target_sorted <- kinomescan_pseudo_kds %>%
   replace_na(
     replace = list(
       nominal_target = FALSE,
-      max_phase = 0
+      approved = "Not approved"
     )
   ) %>%
   arrange(
-    lspci_id, pseudo_kd
+    lspci_id, kd
   ) %>%
   group_by(lspci_id) %>%
   mutate(
-    rank = rank(pseudo_kd, ties.method = "first")
+    rank = rank(kd, ties.method = "first")
   ) %>%
   ungroup()
+```
 
-pseudo_kds_nominal_top_n <- pseudo_kds_nominal_target_sorted %>%
+Only keep nominal target with best (lowest) Kd,
+this will take care of cases with multiple nominal targets
+
+```{r}
+kds_nominal_top_n <- kds_nominal_target_sorted %>%
   group_by(lspci_id) %>%
   slice(
     which(nominal_target)[1]
   ) %>%
   ungroup()
 
-pseudo_kds_nominal_top_n_plot_data <- pseudo_kds_nominal_top_n %>%
+kds_nominal_top_n_plot_data <- kds_nominal_top_n %>%
   group_by(rank) %>%
   summarize(
     n_rank = n(),
@@ -117,10 +124,10 @@ pseudo_kds_nominal_top_n_plot_data <- pseudo_kds_nominal_top_n %>%
   arrange(rank) %>%
   mutate(
     n_cumsum = cumsum(n_rank),
-    proportion_in_top_n = n_cumsum / length(unique(pseudo_kds_nominal_target_sorted$lspci_id))
+    proportion_in_top_n = n_cumsum / length(unique(kds_nominal_target_sorted$lspci_id))
   )
 
-p <- pseudo_kds_nominal_top_n_plot_data %>%
+p <- kds_nominal_top_n_plot_data %>%
   ggplot(aes(rank, proportion_in_top_n)) +
   geom_point() +
   geom_step() +
@@ -130,15 +137,55 @@ p <- pseudo_kds_nominal_top_n_plot_data %>%
     x = "Top N targets",
     y = "Proportion of compounds with\nintended target in top N targets"
   )
-
+p
 ggsave(
-  "plots/nominal_target_in_top_n.pdf",
+  "plots/nominal_target_in_top_n_fitted.pdf",
   p, width = 5, height = 3
 )
 
+FISHER_RANK_CUT <- 3L
+kds_nominal_fisher_data <- kds_nominal_target_sorted %>%
+  filter(rank <= FISHER_RANK_CUT) %>%
+  group_by(lspci_id, name, approved) %>%
+  summarize(
+    nominal_target_hit = any(nominal_target),
+    .groups = "drop"
+  )
 
-pseudo_kds_nominal_top_n_plot_data_clinical <- pseudo_kds_nominal_top_n %>%
-  mutate(approved = if_else(max_phase >= 4, "Approved", "Not approved")) %>%
+kds_nominal_fisher_table <- kds_nominal_fisher_data %>%
+  transmute(
+    Approval = approved,
+    `Intended target in top 3` = if_else(nominal_target_hit, "Yes", "No")
+  ) %>%
+  table()
+
+fisher.test(kds_nominal_fisher_table)
+
+withr::with_pdf(
+  "plots/nominal_target_in_top_3_fisher_mosaic_fitted.pdf", width = 3, height = 3,
+  mosaicplot(
+    kds_nominal_fisher_table,
+    main = "",,
+    color = paletteer::paletteer_d("ggsci::category10_d3")
+  )
+)
+
+```
+
+        Fisher's Exact Test for Count Data
+
+data:  .
+p-value = 0.02555
+alternative hypothesis: true odds ratio is not equal to 1
+95 percent confidence interval:
+ 1.062060 5.307341
+sample estimates:
+odds ratio
+  2.345732
+
+
+```{r}
+kds_nominal_top_n_plot_data_clinical <- kds_nominal_top_n %>%
   group_by(rank, approved) %>%
   summarize(
     n_rank = n(),
@@ -152,8 +199,7 @@ pseudo_kds_nominal_top_n_plot_data_clinical <- pseudo_kds_nominal_top_n %>%
   ) %>%
   ungroup()
 
-
-p <- pseudo_kds_nominal_top_n_plot_data_clinical %>%
+p <- kds_nominal_top_n_plot_data_clinical %>%
   ggplot(aes(rank, proportion_in_top_n, color = approved)) +
   geom_point(alpha = 0.7) +
   geom_step(alpha = 0.7) +
@@ -163,9 +209,9 @@ p <- pseudo_kds_nominal_top_n_plot_data_clinical %>%
     x = "Top N targets",
     y = "Proportion of compounds with\nintended target in top N targets"
   )
-
+p
 ggsave(
-  "plots/nominal_target_in_top_n_clinical.pdf",
+  "plots/nominal_target_in_top_n_clinical_fitted.pdf",
   p, width = 5, height = 3
 )
 
@@ -177,14 +223,14 @@ ggsave(
 ```{r}
 kd_thresholds <- c(100, 1000, 10000)
 
-biochem_pseudo_kd <- lsp_biochem %>%
-  filter(symbol %in% kinomescan_pseudo_kds$hgnc_symbol) %>%
+biochem_kd <- lsp_biochem %>%
+  filter(symbol %in% kinomescan_kds$hgnc_symbol) %>%
   power_left_join(
-    kinomescan_pseudo_kds %>%
+    kinomescan_kds %>%
       filter(dataset == "original_repeat_replaced") %>%
       group_by(lspci_id, hgnc_symbol) %>%
       summarize(
-        pseudo_kd = min(pseudo_kd),
+        kd = min(kd),
         .groups = "drop"
       ),
     by = c("lspci_id", "symbol" = "hgnc_symbol"),
@@ -199,13 +245,13 @@ novel_hits <- tibble(
   mutate(
     data = map(
       kd_threshold,
-      ~biochem_pseudo_kd %>%
+      ~biochem_kd %>%
         group_by(
           symbol
         ) %>%
         summarize(
           hit_by_chembl = any(value < .x, na.rm = TRUE),
-          hit_by_kinomescan = any(pseudo_kd < .x, na.rm = TRUE),
+          hit_by_kinomescan = any(kd < .x, na.rm = TRUE),
           .groups = "drop"
         )
     )
@@ -235,7 +281,7 @@ p <- novel_hits %>%
   )
 
 ggsave(
-  "plots/novel_hits_per_kinase.pdf",
+  "plots/novel_hits_per_kinase_fitted.pdf",
   p, width = 6, height = 4,
   device = Cairo::CairoPDF
 )
