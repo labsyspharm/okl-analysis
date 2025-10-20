@@ -25,7 +25,7 @@ syn <- synDownloader("~/data/", .cache = TRUE)
 inputs <- list(
   okl_single_dose_datasets = "syn52504516",
   kinase_info = "syn51286743",
-  okl_pseudo_kds = "syn51080578",
+  okl_kds = "syn69680641",
   partition_index_max = "syn52576129",
   okl_metadata = "syn63303526"
 )
@@ -56,7 +56,7 @@ mutant_panel <- kinase_info %>%
       mutate(mutant = FALSE)
   )
 
-pseudo_kds <- input_files[["okl_pseudo_kds"]] %>%
+okl_kds <- input_files[["okl_kds"]] %>%
   fread() %>%
   as_tibble() %>%
   filter(dataset == "original_repeat_replaced")
@@ -75,17 +75,16 @@ okl_metadata <- input_files[["okl_metadata"]] %>%
 
 
 ```{r}
-pseudo_kds_dedup <- pseudo_kds %>%
+okl_kds_dedup <- okl_kds %>%
   filter(
     hgnc_symbol != "",
     classification != "discordant",
-    pseudo_kd_concordant != "discordant",
     !exclude_target,
     library == "OKL"
   ) %>%
   group_by(lspci_id, hgnc_symbol, `DiscoveRx Gene Symbol`) %>%
   slice_min(
-    pseudo_kd,
+    kd,
     with_ties = FALSE,
     na_rm = TRUE
   ) %>%
@@ -94,12 +93,12 @@ pseudo_kds_dedup <- pseudo_kds %>%
 CUTOFFS <- c(100, 1000)
 TOP_N <- 15
 
-most_inhibited_raw <- pseudo_kds_dedup %>%
+most_inhibited_raw <- okl_kds_dedup %>%
   group_by(hgnc_symbol, `DiscoveRx Gene Symbol`) %>%
   summarize(
     n_inhibitors = map_int(
       set_names(CUTOFFS),
-      ~ sum(pseudo_kd <= as.numeric(.x), na.rm = TRUE)
+      ~ sum(kd <= as.numeric(.x), na.rm = TRUE)
     ) %>%
       list(),
     .groups = "drop"
@@ -114,12 +113,12 @@ most_inhibited %>%
   count(cutoff, n_inhibitors) %>%
   View()
 
-most_targets_raw <- pseudo_kds_dedup %>%
+most_targets_raw <- okl_kds_dedup %>%
   group_by(lspci_id, hmsl_id, library, name) %>%
   summarize(
     n_targets = map_int(
       set_names(CUTOFFS),
-      ~ sum(pseudo_kd <= as.numeric(.x), na.rm = TRUE)
+      ~ sum(kd <= as.numeric(.x), na.rm = TRUE)
     ) %>%
       list(),
     .groups = "drop"
@@ -140,12 +139,12 @@ most_inhibited_inhibitors <- most_inhibited %>%
   slice_head(n = TOP_N) %>%
   ungroup() %>%
   inner_join(
-    pseudo_kds_dedup,
+    okl_kds_dedup,
     by = c("DiscoveRx Gene Symbol", "hgnc_symbol"),
     relationship = "many-to-many"
   ) %>%
   mutate(
-    inhibited = pseudo_kd <= cutoff
+    inhibited = kd <= cutoff
   ) %>%
   group_by(lspci_id, cutoff) %>%
   filter(sum(inhibited) > 0) %>%
