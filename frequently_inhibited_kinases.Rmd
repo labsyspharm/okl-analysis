@@ -829,11 +829,12 @@ library(seriation)
 library(impute)
 
 cluster_fun_eucl <- function(mat, sample_in_col = TRUE) {
+  # browser()
   if (!sample_in_col) {
     mat <- t(mat)
   }
   mat_imp <- impute.knn(
-    mat, rng.seed = 42
+    mat, rng.seed = 42, colmax = 1
   )[["data"]]
   if (!sample_in_col) {
     mat_imp <- t(mat_imp)
@@ -900,16 +901,15 @@ createAnnotation <- function(df, colors = list(), which = "column") {
 Redo computation with all kinases included, even mutant ones
 
 ```{r}
-pseudo_kds_dedup_no <- pseudo_kds %>%
+okl_kds_dedup_no <- okl_kds %>%
   filter(
     hgnc_symbol != "",
     classification != "discordant",
-    pseudo_kd_concordant != "discordant",
     library == "OKL"
   ) %>%
   group_by(lspci_id, hgnc_symbol, `DiscoveRx Gene Symbol`) %>%
   slice_min(
-    pseudo_kd,
+    kd,
     with_ties = FALSE,
     na_rm = TRUE
   ) %>%
@@ -918,12 +918,12 @@ pseudo_kds_dedup_no <- pseudo_kds %>%
 CUTOFFS <- c(100, 1000)
 TOP_N <- 15
 
-most_inhibited_raw_no <- pseudo_kds_dedup_no %>%
+most_inhibited_raw_no <- okl_kds_dedup_no %>%
   group_by(hgnc_symbol, `DiscoveRx Gene Symbol`) %>%
   summarize(
     n_inhibitors = map_int(
       set_names(CUTOFFS),
-      ~ sum(pseudo_kd <= as.numeric(.x), na.rm = TRUE)
+      ~ sum(kd <= as.numeric(.x), na.rm = TRUE)
     ) %>%
       list(),
     .groups = "drop"
@@ -934,12 +934,12 @@ most_inhibited_no <- most_inhibited_raw_no %>%
   mutate(across(cutoff, as.numeric)) %>%
   arrange(desc(n_inhibitors))
 
-most_targets_raw_no <- pseudo_kds_dedup_no %>%
+most_targets_raw_no <- okl_kds_dedup_no %>%
   group_by(lspci_id, hmsl_id, library, name) %>%
   summarize(
     n_targets = map_int(
       set_names(CUTOFFS),
-      ~ sum(pseudo_kd <= as.numeric(.x), na.rm = TRUE)
+      ~ sum(kd <= as.numeric(.x), na.rm = TRUE)
     ) %>%
       list(),
     .groups = "drop"
@@ -975,10 +975,10 @@ mutant_hm_data <- tibble(
     hm = map(
       cutoff,
       \(cu) {
-        mat <- pseudo_kds_dedup_no %>%
+        mat <- okl_kds_dedup_no %>%
           filter(`DiscoveRx Gene Symbol` %in% mutant_panel$`DiscoveRx Gene Symbol`) %>%
-          transmute(`DiscoveRx Gene Symbol`, lspci_id, pseudo_kd = log10(pseudo_kd)) %>%
-          pivot_wider(names_from = lspci_id, values_from = pseudo_kd) %>%
+          transmute(`DiscoveRx Gene Symbol`, lspci_id, kd = log10(kd)) %>%
+          pivot_wider(names_from = lspci_id, values_from = kd) %>%
           column_to_rownames("DiscoveRx Gene Symbol") %>%
           as.matrix()
         mutant_panel_sub <- mutant_panel %>%
@@ -1001,10 +1001,10 @@ mutant_hm_data <- tibble(
         # browser()
         Heatmap(
           mat,
-          name = "Pseudo Kd",
+          name = "Kd",
           col = viridisLite::viridis(100, direction = -1),
-          cluster_columns = cluster_fun_eucl,
-          cluster_rows = cluster_fun_eucl,
+          cluster_columns = \(x) cluster_fun_eucl(x, sample_in_col = FALSE),
+          cluster_rows = \(x) cluster_fun_eucl(x, sample_in_col = TRUE),
           row_split = mutant_panel_sub$hgnc_symbol,
           left_annotation = createAnnotation(
             row_anno,
@@ -1030,7 +1030,7 @@ pwalk(
   mutant_hm_data,
   \(cutoff, hm) {
     withr::with_pdf(
-      here("plots", paste0("mutant_panel_pseudo_kd_heatmap_cutoff_", cutoff, ".pdf")),
+      here("plots", paste0("mutant_panel_fit_kd_heatmap_cutoff_", cutoff, ".pdf")),
       print(hm), width = 10, height = 13
     )
   }
@@ -1068,13 +1068,13 @@ mutant_hm_data <- crossing(
               str_remove_all("[\\(\\)]") %>%
               str_replace_all(fixed("phosphorylated"), "p")
           )
-        col_anno <- pseudo_kds_dedup_no %>%
+        col_anno <- okl_kds_dedup_no %>%
           filter(
             `DiscoveRx Gene Symbol` %in% mutant_panel$`DiscoveRx Gene Symbol`,
             hgnc_symbol == g
           ) %>%
           group_by(lspci_id) %>%
-          filter(sum(pseudo_kd <= cu) >= 1) %>%
+          filter(sum(kd <= cu) >= 1) %>%
           ungroup() %>%
           distinct(name, lspci_id, hmsl_id) %>%
           mutate(cutoff = cu) %>%
@@ -1096,13 +1096,13 @@ mutant_hm_data <- crossing(
               duplicate_keys_right = "warn"
             )
           )
-        mat <- pseudo_kds_dedup_no %>%
+        mat <- okl_kds_dedup_no %>%
           filter(
             `DiscoveRx Gene Symbol` %in% row_anno$`DiscoveRx Gene Symbol`,
             lspci_id %in% col_anno$lspci_id
           ) %>%
-          transmute(`DiscoveRx Gene Symbol`, lspci_id, pseudo_kd = log10(pseudo_kd)) %>%
-          pivot_wider(names_from = lspci_id, values_from = pseudo_kd) %>%
+          transmute(`DiscoveRx Gene Symbol`, lspci_id, across(kd, \(x) log10(pmin(x, 10000)))) %>%
+          pivot_wider(names_from = lspci_id, values_from = kd) %>%
           column_to_rownames("DiscoveRx Gene Symbol") %>%
           as.matrix()
         # browser()
@@ -1110,7 +1110,7 @@ mutant_hm_data <- crossing(
         # browser()
         Heatmap(
           subset_mat,
-          name = "Pseudo Kd",
+          name = "Kd",
           column_title = g,
           col = viridisLite::viridis(100, direction = -1),
           cluster_columns = cluster_fun_eucl,
@@ -1152,7 +1152,7 @@ pwalk(
     h <- ComplexHeatmap:::height(hm) %>%
       convertY(unit = "inch", valueOnly = TRUE)
     withr::with_pdf(
-      here("plots", paste0("mutant_panel_", hgnc_symbol, "_pseudo_kd_heatmap_cutoff_", cutoff, ".pdf")),
+      here("plots", paste0("mutant_panel_", hgnc_symbol, "_fit_kd_heatmap_cutoff_", cutoff, ".pdf")),
       print(hm), width = w, height = h
     )
   }

@@ -12,7 +12,7 @@ syn <- synDownloader("~/data", .cache = TRUE)
 ```
 
 ```{r}
-kinomescan_pseudo_kds <- syn("syn51080578") %>%
+kinomescan_kds <- syn("syn69680641") %>%
   read_csv() %>%
   filter(dataset == "original_repeat_replaced")
 
