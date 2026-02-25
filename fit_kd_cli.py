@@ -71,35 +71,29 @@ def _fit_one(
         seed=seed,
     )
 
-    kd_samples = trace.posterior["kd"].values.reshape(-1)
-    hs_samples = trace.posterior["hill_slope"].values.reshape(-1)
-
     summary = pm.summary(trace)
     try:
         summary_json = summary.to_json(orient="table")
     except Exception:
         summary_json = json.dumps(summary.to_dict())
-
-    return {
+    fit_parameters = (
+        summary.reset_index()
+        .melt(id_vars="index", var_name="metric", value_name="value")
+        .rename(columns={"index": "parameter"})
+    )
+    fit_metrics = {
         "compound_id": drug_id,
         "target": target,
-        "kd": float(np.mean(kd_samples)),
-        "kd_std": float(np.std(kd_samples)),
-        "hill_slope": float(np.mean(hs_samples)),
-        "hill_slope_std": float(np.std(hs_samples)),
         "status": "ok",
         "summary_json": summary_json,
     }
+    return fit_metrics, fit_parameters, trace, summary
 
 
 def _error_record(drug_id, target, exc):
     return {
         "compound_id": drug_id,
         "target": target,
-        "kd": None,
-        "kd_std": None,
-        "hill_slope": None,
-        "hill_slope_std": None,
         "status": f"error: {exc}",
         "summary_json": None,
     }
@@ -122,15 +116,24 @@ def _get_db(db_path):
         CREATE TABLE IF NOT EXISTS fits (
             compound_id  TEXT NOT NULL,
             target       TEXT NOT NULL,
-            kd           REAL,
-            kd_std       REAL,
-            hill_slope   REAL,
-            hill_slope_std REAL,
             status       TEXT,
             summary_json TEXT,
             updated_at   INTEGER NOT NULL,
             PRIMARY KEY (compound_id, target)
-        )
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fit_metrics (
+            compound_id  TEXT NOT NULL,
+            target       TEXT NOT NULL,
+            parameter    TEXT NOT NULL,
+            metric       TEXT NOT NULL,
+            value        REAL,
+            PRIMARY KEY (compound_id, target, parameter, metric),
+            FOREIGN KEY (compound_id, target) REFERENCES fits (compound_id, target)
+        );
         """
     )
     return conn
@@ -140,31 +143,53 @@ def _existing_pairs(conn):
     return set(conn.execute("SELECT compound_id, target FROM fits").fetchall())
 
 
-def _upsert(conn, r):
+def _upsert(conn, result):
+    # _fit_one returns (fit_record, fit_parameters); _error_record returns a plain dict
+    if isinstance(result, tuple):
+        fit_record, fit_parameters = result
+    else:
+        fit_record, fit_parameters = result, None
+
     conn.execute(
         """
-        INSERT INTO fits (compound_id, target, kd, kd_std,
-                          hill_slope, hill_slope_std,
-                          status, summary_json, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?)
+        INSERT INTO fits (compound_id, target, status, summary_json, updated_at)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(compound_id, target) DO UPDATE SET
-            kd=excluded.kd, kd_std=excluded.kd_std,
-            hill_slope=excluded.hill_slope, hill_slope_std=excluded.hill_slope_std,
-            status=excluded.status, summary_json=excluded.summary_json,
+            status=excluded.status,
+            summary_json=excluded.summary_json,
             updated_at=excluded.updated_at
         """,
         (
-            r["compound_id"],
-            r["target"],
-            r.get("kd"),
-            r.get("kd_std"),
-            r.get("hill_slope"),
-            r.get("hill_slope_std"),
-            r.get("status", "ok"),
-            r.get("summary_json"),
+            fit_record["compound_id"],
+            fit_record["target"],
+            fit_record.get("status", "ok"),
+            fit_record.get("summary_json"),
             int(time.time()),
         ),
     )
+
+    # Delete stale metrics rows then re-insert
+    conn.execute(
+        "DELETE FROM fit_metrics WHERE compound_id = ? AND target = ?",
+        (fit_record["compound_id"], fit_record["target"]),
+    )
+    if fit_parameters is not None and not fit_parameters.empty:
+        conn.executemany(
+            """
+            INSERT INTO fit_metrics (compound_id, target, parameter, metric, value)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    fit_record["compound_id"],
+                    fit_record["target"],
+                    row["parameter"],
+                    row["metric"],
+                    row["value"],
+                )
+                for _, row in fit_parameters.iterrows()
+            ],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +236,6 @@ def _worker(work_q, result_q, cfg):
     try:
         compiled = nutpie.compile_pymc_model(_create_model(), backend=cfg["backend"])
     except Exception as exc:
-        result_q.put(_error_record(None, None, f"worker init: {exc}"))
         return
 
     while True:
@@ -227,7 +251,7 @@ def _worker(work_q, result_q, cfg):
             devnull
         ), contextlib.redirect_stderr(devnull):
             try:
-                record = _fit_one(
+                fit_metrics, fit_parameters, trace, summary = _fit_one(
                     drug_id,
                     target,
                     target_data,
@@ -236,6 +260,7 @@ def _worker(work_q, result_q, cfg):
                     cfg["tune"],
                     cfg["chains"],
                 )
+                record = (fit_metrics, fit_parameters)
             except Exception as exc:
                 record = _error_record(drug_id, target, exc)
         result_q.put(record)
@@ -261,13 +286,10 @@ def _run_parallel(items, conn, workers, commit_every, cfg):
     with tqdm.tqdm(total=total, desc="Fitting") as pbar:
         while done < total:
             rec = result_q.get(timeout=600)
-            if rec["compound_id"] is None:
-                click.echo(rec["status"], err=True)
-                continue
             _upsert(conn, rec)
             writes += 1
             done += 1
-            if str(rec.get("status", "")).startswith("error"):
+            if str(rec[0].get("status", "")).startswith("error"):
                 errors += 1
             if writes % commit_every == 0:
                 conn.commit()
@@ -319,6 +341,7 @@ def _run_serial(items, conn, commit_every, cfg):
 def fit_kd_from_dataframe(
     df,
     db_path,
+    draw_zarr_path=None,
     skip_existing=True,
     parallel=True,
     workers=8,
@@ -326,17 +349,13 @@ def fit_kd_from_dataframe(
     tune=1000,
     chains=4,
     commit_every=100,
-    backend="numba",
-    cxx=None,
+    backend="numba"
 ):
     """Fit Kd and Hill slope for all compound/target pairs in a DataFrame.
 
     DataFrame must contain columns: hmsl_id, DiscoveRx Gene Symbol,
     Compound Concentration (nM), Percent Control.
     """
-    if cxx:
-        pytensor.config.cxx = cxx
-
     data = _load_data_from_df(df)
 
     with contextlib.closing(_get_db(db_path)) as conn:
@@ -367,7 +386,9 @@ def fit_kd_from_dataframe(
 
         click.echo(f"Done: {done}/{len(items)} fitted, {errs} errors")
 
-        df = pd.read_sql_query("SELECT * FROM fits", conn)
+        df_metrics = pd.read_sql_query("SELECT * FROM fit_metrics", conn)
+        df_fits = pd.read_sql_query("SELECT * FROM fits", conn)
+        df = df_fits.merge(df_metrics, on=["compound_id", "target"], how="left")
         return done, errs, df
 
 
@@ -398,12 +419,6 @@ def fit_kd_from_dataframe(
     type=click.Choice(["numba", "jax"], case_sensitive=False),
     help="nutpie compilation backend.",
 )
-@click.option(
-    "--cxx",
-    default=None,
-    type=str,
-    help="C++ compiler path for pytensor (e.g. /usr/bin/g++).",
-)
 def main(
     input_csv,
     db_path,
@@ -416,7 +431,6 @@ def main(
     chains,
     commit_every,
     backend,
-    cxx,
 ):
     """Fit Kd and Hill slope for every compound/target pair in INPUT_CSV
     and store them in DB_PATH.
@@ -436,7 +450,6 @@ def main(
         chains=chains,
         commit_every=commit_every,
         backend=backend,
-        cxx=cxx,
     )
 
     if csv_output and df is not None:
