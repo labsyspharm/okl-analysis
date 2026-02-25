@@ -81,11 +81,16 @@ def _fit_one(
         .melt(id_vars="index", var_name="metric", value_name="value")
         .rename(columns={"index": "parameter"})
     )
+    kd_log_samples = trace.posterior["kd_log"].values.reshape(-1).astype(np.float32).tobytes()
+    hill_slope_log_samples = trace.posterior["hill_slope_log"].values.reshape(-1).astype(np.float32).tobytes()
+
     fit_metrics = {
         "compound_id": drug_id,
         "target": target,
         "status": "ok",
         "summary_json": summary_json,
+        "kd_log_samples": kd_log_samples,
+        "hill_slope_log_samples": hill_slope_log_samples,
     }
     return fit_metrics, fit_parameters, trace, summary
 
@@ -114,11 +119,13 @@ def _get_db(db_path):
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS fits (
-            compound_id  TEXT NOT NULL,
-            target       TEXT NOT NULL,
-            status       TEXT,
-            summary_json TEXT,
-            updated_at   INTEGER NOT NULL,
+            compound_id          TEXT NOT NULL,
+            target               TEXT NOT NULL,
+            status               TEXT,
+            summary_json         TEXT,
+            kd_log_samples       BLOB,
+            hill_slope_log_samples BLOB,
+            updated_at           INTEGER NOT NULL,
             PRIMARY KEY (compound_id, target)
         );
         """
@@ -152,11 +159,13 @@ def _upsert(conn, result):
 
     conn.execute(
         """
-        INSERT INTO fits (compound_id, target, status, summary_json, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO fits (compound_id, target, status, summary_json, kd_log_samples, hill_slope_log_samples, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(compound_id, target) DO UPDATE SET
             status=excluded.status,
             summary_json=excluded.summary_json,
+            kd_log_samples=excluded.kd_log_samples,
+            hill_slope_log_samples=excluded.hill_slope_log_samples,
             updated_at=excluded.updated_at
         """,
         (
@@ -164,6 +173,8 @@ def _upsert(conn, result):
             fit_record["target"],
             fit_record.get("status", "ok"),
             fit_record.get("summary_json"),
+            fit_record.get("kd_log_samples"),
+            fit_record.get("hill_slope_log_samples"),
             int(time.time()),
         ),
     )
@@ -311,7 +322,7 @@ def _run_serial(items, conn, commit_every, cfg):
 
     for drug_id, target, target_data in tqdm.tqdm(items, desc="Fitting"):
         try:
-            rec = _fit_one(
+            fit_metrics, fit_parameters, _, _ = _fit_one(
                 drug_id,
                 target,
                 target_data,
@@ -320,6 +331,7 @@ def _run_serial(items, conn, commit_every, cfg):
                 cfg["tune"],
                 cfg["chains"],
             )
+            rec = (fit_metrics, fit_parameters)
         except Exception as exc:
             rec = _error_record(drug_id, target, exc)
             errors += 1
@@ -341,7 +353,6 @@ def _run_serial(items, conn, commit_every, cfg):
 def fit_kd_from_dataframe(
     df,
     db_path,
-    draw_zarr_path=None,
     skip_existing=True,
     parallel=True,
     workers=8,
