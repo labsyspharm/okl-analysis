@@ -380,27 +380,27 @@ def fit_kd_from_dataframe(
             if (cid, tgt) not in existing
         ]
         click.echo(f"Pairs to fit: {len(items)}")
-        if not items:
-            return 0, 0, None
+        if items:
+            cfg = {
+                "draws": draws,
+                "tune": tune,
+                "chains": chains,
+                "backend": backend.lower(),
+            }
 
-        cfg = {
-            "draws": draws,
-            "tune": tune,
-            "chains": chains,
-            "backend": backend.lower(),
-        }
+            if parallel:
+                done, errs = _run_parallel(items, conn, workers, commit_every, cfg)
+            else:
+                done, errs = _run_serial(items, conn, commit_every, cfg)
 
-        if parallel:
-            done, errs = _run_parallel(items, conn, workers, commit_every, cfg)
-        else:
-            done, errs = _run_serial(items, conn, commit_every, cfg)
-
-        click.echo(f"Done: {done}/{len(items)} fitted, {errs} errors")
+            click.echo(f"Done: {done}/{len(items)} fitted, {errs} errors")
 
         df_metrics = pd.read_sql_query("SELECT * FROM fit_metrics", conn)
-        df_fits = pd.read_sql_query("SELECT * FROM fits", conn)
+        df_fits = pd.read_sql_query(
+            "SELECT compound_id, target, status, summary_json, updated_at FROM fits", conn
+        )
         df = df_fits.merge(df_metrics, on=["compound_id", "target"], how="left")
-        return done, errs, df
+        return df
 
 
 @click.command(context_settings={"show_default": True})
@@ -449,9 +449,9 @@ def main(
     INPUT_CSV must contain columns: hmsl_id, DiscoveRx Gene Symbol,
     Compound Concentration (nM), Percent Control.
     """
-    df = pd.read_csv(input_csv)
-    _, _, df = fit_kd_from_dataframe(
-        df=df,
+    df_input = pd.read_csv(input_csv)
+    df = fit_kd_from_dataframe(
+        df=df_input,
         db_path=db_path,
         skip_existing=skip_existing,
         parallel=parallel,
