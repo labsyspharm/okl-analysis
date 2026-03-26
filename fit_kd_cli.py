@@ -81,8 +81,15 @@ def _fit_one(
         .melt(id_vars="index", var_name="metric", value_name="value")
         .rename(columns={"index": "parameter"})
     )
-    kd_log_samples = trace.posterior["kd_log"].values.reshape(-1).astype(np.float32).tobytes()
-    hill_slope_log_samples = trace.posterior["hill_slope_log"].values.reshape(-1).astype(np.float32).tobytes()
+    kd_log_samples = (
+        trace.posterior["kd_log"].values.reshape(-1).astype(np.float32).tobytes()
+    )
+    hill_slope_log_samples = (
+        trace.posterior["hill_slope_log"]
+        .values.reshape(-1)
+        .astype(np.float32)
+        .tobytes()
+    )
 
     fit_metrics = {
         "compound_id": drug_id,
@@ -360,7 +367,7 @@ def fit_kd_from_dataframe(
     tune=1000,
     chains=4,
     commit_every=100,
-    backend="numba"
+    backend="numba",
 ):
     """Fit Kd and Hill slope for all compound/target pairs in a DataFrame.
 
@@ -397,9 +404,19 @@ def fit_kd_from_dataframe(
 
         df_metrics = pd.read_sql_query("SELECT * FROM fit_metrics", conn)
         df_fits = pd.read_sql_query(
-            "SELECT compound_id, target, status, summary_json, updated_at FROM fits", conn
+            "SELECT compound_id, target, status, summary_json, updated_at FROM fits",
+            conn,
         )
-        df = df_fits.merge(df_metrics, on=["compound_id", "target"], how="left")
+        df_wide = df_metrics.pivot_table(
+            index=["compound_id", "target"],
+            columns=["parameter", "metric"],
+            values="value",
+        ).reset_index()
+        df_wide.columns = [
+            c if isinstance(c, str) else "_".join(x for x in c if x not in ("", None))
+            for c in df_wide.columns
+        ]
+        df = df_wide.merge(df_fits, on=["compound_id", "target"], how="left")
         return df
 
 
