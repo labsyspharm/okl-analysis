@@ -65,9 +65,37 @@ kds <- input_files[["okl_kds"]] %>%
 classification <- input_files[["okl_classification"]] %>%
   fread() %>%
   as_tibble()
+
+coral_families <- syn("syn61680422") %>%
+  read_csv()
+
+chemical_probes_raw <- syn("syn74301118") |>
+  read_csv()
+
+compound_mapping <- syn("syn26260389") %>%
+  read_fst(as.data.table = TRUE)
+```
+
+
+## Process Chemical probes
+
+```{r}
+chemical_probes_mapped <- chemical_probes_raw |>
+  power_inner_join(
+    compound_mapping %>%
+      filter(source == "chembl") |>
+      distinct(lspci_id, chembl_id = external_id),
+    by = c("ChEMBL ID" = "chembl_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
 ```
 
 ## CATDS
+
+### Using Single dose data to compute CATDS
 
 For computing CATDS try to reduce noise by censoring Percent Control values of
 compound-target pairs that are classified as non-binding. We frequently have
@@ -193,13 +221,131 @@ catds %>%
   View()
 ```
 
+### Using Kd data to compute CATDS
+
+```{r}
+kds_filtered <- kds %>%
+  mutate(
+    across(kd, \(x) pmin(x, 10000))
+  ) %>%
+  filter(
+    !exclude_target,
+    classification != "discordant"
+  ) |>
+  power_inner_join(
+    coral_families %>%
+      select(`DiscoveRx Gene Symbol`, Family),
+    by = c("DiscoveRx Gene Symbol"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+catds_most_potent <- kds_filtered |>
+  group_by(lspci_id, dataset) %>%
+  slice_min(kd, with_ties = FALSE) %>%
+  ungroup() %>%
+  inner_join(
+    kds_filtered |>
+      group_nest(dataset, lspci_id),
+    by = c("dataset", "lspci_id")
+  ) %>%
+  mutate(
+    catds_data = map2(
+      data, kd,
+      \(kd_data, kd_most_potent) {
+        kd_data |>
+          mutate(
+            kd_most_potent = kd_most_potent,
+            percent_remaining_catds = 100 - 100 / (1 + (kd / kd_most_potent)**hill_slope),
+            catds = (100 - percent_remaining_catds) / sum(100 - percent_remaining_catds, na.rm = TRUE)
+          )
+      }
+    )
+  ) |>
+  select(
+    dataset, lspci_id, catds_data
+  ) |>
+  unnest(catds_data)
+
+
+write_csv(
+  catds_most_potent %>%
+    arrange(
+      desc(catds)
+    ),
+  "classification/okl_eurofins_catds_kd_most_potent.csv.gz"
+)
+```
+
+
+```{r}
+catds_most_potent_by_gene <- catds_most_potent |>
+  group_by(
+    dataset, lspci_id, hmsl_id, library, name,
+    hgnc_symbol, entrezgene_id, ensembl_gene_id, `Entrez Gene Symbol`
+  ) |>
+  summarize(
+    catds = sum(catds, na.rm = TRUE),
+    kd_most_potent = min(kd, na.rm = TRUE),
+    kd_list = paste(paste0(`DiscoveRx Gene Symbol`, ": ", signif(kd, 2)), collapse = "; "),
+    .groups = "drop"
+  )
+```
+
+* Plot dose response curves for potential chemical probes
+* Share table with Caitlin
+* Use only wild type kinases
+* Compute family-wise chemical probe
+
+#### By family
+
+
+```{r}
+
+catds_most_potent_by_fam <- catds_most_potent |>
+  power_inner_join(
+    coral_families %>%
+      select(`DiscoveRx Gene Symbol`, Family),
+    by = c("DiscoveRx Gene Symbol"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  group_by(dataset, lspci_id, hmsl_id, library, name, Family) |>
+  summarize(
+    catds = sum(catds, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
 ### Chemical probes
 
 Check if any of our compounds fits the criteria for chemical probes. Potency <100nM
 and CATDSmax >.5
 
 ```{r}
+chemical_probes_catds <- catds_most_potent |>
+  filter(catds > .5, kd_most_potent < 100, library == "OKL") |>
+  arrange(desc(catds))
 
+write_csv(
+  chemical_probes_catds %>%
+    select(where(negate(is.list))),
+  "classification/okl_eurofins_chemical_probes_single_target_catds.csv"
+)
+
+chemical_probes_by_gene_catds <- catds_most_potent_by_gene |>
+  filter(catds > .5, kd_most_potent < 100, library == "OKL") |>
+  arrange(desc(catds))
+
+write_csv(
+  chemical_probes_by_gene_catds,
+  "classification/okl_eurofins_chemical_probes_by_gene_catds.csv"
+)
 
 chemical_probes <- catds_max %>%
   power_inner_join(
@@ -352,7 +498,155 @@ klaeger_partition_index_max <- klaeger_partition_index %>%
   )
 ```
 
+### By Family
 
+```{r}
+
+partition_index_fam <- kds_filtered %>%
+  power_inner_join(
+    coral_families %>%
+      select(`DiscoveRx Gene Symbol`, Family),
+    by = c("DiscoveRx Gene Symbol"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  # filter(pseudo_ic50_relation == "=") %>%
+  group_by(dataset, lspci_id) %>%
+  filter(n() > 50) %>%
+  mutate(
+    partition_index = (1 / kd) / sum(1 / kd, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+partition_index_fam_agg <- partition_index_fam %>%
+  group_by(dataset, Family, lspci_id, hmsl_id, library, name) %>%
+  summarize(
+    partition_index = sum(partition_index, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+
+## Chemical Probes with CATDs and partition index
+
+```{r}
+chemical_probe_by_family <- power_inner_join(
+  catds_most_potent_by_fam,
+  partition_index_fam_agg,
+  by = c("dataset", "Family", "lspci_id", "hmsl_id", "library", "name"),
+  check = check_specs(
+    unmatched_keys_left = "warn",
+    duplicate_keys_right = "warn",
+    unmatched_keys_right = "warn",
+    duplicate_keys_left = "warn"
+  )
+) |>
+  power_inner_join(
+    kds_filtered |>
+      group_by(dataset, lspci_id, hmsl_id, library, name, Family) |>
+      summarize(
+        kd_most_potent_family = min(kd, na.rm = TRUE),
+        kd_list = paste(paste0(`DiscoveRx Gene Symbol`, ": ", signif(kd, 2)), collapse = "; "),
+        .groups = "drop"
+      ),
+    by = c("dataset", "Family", "lspci_id", "hmsl_id", "library", "name"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_left = "warn"
+    )
+  )  |>
+  power_inner_join(
+    kds_filtered |>
+      distinct(dataset, lspci_id, hmsl_id, library, name, Family) |>
+      mutate(
+        data_outside_family = pmap(
+          cur_data(),
+          \(lspci_id, Family, ...) {
+            df <- kds_filtered |>
+              filter(
+                .data$lspci_id == .env$lspci_id,
+                .data$Family != .env$Family
+              )
+            df |>
+              arrange(kd) |>
+              summarize(
+                kd_most_potent_outside_family = min(kd, na.rm = TRUE),
+                kd_list_top3_outside_family = paste(paste0(head(`DiscoveRx Gene Symbol`, n = 3), ": ", signif(head(kd, n = 3), 2)), collapse = "; "),
+                .groups = "drop"
+              )
+          }
+        )
+      ) |>
+      unnest(data_outside_family),
+    by = c("dataset", "Family", "lspci_id", "hmsl_id", "library", "name"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_left = "warn"
+    )
+  )
+
+
+p <- ggplot(
+  chemical_probe_by_family,
+  aes(
+    x = catds,
+    y = partition_index,
+  )
+) +
+  geom_point()
+p
+```
+
+```{r}
+chemical_probe_by_family |>
+  filter(partition_index > .9, catds < .5)
+
+kds_filtered |> filter(name == "SGX-523") |> arrange(kd)
+catds_most_potent |> filter(name == "SGX-523") |> arrange(desc(catds)) |> select(-c(dataset, hmsl_id, entrezgene_id))
+```
+
+
+```{r}
+chemical_probe_by_family_top <- chemical_probe_by_family |>
+  filter(
+    partition_index > .5 | catds > .5,
+    kd_most_potent_family < 100
+  ) |>
+  arrange(desc(catds))
+
+write_csv(
+  chemical_probe_by_family_top %>%
+    select(where(negate(is.list))),
+  "classification/okl_eurofins_chemical_probes_by_family_catds_partition_index.csv"
+)
+```
+
+
+### Counterexamples
+
+```{r}
+chemical_probes_gt3 <- chemical_probes_mapped |>
+  filter(`Rating in cell` >= 3)
+
+chemical_probe_by_family_ce <- chemical_probe_by_family |>
+  group_by(dataset, lspci_id, hmsl_id, library, name) |>
+  slice_max(catds, n = 1, with_ties = FALSE) |>
+  inner_join(
+    chemical_probes_gt3,
+    by = c("lspci_id" = "lspci_id")
+  )
+
+chemical_probe_by_family_ce |>
+  arrange(catds) |>
+  View()
+```
 
 ```{r}
 synStoreMany(
@@ -362,7 +656,9 @@ synStoreMany(
     "classification/okl_eurofins_catds.csv",
     "classification/okl_eurofins_catds_index_max.csv",
     "classification/okl_eurofins_catds_censored.csv",
-    "classification/okl_eurofins_catds_index_max_censored.csv"
+    "classification/okl_eurofins_catds_index_max_censored.csv",
+    "classification/okl_eurofins_chemical_probes_single_target_catds.csv",
+    "classification/okl_eurofins_chemical_probes_by_gene_catds.csv"
   ),
   parentId = "syn18508401",
   used = unname(inputs),

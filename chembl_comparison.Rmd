@@ -362,7 +362,7 @@ p_scatter <- pseudo_kd_comp %>%
   geom_text(
     aes(label = label),
     data = \(df) df %>%
-      mutate(across(c(value, kd), \(x) -log10(x))) %>%
+      mutate(across(c(value, kd), \(x) log10(x))) %>%
       summarize(
         res = cor.test(
           value, kd
@@ -371,7 +371,7 @@ p_scatter <- pseudo_kd_comp %>%
           list()
       ) %>%
       unnest(res) %>%
-      mutate(label = paste("italic(R)^2 ==", signif(estimate**2, 2))),
+      mutate(label = paste("R ==", signif(estimate, 2))),
     x = -Inf, y = Inf, hjust = 0, vjust = 1,
     inherit.aes = FALSE, parse = TRUE
   ) +
@@ -614,7 +614,7 @@ p_scatter <- pseudo_kd_kd_comp %>%
           list()
       ) %>%
       unnest(res) %>%
-      mutate(label = paste("italic(R)^2 ==", signif(estimate**2, 2))),
+      mutate(label = paste("R ==", signif(estimate, 2))),
     x = -Inf, y = Inf, hjust = 0, vjust = 1,
     inherit.aes = FALSE, parse = TRUE
   ) +
@@ -750,7 +750,7 @@ p_scatter <- pseudo_kd_kd_comp %>%
           list()
       ) %>%
       unnest(res) %>%
-      mutate(label = paste("italic(R)^2 ==", signif(estimate**2, 2))),
+      mutate(label = paste("R ==", signif(estimate, 2))),
     x = -Inf, y = Inf, hjust = 0, vjust = 1,
     inherit.aes = FALSE, parse = TRUE
   ) +
@@ -844,6 +844,103 @@ ggsave(
     "plots/chembl_kd_vs_kd_fit_comparison_combined_tas_with_fda.pdf", p_combined,
     width = 6, height = 4.5
 )
+
+
+pseudo_kd_kd_comp |>
+  summarize(
+    lm_res = list(
+      lm(kd ~ chembl_kd, data = cur_data()) %>%
+        broom::tidy()
+    )
+  ) |>
+  unnest(lm_res)
+
+pseudo_kd_kd_comp |>
+  summarize(
+    lm_res = list(
+      lm(log10(kd) ~ log10(chembl_kd), data = cur_data()) %>%
+        broom::tidy()
+    )
+  ) |>
+  unnest(lm_res)
+
+pseudo_kd_kd_comp %>%
+  drop_na(pseudo_kd) %>%
+  filter(
+    # pseudo_ic50_relation == "=",
+    pseudo_kd_concordant == "concordant",
+    classification != "discordant"
+  ) %>%
+  mutate(
+    across(c(kd, chembl_kd), \(x) pmin(x, 10000)),
+    kd_relation = if_else(kd < .1, "<", "="),
+    across(kd, \(x) pmax(x, .1)),
+    tas_kd = as.character(tas_kd) %>%
+      factor(levels = names(tas_colors))
+  ) %>%
+  arrange(desc(fda_target)) %>%
+  ggplot(
+    aes(chembl_kd, kd, fill = tas_kd)
+  ) +
+  geom_point(
+    aes(size = fda_target, shape = kd_relation, color = fda_target),
+  ) +
+  # geom_abline(
+  #   slope = .626, intercept = 2612,
+  #   color = "black"
+  # ) +
+  geom_abline(
+    slope = .875, intercept = 10^2.74,
+    color = "black"
+  ) +
+  geom_text(
+    aes(label = label),
+    data = \(df) df %>%
+      mutate(across(c(chembl_kd, kd), \(x) -log10(x))) %>%
+      summarize(
+        res = cor.test(
+          chembl_kd, kd
+        ) %>%
+          broom::tidy() %>%
+          list()
+      ) %>%
+      unnest(res) %>%
+      mutate(label = paste("italic(R)^2 ==", signif(estimate**2, 2))),
+    x = -Inf, y = Inf, hjust = 0, vjust = 1,
+    inherit.aes = FALSE, parse = TRUE
+  ) +
+  scale_shape_manual(
+    values = c(
+      `<` = 25, `>` = 24, `=` = 21
+    ),
+    guide = "none"
+  ) +
+  scale_fill_manual(
+    values = map_chr(tas_colors, \(x) alpha(x, alpha = 0.5)),
+    guide = guide_legend(override.aes = list(color = alpha("white", 0), shape = 21, alpha = 1))
+  ) +
+  scale_color_manual(
+    values = c(
+      `ontarget` = alpha("black", .9),
+      `offtarget` = alpha("purple", 0),
+      `no` = alpha("purple", 0)
+    ),
+    guide = "none"
+  ) +
+  scale_size_manual(
+    values = c(`ontarget` = 1.5, `offtarget` = 1, `no` = 1),
+    guide = "none"
+  ) +
+  # Limiting to between 1 and 10000 because barely any data outside this range
+  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
+  scale_y_log10(labels = scales::label_number(big.mark = "")) +
+  coord_equal() +
+  labs(
+    x = "Kd (ChEMBL)",
+    y = "Kd (KINOMEscan)",
+    fill = "TAS"
+  )
+
 ```
 
 ### color by tas without fda

@@ -136,7 +136,7 @@ library(UpSetR)
 
 most_inhibited_inhibitors <- most_inhibited %>%
   group_by(cutoff) %>%
-  slice_head(n = TOP_N) %>%
+  slice_max(n_inhibitors, n = TOP_N, with_ties = TRUE) %>%
   ungroup() %>%
   inner_join(
     okl_kds_dedup,
@@ -219,7 +219,7 @@ pwalk(
   function(p, cutoff, ...) {
     ggsave(
       here("plots", paste0("upset_top", TOP_N, "_kinase_targets_cutoff_", cutoff, ".pdf")),
-      p, width = 5.5, height = 4
+      p, width = 5, height = 4.5
     )
   }
 )
@@ -1134,9 +1134,9 @@ mutant_hm_data <- crossing(
               Type = \(x) RColorBrewer::brewer.pal(x, "Set2")
             )
           ),
-          # column_labels = col_anno$name,
-          show_column_names = FALSE,
-          width = ncol(subset_mat) * unit(2, "mm"),
+          column_labels = col_anno$name,
+          # show_column_names = FALSE,
+          width = ncol(subset_mat) * unit(5, "mm"),
           height = nrow(subset_mat) * unit(5, "mm")
         )
       }
@@ -1152,7 +1152,7 @@ pwalk(
     h <- ComplexHeatmap:::height(hm) %>%
       convertY(unit = "inch", valueOnly = TRUE)
     withr::with_pdf(
-      here("plots", paste0("mutant_panel_", hgnc_symbol, "_fit_kd_heatmap_cutoff_", cutoff, ".pdf")),
+      here("plots", paste0("mutant_panel_", hgnc_symbol, "_fit_kd_heatmap_cutoff_", cutoff, "_names.pdf")),
       print(hm), width = w, height = h
     )
   }

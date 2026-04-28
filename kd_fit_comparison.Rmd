@@ -130,6 +130,7 @@ kd_comparison <- power_inner_join(
     )
   ) |>
   mutate(
+    kd_log_chembl = log10(chembl_kd * 1e-9),
     across(
       starts_with("kd_log"),
       \(x) pmin(x, log10(10000))
@@ -139,7 +140,107 @@ kd_comparison <- power_inner_join(
       \(x) pmin(x, 10000)
     ),
     kd_log_diff_all = kd_log_pairs - kd_log_all,
-    kd_log_diff_chembl = kd_log_all - log10(chembl_kd * 1e-9)
+    kd_log_diff_chembl = kd_log_pairs - kd_log_chembl
+  )
+
+```
+
+Check ruxolitinib specifically for manuscript
+
+```{r}
+kd_comparison |>
+  filter(
+    name == "RUXOLITINIB",
+    combination == "100_10000"
+  ) |>
+  mutate(
+    chembl_under_1000 = if_else(chembl_kd < 1000, "yes", "no"),
+    pair_under_1000 = if_else(kd_pairs < 1000, "yes", "no")
+  ) |>
+  count(chembl_under_1000, pair_under_1000)
+
+
+kd_comparison |>
+  filter(
+    name == "RUXOLITINIB",
+    combination == "100_10000"
+  ) |>
+  mutate(
+    chembl_under_1000 = if_else(chembl_kd < 1000, "yes", "no"),
+    pair_under_1000 = if_else(kd_pairs < 1000, "yes", "no")
+  ) |>
+  count(chembl_under_1000, pair_under_1000)
+```
+
+```{r}
+kd_comparison |>
+  bind_rows(
+    kd_comparison |>
+      filter(combination == "100_10000") |>
+      transmute(
+        combination = "all",
+        combination_print = "all doses",
+        kd_pairs = kd_all,
+        chembl_kd
+      )
+  ) |>
+  group_by(combination, combination_print) |>
+  summarize(
+    # cor_res = cor.test(kd_pairs, chembl_kd, method = "pearson", use = "complete.obs") |>
+    #   broom::tidy() |>
+    #   list(),
+    lm_res = lm(kd_pairs ~ chembl_kd) |>
+      broom::tidy() |>
+      list(),
+    .groups = "drop"
+  ) |>
+  unnest(lm_res)
+
+
+```
+
+
+### Compute performance metrics at 1000 nM
+
+```{r}
+kd_performance_summary <- kd_comparison |>
+  bind_rows(
+    kd_comparison |>
+      filter(combination == "100_10000") |>
+      transmute(
+        combination = "all",
+        combination_print = "all doses",
+        kd_pairs = kd_all,
+        chembl_kd
+      )
+  ) |>
+  mutate(
+    chembl_under_1000 = if_else(chembl_kd < 1000, "yes", "no"),
+    pair_under_1000 = if_else(kd_pairs < 1000, "yes", "no")
+  ) |>
+  count(combination, combination_print, chembl_under_1000, pair_under_1000) |>
+  drop_na() |>
+  mutate(
+    type = case_when(
+      chembl_under_1000 == "yes" & pair_under_1000 == "yes" ~ "TP",
+      chembl_under_1000 == "no" & pair_under_1000 == "no" ~ "TN",
+      chembl_under_1000 == "yes" & pair_under_1000 == "no" ~ "FN",
+      chembl_under_1000 == "no" & pair_under_1000 == "yes" ~ "FP",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  select(combination, combination_print, type, n) |>
+  pivot_wider(
+    names_from = type,
+    values_from = n
+  ) |>
+  mutate(
+    sensitivity = TP / (TP + FN),
+    specificity = TN / (TN + FP),
+    precision = TP / (TP + FP),
+    n = TP + TN + FP + FN,
+    f1 = 2 * (precision * sensitivity) / (precision + sensitivity),
+    youden = sensitivity + specificity - 1
   )
 
 ```
@@ -231,7 +332,7 @@ pair_combinations_overall_mse <- kd_comparison |>
   ) |>
   arrange(mean_square_diff_all)
 
-kd_comparison |>
+pair_combinations_cor_df <- kd_comparison |>
   group_by(combination, combination_print) |>
   summarize(
     cor_res = cor(kd_log_all, kd_log_pairs, method = "pearson", use = "complete.obs"),
@@ -286,6 +387,14 @@ p <- ggplot(
   )
 ) +
   geom_hex() +
+  geom_text(
+    aes(
+      label = paste("R² =", signif(r_squared, 2))
+    ),
+    data = pair_combinations_cor_df,
+    x = -Inf, y = Inf,
+    hjust = -0.1, vjust = 1.1
+  ) +
   geom_abline(
     slope = 1, intercept = 0, linetype = "dashed"
   ) +
@@ -391,14 +500,14 @@ plot_fit_impl <- function(kd_samples, hill_slope_samples, doses, responses, dose
         x = kd_mean, xend = kd_mean
       ),
       data = kd_df,
-      y = 100, yend = 110
+      y = -Inf, yend = 7
     ) +
     geom_segment(
       aes(
         x = kd_mean, xend = kd_mean
       ),
       data = kd_df,
-      y = -Inf, yend = 100,
+      y = 22, yend = Inf,
       linetype = "dotted"
     ) +
     geom_text(
@@ -407,17 +516,18 @@ plot_fit_impl <- function(kd_samples, hill_slope_samples, doses, responses, dose
         x = kd_mean
       ),
       data = kd_df,
-      y = 112,
+      y = 9,
       angle = 45,
-      hjust = 0
+      hjust = 0,
+      vjust = 0
     ) +
     geom_rect(
       aes(
         xmin = kd_lower, xmax = kd_upper
       ),
       data = kd_ci_df,
-      ymin = 100,
-      ymax = 110,
+      ymin = -Inf,
+      ymax = 7,
       fill = "gray20", alpha = 0.5
     ) +
     # # Kd and pseudo-Kd vertical lines
@@ -425,10 +535,13 @@ plot_fit_impl <- function(kd_samples, hill_slope_samples, doses, responses, dose
     #   data = vlines,
     #   aes(xintercept = xintercept, color = color, linetype = linetype)
     # ) +
-    scale_x_log10() +
+    scale_x_log10(
+      expand = expansion(mult = c(0.05, 0.05))
+    ) +
     scale_y_continuous(
       breaks = seq(0, 100, 25),
-      minor_breaks = NULL
+      minor_breaks = NULL,
+      expand = expansion(mult = 0)
     ) +
     scale_color_manual(
       name   = NULL,
@@ -441,7 +554,7 @@ plot_fit_impl <- function(kd_samples, hill_slope_samples, doses, responses, dose
       )
     ) +
     scale_linetype_identity() +
-    coord_cartesian(ylim = c(-5, 120)) +
+    coord_cartesian(ylim = c(-7, 105)) +
     labs(
       x = "Dose (nM)",
       y = "Percent Control Remaining"
@@ -507,7 +620,8 @@ plot_fit <- function(compound, target) {
     )
   wrap_plots(
     plots,
-    guides = "collect"
+    guides = "collect",
+    nrow = 2
   )
 }
 
@@ -526,9 +640,19 @@ nice extrapolation
 ```{r}
 kd_comparison |>
   filter(kd_all < 50, combination == "1000_10000") |>
-  arrange(kd_log_diff_all) |>
+  arrange(abs(kd_log_diff_all)) |>
   as.data.frame() |>
   head()
 
-plot_fit("HMSL10393", "DAPK2")
+p <- plot_fit("HMSL11317", "EPHB6")
+
+ggsave(
+  here("plots", "HMSL11317_LENVATINIB_EPHB6_fit.pdf"),
+  p, width = 14, height = 5
+)
+
+plot_fit("HMSL10123", "MKNK1")
+plot_fit("HMSL10123", "WNK2")
+
+
 ```

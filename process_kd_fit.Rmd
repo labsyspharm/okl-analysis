@@ -29,6 +29,23 @@ input_files <- map(
   inputs, syn
 )
 
+kd_fit_pairs <- synGlob("syn73756839", "*.csv.gz") |>
+  set_names(\(x) str_remove(basename(x), fixed(".csv.gz"))) |>
+  map(syn) |>
+  map(read_csv) |>
+  bind_rows(.id = "combination") |>
+  mutate(
+    across(c(kd, kd_std), \(x) x * 1e9),
+    across(
+      summary_json,
+      \(x) map(x, \(y) as_tibble(fromJSON(y)$data))
+    )
+  )
+
+kd_fit_pairs_summaries <- kd_fit_pairs %>%
+  select(combination, compound_id, target, status, summary_json) %>%
+  unnest(summary_json)
+
 kd_fits_raw <- input_files$kd_fits_raw %>%
   read_csv() %>%
   mutate(
@@ -78,14 +95,18 @@ kd_comp <- okl_pseudo_kds %>%
 Make Kd dataframe for synapse. Us
 
 ```{r}
-kd_fit_metrics <- kd_fits_summaries %>%
+kd_fit_metrics <- bind_rows(
+  kd_fits_summaries |>
+    mutate(combination = "all"),
+  kd_fit_pairs_summaries
+) %>%
   filter(index %in% c("kd_log", "hill_slope")) %>%
   pivot_wider(
     names_from = index,
-    values_from = -c(compound_id, target, index)
+    values_from = -c(compound_id, target, index, combination)
   ) %>%
   transmute(
-    compound_id, target,
+    combination, compound_id, target,
     kd_log = mean_kd_log / log(10),
     kd_log_lower = `hdi_3%_kd_log` / log(10),
     kd_log_upper = `hdi_97%_kd_log` / log(10),
@@ -110,8 +131,7 @@ kd_table <- okl_pseudo_kds %>%
     by = c("hmsl_id" = "compound_id", "DiscoveRx Gene Symbol" = "target"),
     check = check_specs(
       unmatched_keys_left = "warn",
-      duplicate_keys_left = "warn",
-      duplicate_keys_right = "warn"
+      duplicate_keys_left = "warn"
     )
   ) %>%
   mutate(
@@ -123,8 +143,16 @@ kd_table <- okl_pseudo_kds %>%
   )
 
 write_csv(
-  kd_table,
+  kd_table |>
+    filter(combination == "all") |>
+    select(-combination),
   "classification/okl_eurofins_kd_fits.csv.gz"
+)
+
+write_csv(
+  kd_table |>
+    filter(combination != "all"),
+  "classification/okl_eurofins_kd_fits_pairs.csv.gz"
 )
 ```
 
@@ -132,7 +160,8 @@ write_csv(
 ```{r}
 synStoreMany(
   c(
-    "classification/okl_eurofins_kd_fits.csv.gz"
+    "classification/okl_eurofins_kd_fits.csv.gz",
+    "classification/okl_eurofins_kd_fits_pairs.csv.gz"
   ),
   parentId = "syn18508401",
   forceVersion = FALSE

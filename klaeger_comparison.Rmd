@@ -15,8 +15,8 @@ syn <- synDownloader("~/data", .cache = TRUE)
 klaeger_ic50s <- syn("syn51288931") %>%
     read_csv()
 
-kinomescan_pseudo_ic50s <- syn("syn51080578") %>%
-    read_csv()
+kinomescan_kd_fits <- syn("syn69680641") %>%
+  read_csv()
 
 kinomescan_classes <- syn("syn51080579") %>%
     read_csv()
@@ -26,54 +26,166 @@ kinomescan_kinase_info <- syn("syn51286743") %>%
 
 single_dose <- syn("syn26486828") %>%
     read_csv()
+
+chembl_kd_raw <- syn("syn52854574") %>%
+  read_csv()
 ```
 
-```{r}
-compounds_fully_profiled <- single_dose %>%
-    group_by(lspci_id) %>%
-    filter(uniqueN(`Compound Concentration (nM)`) >= 4) %>%
-    ungroup() %>%
-    distinct(lspci_id)
 
-kinomescan_pseudo_ic50s_comp <- kinomescan_pseudo_ic50s %>%
-    semi_join(
-        compounds_fully_profiled
-    ) %>%
-    inner_join(
-        kinomescan_kinase_info
-    ) %>%
-    inner_join(
-        kinomescan_classes
-    ) %>%
-    filter(`Kinase Form` == "Wild Type", classification != "discordant") %>%
-    select(lspci_id, name, Symbol = `Entrez Gene Symbol`, pseudo_ic50, classification)
+```{r}
+chembl_kd_all <- chembl_kd_raw %>%
+  filter(
+    standard_relation == "=" |
+      (standard_relation %in% c(">=", ">") & standard_value > 9000)
+  )
+
+chembl_kd_all_agg <- chembl_kd_all %>%
+  group_by(gene_symbol, lspci_id) %>%
+  summarize(
+    chembl_kd = quantile(standard_value, 0.25, na.rm = TRUE, names = FALSE) |>
+      pmin(10000),
+    chembl_kd_relation = paste(sort(unique(standard_relation)), collapse = ""),
+    .groups = "drop"
+  )
+
+chembl_kd_no_klaeger_agg <- chembl_kd_all %>%
+  filter(
+    pubmed_id != 29191878
+  ) %>%
+  group_by(gene_symbol, lspci_id) %>%
+  summarize(
+    chembl_kd = quantile(standard_value, 0.25, na.rm = TRUE, names = FALSE) |>
+      pmin(10000),
+    chembl_kd_relation = paste(sort(unique(standard_relation)), collapse = ""),
+    .groups = "drop"
+  )
+
+```
+
+
+```{r}
+kinomescan_kd_fits_comp <- kinomescan_kd_fits %>%
+  filter(
+    !exclude_target,
+    classification != "discordant"
+  ) %>%
+  transmute(
+    lspci_id, name, Symbol = `Entrez Gene Symbol`,
+    kd = pmin(kd, 10000),
+    classification
+  ) |>
+  # aggregate to kinase level by taking the most potent kd per kinase
+  group_by(lspci_id, Symbol) %>%
+  slice_min(kd, with_ties = FALSE) |>
+  ungroup()
 
 klaeger_ic50_comp <- klaeger_ic50s %>%
-    semi_join(
-        compounds_fully_profiled
-    ) %>%
-    select(lspci_id, Symbol = Name, IC50) %>%
-    inner_join(
-        kinomescan_pseudo_ic50s_comp
+  transmute(
+    lspci_id, Symbol = Name,
+    IC50 = pmin(IC50, 10000) |>
+      pmax(min(IC50[IC50 > 0], na.rm = TRUE) * 0.5)
+  ) %>%
+  power_inner_join(
+    kinomescan_kd_fits_comp,
+    by = c("lspci_id", "Symbol"),
+    check = check_specs(
+      unmatched_keys_left = "info",
+      unmatched_keys_right = "info",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn"
     )
+  )
 
 p <- klaeger_ic50_comp %>%
   ggplot(
     # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
-    aes(IC50, pseudo_ic50, color = classification)
+    aes(IC50, kd)
   ) +
-  geom_point(alpha = 0.5) +
-  scale_x_log10() +
-  scale_y_log10() +
+  geom_point(
+    alpha = 0.5,
+    shape = 16,
+    size = 1
+  ) +
+  geom_text(
+    aes(
+      label = paste0("  R = ", signif(r, 2))
+    ),
+    x = -Inf, y = Inf,
+    hjust = 0, vjust = 1,
+    data = \(x) tibble(
+      r = cor(log10(x$IC50), log10(x$kd), method = "pearson", use = "complete.obs")
+    ),
+    inherit.aes = FALSE
+  ) +
+  scale_x_log10(labels = scales::label_number(big.mark = "")) +
+  scale_y_log10(labels = scales::label_number(big.mark = "")) +
+  coord_equal() +
   labs(
-    x = "IC50 Klaeger",
-    y = "pseudo IC50 Eurofins"
+    x = "Kd Klaeger",
+    y = "Kd Kinomescan"
   )
 ggsave(
-    "plots/klaeger_ic50_vs_kinomescan_pseudo_ic50.pdf", p,
-    width = 8, height = 6
+    "plots/klaeger_kd_vs_kinomescan_kd.pdf", p,
+    width = 3, height = 3
 )
 
+
+```
+
+
+### Klaeger vs Chembl
+
+```{r}
+klaeger_ic50s_vs_chembl <- klaeger_ic50s %>%
+  power_inner_join(
+    chembl_kd_no_klaeger_agg,
+    by = c("lspci_id", "Name" = "gene_symbol"),
+    check = check_specs(
+      unmatched_keys_left = "info",
+      unmatched_keys_right = "info",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  mutate(
+    IC50 = pmin(IC50, 10000) |>
+      pmax(min(IC50[IC50 > 0], na.rm = TRUE) * 0.5)
+  )
+
+p <- ggplot(
+  klaeger_ic50s_vs_chembl,
+  aes(IC50, chembl_kd)
+) +
+  geom_point(
+    alpha = 0.5,
+    shape = 16,
+    size = 1
+  ) +
+  geom_text(
+    aes(
+      label = paste0("  R = ", signif(r, 2))
+    ),
+    x = -Inf, y = Inf,
+    hjust = 0, vjust = 1,
+    data = \(x) tibble(
+      r = cor(log10(x$IC50), log10(x$chembl_kd), method = "pearson", use = "complete.obs")
+    ),
+    inherit.aes = FALSE
+  ) +
+  scale_x_log10(labels = scales::label_number(big.mark = "")) +
+  scale_y_log10(labels = scales::label_number(big.mark = "")) +
+  coord_equal() +
+  labs(
+    x = "Kd Klaeger",
+    y = "Kd Chembl"
+  )
+
+p
+
+ggsave(
+    "plots/klaeger_kd_vs_chembl_kd.pdf", p,
+    width = 3, height = 3
+)
 ```
 
 Make venn diagram of overlap assayed compounds that we have information for

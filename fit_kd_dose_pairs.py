@@ -38,7 +38,7 @@ for conc_pair in possible_combinations:
     pair_name = f"{conc_pair[0]}_{conc_pair[1]}"
     df = fit_kd.fit_kd_from_dataframe(
         filtered,
-        db_path=pair_dataset_path / f"{pair_name}.db"
+        db_path=pair_dataset_path / f"{pair_name}.db",
     )
     if df is not None:
         df.to_csv(pair_dataset_path / f"{pair_name}.csv.gz", index=False)
@@ -48,6 +48,8 @@ kd_all_eligible = fit_kd.fit_kd_from_dataframe(
     okl_all_eligible,
     db_path=pair_dataset_path / f"all_eligible_concentrations.db"
 )
+if kd_all_eligible is not None:
+    kd_all_eligible.to_csv(pair_dataset_path / f"all_eligible_concentrations.csv.gz", index=False)
 
 def extract_posterior_matrices(db_path: pathlib.Path, n_samples: int):
     """Stream posterior samples into preallocated float32 matrices.
