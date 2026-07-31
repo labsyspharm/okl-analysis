@@ -80,16 +80,6 @@ chembl_kd <- chembl_kd_raw |>
     standard_relation == "=" |
       (standard_relation %in% c(">=", ">") & standard_value > 9000)
   ) |>
-  power_inner_join(
-    compound_mapping |>
-      filter(source == "chembl") |>
-      distinct(lspci_id, chembl_id_compound = external_id),
-    by = "chembl_id_compound",
-    check = check_specs(
-      duplicate_keys_right = "warn",
-      unmatched_keys_left = "warn"
-    )
-  ) |>
   group_by(gene_symbol, lspci_id) |>
   summarize(
     chembl_kd = quantile(standard_value, 0.25, na.rm = TRUE, names = FALSE),
@@ -108,11 +98,73 @@ chembl_kd <- chembl_kd_raw |>
 ```
 
 
+Checking which dose pairs actually contain two doses
+
+```{r}
+eligible_doses <- c(12.5, 100, 1000, 10000)
+
+kd_fit_pairs_check <- kd_fit_pairs |>
+  separate_wider_delim(
+    combination,
+    delim = "_",
+    names = c("dose1", "dose2"),
+    cols_remove = FALSE
+  ) |>
+  mutate(
+    across(
+      starts_with("dose"),
+      as.numeric
+    )
+  ) |>
+  power_left_join(
+    single_dose |>
+      transmute(
+        hmsl_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`,
+        dose_1_present = TRUE
+      ),
+    by = c("hmsl_id", "DiscoveRx Gene Symbol", "dose1" = "Compound Concentration (nM)"),
+    check = check_specs(
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  power_left_join(
+    single_dose |>
+      transmute(
+        hmsl_id, `DiscoveRx Gene Symbol`, `Compound Concentration (nM)`,
+        dose_2_present = TRUE
+      ),
+    by = c("hmsl_id", "DiscoveRx Gene Symbol", "dose2" = "Compound Concentration (nM)"),
+    check = check_specs(
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  mutate(
+    across(
+      ends_with("_present"),
+      \(x) replace_na(x, FALSE)
+    ),
+    both_doses_present = dose_1_present & dose_2_present
+  )
+
+kd_fit_pairs_check |>
+  group_by(combination) |>
+  summarize(
+    n_total = n(),
+    n_both_doses_present = sum(both_doses_present),
+    prop_both_doses_present = n_both_doses_present / n_total,
+    .groups = "drop"
+  )
+
+kd_fit_pairs_check |>
+  count(combination, both_doses_present, converged = rhat < 1.01)
+```
+
+
 ```{r}
 kd_comparison <- power_inner_join(
   kd_fits,
-  kd_fit_pairs |>
-    select(hmsl_id, `DiscoveRx Gene Symbol`, combination, combination_print, starts_with("kd"), hill_slope, rhat),
+  kd_fit_pairs_check |>
+    select(hmsl_id, `DiscoveRx Gene Symbol`, combination, combination_print, starts_with("kd"), hill_slope, rhat, both_doses_present),
   by = c("hmsl_id", "DiscoveRx Gene Symbol"),
   check = check_specs(
     duplicate_keys_left = "warn",
@@ -204,6 +256,9 @@ kd_comparison |>
 
 ```{r}
 kd_performance_summary <- kd_comparison |>
+  filter(
+    both_doses_present
+  ) |>
   bind_rows(
     kd_comparison |>
       filter(combination == "100_10000") |>
@@ -248,7 +303,8 @@ kd_performance_summary <- kd_comparison |>
 
 ```{r}
 p <- ggplot(
-  kd_comparison,
+  kd_comparison |>
+    filter(both_doses_present),
   aes(
     kd_log_diff_all,
     combination_print
@@ -273,7 +329,8 @@ ggsave(
 )
 
 p <- ggplot(
-  kd_comparison,
+  kd_comparison |>
+    filter(both_doses_present),
   aes(
     kd_log_diff_chembl,
     combination
@@ -290,6 +347,7 @@ p
 
 ```{r}
 kd_comparison |>
+  # filter(both_doses_present) |>
   group_by(combination, tas_kd) |>
   summarize(
     mean_square_diff_all = mean(kd_log_diff_all^2, na.rm = TRUE),
@@ -300,6 +358,7 @@ kd_comparison |>
   View()
 
 pair_combinations_overall_mse <- kd_comparison |>
+  filter(both_doses_present, rhat_all < 1.01, rhat_pairs < 1.01) |>
   power_inner_join(
     kd_comparison |>
       count(combination, tas_kd) |>
@@ -333,6 +392,7 @@ pair_combinations_overall_mse <- kd_comparison |>
   arrange(mean_square_diff_all)
 
 pair_combinations_cor_df <- kd_comparison |>
+  filter(both_doses_present) |>
   group_by(combination, combination_print) |>
   summarize(
     cor_res = cor(kd_log_all, kd_log_pairs, method = "pearson", use = "complete.obs"),
@@ -346,6 +406,7 @@ pair_combinations_cor_df <- kd_comparison |>
 ```{r}
 p <- ggplot(
   pair_combinations_overall_mse |>
+
     mutate(
       across(
         starts_with("combination"),
@@ -368,7 +429,7 @@ p <- ggplot(
 p
 
 ggsave(
-  here("plots", "pair_combinations_overall_mse.pdf"),
+  here("plots", "pair_combinations_overall_mse_v2.pdf"),
   p, width = 4, height = 3.5
 )
 
@@ -380,7 +441,21 @@ kd_comparison
 tas_colors <- c(`1` = "#b2182b", `2` = "#ef8a62", `3` = "#fddbc7", `10` = "#2166ac", `no data` = "#ffffff")
 
 p <- ggplot(
-  kd_comparison,
+  kd_comparison |>
+    filter(both_doses_present) |>
+    power_inner_join(
+      pair_combinations_cor_df,
+      by = c("combination", "combination_print"),
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        unmatched_keys_right = "warn",
+        duplicate_keys_right = "warn"
+      )
+    ) |>
+    mutate(
+      combination_print = fct_reorder(combination_print, r_squared) |>
+        fct_rev()
+    ),
   aes(
     kd_all,
     kd_pairs
@@ -391,7 +466,11 @@ p <- ggplot(
     aes(
       label = paste("R² =", signif(r_squared, 2))
     ),
-    data = pair_combinations_cor_df,
+    data = pair_combinations_cor_df |>
+      mutate(
+        combination_print = fct_reorder(combination_print, r_squared) |>
+          fct_rev()
+      ),
     x = -Inf, y = Inf,
     hjust = -0.1, vjust = 1.1
   ) +
@@ -417,7 +496,7 @@ p <- ggplot(
 p
 
 ggsave(
-  here("plots", "pair_kd_vs_all_hex.pdf"),
+  here("plots", "pair_kd_vs_all_hex_v2.pdf"),
   p, width = 7, height = 4
 )
 ```
