@@ -26,6 +26,11 @@ anything:
 4. Prior sensitivity: compares the default-prior all_eligible fit against the
    wide-prior subsample fit in prior_sensitivity_wide_kd_prior.csv.gz.
 
+5. Prior predictive checks: same PPC machinery as (1), but driven by i.i.d.
+   draws from the model's prior (no fitting, no stored posterior) via
+   PriorDraws, to check whether the prior itself implies a plausible spread
+   of dose-response behavior before any data is seen.
+
 Outputs CSV summary tables and PNG plots into ppc_report_output/.
 """
 
@@ -87,61 +92,132 @@ def load_observed_data():
     return df
 
 
+def filter_eligible_pairs(observed_df):
+    """Restrict to pairs tested at all 4 ELIGIBLE_CONCENTRATIONS, at exactly
+    those concentrations - the same "all_eligible" subset fit_kd_dose_pairs.py
+    fits, matching what all_eligible_posteriors.zarr covers. Needed for draw
+    sources like PriorDraws that don't naturally restrict to this subset the
+    way a zarr lookup keyed on those pairs does.
+    """
+    eligible = set(ELIGIBLE_CONCENTRATIONS)
+    df = observed_df[observed_df["Compound Concentration (nM)"].isin(eligible)]
+    group_keys = ["hmsl_id", "DiscoveRx Gene Symbol"]
+    complete = df.groupby(group_keys)["Compound Concentration (nM)"].apply(
+        lambda s: eligible.issubset(s)
+    )
+    keep = complete[complete].index
+    return df.set_index(group_keys).loc[keep].reset_index()
+
+
 def potency_bin(kd_log_molar):
     idx = np.digitize(kd_log_molar, POTENCY_BIN_EDGES_LOG_M[1:-1])
     return np.array(POTENCY_BIN_LABELS)[idx]
 
 
 # ---------------------------------------------------------------------------
-# 1. Posterior predictive checks
+# 1. Posterior / prior predictive checks
 # ---------------------------------------------------------------------------
 
 
-def compute_ppc(observed_df, zarr_group_path, group_name):
-    """Compute per-pair, per-dose PPC diagnostics.
+class ZarrDraws:
+    """Draw source backed by a zarr group of per-pair posterior draws (as
+    written by fit_kd_dose_pairs.py's extract_posterior_matrices/zarr export).
+
+    Each real (compound_id, target) pair has its own row of stored draws.
+    """
+
+    def __init__(self, zarr_group_path, group_name):
+        root = zarr.open_group(str(zarr_group_path), mode="r")
+        grp = root[group_name]
+        compound_ids = list(grp.attrs["compound_ids"])
+        targets = list(grp.attrs["targets"])
+        self._kd_log_draws = grp["kd"][:]  # (n_pairs, n_draws), log-Kd (molar)
+        self._hill_slope_log_draws = grp["hill_slope"][:]  # (n_pairs, n_draws), log-Hill-slope
+        self._row_by_key = {
+            (cid, tgt): i for i, (cid, tgt) in enumerate(zip(compound_ids, targets))
+        }
+
+    def keys(self):
+        return self._row_by_key.keys()
+
+    def get(self, compound_id, target):
+        i = self._row_by_key.get((compound_id, target))
+        if i is None:
+            return None
+        return self._kd_log_draws[i], self._hill_slope_log_draws[i]
+
+
+class PriorDraws:
+    """Draw source that ignores compound_id/target entirely and returns i.i.d.
+    samples from the model's prior (fit_kd_cli._create_model's kd_log/
+    hill_slope_log priors) for every pair. Since the prior doesn't depend on
+    the pair, one shared pool of draws is sampled once and reused for all
+    pairs (this is a prior predictive check, not a per-pair posterior).
+    """
+
+    def __init__(self, n_draws=8000, kd_log_sigma=3, hill_slope_log_sigma=0.5, seed=0):
+        rng = np.random.default_rng(seed)
+        self._kd_log_draws = rng.normal(np.log(1e-6), kd_log_sigma, size=n_draws)
+        self._hill_slope_log_draws = rng.normal(0, hill_slope_log_sigma, size=n_draws)
+
+    def get(self, compound_id, target):
+        return self.sample()
+
+    def sample(self):
+        """Return the shared (kd_log_draws, hill_slope_log_draws) pool directly, without needing a (compound_id, target) key."""
+        return self._kd_log_draws, self._hill_slope_log_draws
+
+
+def _ppc_for_pair(kd, hill_slope, doses_molar, responses):
+    """Per-dose PPC diagnostics for one pair, given already-exponentiated
+    kd/hill_slope draws (shape (n_draws,)) and that pair's observed doses/
+    responses. Returns arrays (p_values, std_resid, mean_mu, mean_sigma).
+    """
+    mu = _model_predict_np(kd[None, :], hill_slope[None, :], doses_molar[None, :])[0]
+    sigma = _error_model_np(mu)
+
+    # Bayesian predictive p-value per dose, averaged over draws:
+    # P(replicated response >= observed | draws), analytically via Normal CDF.
+    p_values = stats.norm.sf(responses[:, None], loc=mu.T, scale=sigma.T).mean(axis=1)
+
+    mean_mu = mu.mean(axis=0)
+    mean_sigma = sigma.mean(axis=0)
+    std_resid = (responses - mean_mu) / mean_sigma
+    return p_values, std_resid, mean_mu, mean_sigma
+
+
+def compute_ppc(observed_df, draw_source):
+    """Compute per-pair, per-dose PPC diagnostics for every real
+    (compound_id, target) pair in observed_df, using kd_log/hill_slope_log
+    draws supplied by draw_source.get(compound_id, target).
+
+    draw_source may be a ZarrDraws (one draw set per real pair, i.e. a
+    posterior predictive check) or a PriorDraws (a shared draw set reused for
+    every pair, i.e. a prior predictive check) - compute_ppc doesn't care
+    which, it only needs .get(compound_id, target) -> (kd_log_draws,
+    hill_slope_log_draws) | None.
 
     Returns a DataFrame with one row per (compound_id, target, dose) with
-    columns: p_value (Bayesian posterior predictive p-value), std_resid
-    (standardized residual using posterior-mean mu/sigma).
+    columns: ppc_p_value (Bayesian predictive p-value), std_resid
+    (standardized residual using mean mu/sigma across draws).
     """
-    root = zarr.open_group(str(zarr_group_path), mode="r")
-    grp = root[group_name]
-    compound_ids = list(grp.attrs["compound_ids"])
-    targets = list(grp.attrs["targets"])
-    kd_log_draws = grp["kd"][:]  # (n_pairs, n_draws), log-Kd (molar)
-    hill_slope_log_draws = grp["hill_slope"][:]  # (n_pairs, n_draws), log-Hill-slope
-
-    pair_index = pd.DataFrame(
-        {"compound_id": compound_ids, "target": targets, "row": np.arange(len(compound_ids))}
-    )
-
     obs_grouped = observed_df.groupby(["hmsl_id", "DiscoveRx Gene Symbol"])
 
     records = []
-    for _, prow in pair_index.iterrows():
-        key = (prow["compound_id"], prow["target"])
-        if key not in obs_grouped.groups:
+    for key, pair_obs in obs_grouped:
+        draws = draw_source.get(*key)
+        if draws is None:
             continue
-        pair_obs = obs_grouped.get_group(key)
+        kd_log_draws, hill_slope_log_draws = draws
         doses_molar = pair_obs["Compound Concentration (nM)"].to_numpy() * 1e-9
         responses = pair_obs["Percent Control"].to_numpy()
 
-        i = prow["row"]
-        kd = np.exp(kd_log_draws[i]).astype(np.float64)
-        hill_slope = np.exp(hill_slope_log_draws[i]).astype(np.float64)
+        kd = np.exp(kd_log_draws).astype(np.float64)
+        hill_slope = np.exp(hill_slope_log_draws).astype(np.float64)
 
-        mu = _model_predict_np(kd[None, :], hill_slope[None, :], doses_molar[None, :])[0]
-        sigma = _error_model_np(mu)
+        p_values, std_resid, _, _ = _ppc_for_pair(kd, hill_slope, doses_molar, responses)
 
-        # Bayesian posterior predictive p-value per dose, averaged over draws:
-        # P(replicated response >= observed | posterior), analytically via Normal CDF.
-        p_values = stats.norm.sf(responses[:, None], loc=mu.T, scale=sigma.T).mean(axis=1)
-
-        mean_mu = mu.mean(axis=0)
-        mean_sigma = sigma.mean(axis=0)
-        std_resid = (responses - mean_mu) / mean_sigma
-
-        kd_log_mean_molar = kd_log_draws[i].mean()
+        kd_log_mean_molar = kd_log_draws.mean()
         for dose, resp, p, sr in zip(doses_molar, responses, p_values, std_resid):
             records.append(
                 {
@@ -408,6 +484,102 @@ def summarize_prior_sensitivity(all_eligible_csv_path, wide_prior_csv_path):
 
 
 # ---------------------------------------------------------------------------
+# 5. Prior predictive checks
+# ---------------------------------------------------------------------------
+
+
+def summarize_prior_ppc_by_dose(prior_ppc_df):
+    """Per-dose summary of the prior predictive p-value distribution, pooled
+    across all pairs (there is no meaningful potency-bin stratification here:
+    every pair is checked against the same shared prior draws, so
+    kd_log_mean_molar is ~constant across pairs by construction).
+    """
+    return prior_ppc_df.groupby("dose_molar").agg(
+        n_pairs=("compound_id", "size"),
+        mean_ppc_p_value=("ppc_p_value", "mean"),
+        std_ppc_p_value=("ppc_p_value", "std"),
+    )
+
+
+def plot_prior_ppc_by_dose(prior_ppc_df, out_path):
+    """Prior predictive check: distribution of the *simulated* response at
+    each tested dose, drawn purely from the prior (before seeing any data).
+
+    Unlike the posterior check, the healthy/expected result here is a wide,
+    non-degenerate spread across the observable 0-100% range at every dose -
+    a prior that instead piles up responses at an implausible extreme (e.g.
+    all mass pinned at 0% or 100%) would indicate the prior itself, not just
+    the fitted posterior, encodes an unreasonable assumption.
+    """
+    doses_nm = np.sort(prior_ppc_df["dose_molar"].unique())
+    fig, axes = plt.subplots(1, len(doses_nm), figsize=(4 * len(doses_nm), 3), sharey=True)
+    for ax, dose in zip(axes, doses_nm):
+        sub = prior_ppc_df[prior_ppc_df["dose_molar"] == dose]
+        ax.hist(sub["simulated_response"], bins=30, range=(0, 100), color="indianred")
+        ax.set_title(f"dose = {dose * 1e9:.0f} nM", fontsize=9)
+        ax.set_xlabel("simulated % control")
+    axes[0].set_ylabel("count (prior draws)")
+    fig.suptitle("Prior predictive response distribution by dose")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_prior_ppc_pvalues_by_dose(prior_ppc_df, out_path):
+    """Bayesian p-value distribution for the prior predictive check: at each
+    tested dose, P(prior-predicted response >= observed | prior) for every
+    real pair's actual observed response, pooled across pairs.
+
+    This is the prior-predictive analogue of plot_ppc_calibration_by_dose_only,
+    but the interpretation differs: since every pair is checked against the
+    *same* shared prior (not its own fitted posterior), a flat/uniform-ish
+    distribution here would be a coincidence, not the goal. What matters is
+    whether real observed responses fall in the extreme tails of the prior
+    (p near 0 or 1) at a concerning rate - that would mean the prior assigns
+    real, commonly-observed data very low prior predictive density, i.e. the
+    prior is too narrow/informative relative to what the data actually looks
+    like. A wide, non-extreme spread (mass away from 0/1) is the healthy result.
+    """
+    doses_nm = np.sort(prior_ppc_df["dose_molar"].unique())
+    fig, axes = plt.subplots(1, len(doses_nm), figsize=(4 * len(doses_nm), 3), sharey=True)
+    for ax, dose in zip(axes, doses_nm):
+        sub = prior_ppc_df[prior_ppc_df["dose_molar"] == dose]
+        n_pairs = sub[["compound_id", "target"]].drop_duplicates().shape[0]
+        ax.hist(sub["ppc_p_value"], bins=20, range=(0, 1), color="indianred", density=True)
+        ax.axhline(1, color="black", linestyle="--", linewidth=1)
+        ax.set_title(f"dose = {dose * 1e9:.0f} nM\n(n={n_pairs} pairs)", fontsize=9)
+        ax.set_xlabel("prior predictive p-value")
+    axes[0].set_ylabel("density (per dose point)")
+    fig.suptitle(
+        "Prior predictive Bayesian p-value by dose: P(prior-simulated response >= observed)"
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def sample_prior_predictive_responses(draw_source, doses_molar, seed=0):
+    """Draw one simulated response per prior draw at each dose, for plotting
+    the raw prior predictive distribution (not just a p-value against real
+    data). Returns a long DataFrame with columns dose_molar, simulated_response.
+    """
+    kd_log_draws, hill_slope_log_draws = draw_source.sample()
+    kd = np.exp(kd_log_draws).astype(np.float64)
+    hill_slope = np.exp(hill_slope_log_draws).astype(np.float64)
+
+    mu = _model_predict_np(kd[None, :], hill_slope[None, :], doses_molar[None, :])[0]
+    sigma = _error_model_np(mu)
+
+    rng = np.random.default_rng(seed)
+    simulated = rng.normal(mu, sigma)  # (n_draws, n_doses)
+
+    records = []
+    for j, dose in enumerate(doses_molar):
+        records.extend({"dose_molar": dose, "simulated_response": r} for r in simulated[:, j])
+    return pd.DataFrame.from_records(records)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -432,11 +604,10 @@ def main(overwrite=False):
         ppc_df = pd.read_csv(ppc_per_dose_path)
     else:
         print("Computing posterior predictive checks...")
-        ppc_df = compute_ppc(
-            get_observed_df(),
-            PAIR_DATASET_PATH / "all_eligible_posteriors.zarr",
-            "all_eligible_concentrations",
+        draw_source = ZarrDraws(
+            PAIR_DATASET_PATH / "all_eligible_posteriors.zarr", "all_eligible_concentrations"
         )
+        ppc_df = compute_ppc(get_observed_df(), draw_source)
         ppc_df.to_csv(ppc_per_dose_path, index=False)
 
     if not overwrite and ppc_per_pair_path.exists():
@@ -496,6 +667,25 @@ def main(overwrite=False):
         print(prior_summary)
     else:
         print("prior_sensitivity_wide_kd_prior.csv.gz not found yet; skipping.")
+
+    print("Computing prior predictive checks...")
+    prior_draws = PriorDraws()
+    prior_ppc_per_dose_path = OUTPUT_PATH / "prior_ppc_per_dose.csv.gz"
+    if not overwrite and prior_ppc_per_dose_path.exists():
+        print(f"Loading cached {prior_ppc_per_dose_path}...")
+        prior_ppc_df = pd.read_csv(prior_ppc_per_dose_path)
+    else:
+        prior_ppc_df = compute_ppc(filter_eligible_pairs(get_observed_df()), prior_draws)
+        prior_ppc_df.to_csv(prior_ppc_per_dose_path, index=False)
+    prior_ppc_summary = summarize_prior_ppc_by_dose(prior_ppc_df)
+    prior_ppc_summary.to_csv(OUTPUT_PATH / "prior_ppc_summary_by_dose.csv")
+    print(prior_ppc_summary)
+
+    plot_prior_ppc_pvalues_by_dose(prior_ppc_df, OUTPUT_PATH / "prior_ppc_pvalues_by_dose.png")
+
+    doses_molar = np.sort(prior_ppc_df["dose_molar"].unique())
+    prior_predictive_responses = sample_prior_predictive_responses(prior_draws, doses_molar)
+    plot_prior_ppc_by_dose(prior_predictive_responses, OUTPUT_PATH / "prior_ppc_by_dose.png")
 
     print(f"Done. Outputs written to {OUTPUT_PATH}/")
 
