@@ -104,7 +104,10 @@ pseudo_kd_comp <- kinomescan_pseudo_kds %>%
   filter(dataset == "original_repeat_replaced") %>%
   power_left_join(
     kinomescan_kd_fits %>%
-      filter(dataset == "original_repeat_replaced") %>%
+      filter(
+        dataset == "original_repeat_replaced",
+        rhat < 1.01
+      ) %>%
       transmute(
         hmsl_id, `DiscoveRx Gene Symbol`,
         kd_relation = if_else(
@@ -502,21 +505,30 @@ chembl_kd <- chembl_kd_raw %>%
     standard_relation == "=" |
       (standard_relation %in% c(">=", ">") & standard_value > 9000)
   ) %>%
-  power_inner_join(
-    compound_mapping %>%
-      filter(source == "chembl") %>%
-      distinct(lspci_id, chembl_id_compound = external_id),
-    by = "chembl_id_compound",
-    check = check_specs(
-      duplicate_keys_right = "warn",
-      unmatched_keys_left = "warn"
-    )
-  ) %>%
+  # power_inner_join(
+  #   compound_mapping %>%
+  #     filter(source == "chembl") %>%
+  #     distinct(lspci_id, chembl_id_compound = external_id),
+  #   by = "chembl_id_compound",
+  #   check = check_specs(
+  #     duplicate_keys_right = "warn",
+  #     unmatched_keys_left = "warn"
+  #   )
+  # ) %>%
   group_by(gene_symbol, lspci_id) %>%
   summarize(
     chembl_kd = quantile(standard_value, 0.25, na.rm = TRUE, names = FALSE),
     chembl_kd_relation = paste(sort(unique(standard_relation)), collapse = ""),
     .groups = "drop"
+  ) %>%
+  power_inner_join(
+    kinomescan_pseudo_kds %>%
+      distinct(lspci_id, hmsl_id, library, name),
+    by = c("lspci_id"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
   ) %>%
   power_inner_join(
     kinomescan_kinase_info %>%
@@ -527,6 +539,11 @@ chembl_kd <- chembl_kd_raw %>%
       unmatched_keys_left = "warn"
     )
   )
+
+write_csv(
+  chembl_kd,
+  file.path("data/chembl_kd_filtered.csv.gz")
+)
 
 chembl_kd %>%
   count(chembl_kd_relation)
@@ -541,11 +558,14 @@ pseudo_kd_kd_comp <- kinomescan_pseudo_kds %>%
   ) %>%
   inner_join(
     chembl_kd,
-    by = c("lspci_id", "DiscoveRx Gene Symbol")
+    by = c("lspci_id", "hmsl_id", "library", "name", "DiscoveRx Gene Symbol")
   ) %>%
   power_left_join(
     kinomescan_kd_fits %>%
-      filter(dataset == "original_repeat_replaced") %>%
+      filter(
+        dataset == "original_repeat_replaced",
+        rhat < 1.01
+      ) %>%
       transmute(
         hmsl_id, `DiscoveRx Gene Symbol`,
         kd_relation = if_else(
@@ -718,10 +738,10 @@ ggsave(
 tas_colors <- c(`1` = "#b2182b", `2` = "#ef8a62", `3` = "#fddbc7", `10` = "#2166ac", `no data` = "#ffffff")
 
 p_scatter <- pseudo_kd_kd_comp %>%
-  drop_na(pseudo_kd) %>%
+  drop_na(kd) %>%
   filter(
     # pseudo_ic50_relation == "=",
-    pseudo_kd_concordant == "concordant",
+    # pseudo_kd_concordant == "concordant",
     classification != "discordant"
   ) %>%
   mutate(
@@ -952,7 +972,7 @@ p_scatter <- pseudo_kd_kd_comp %>%
   drop_na(pseudo_kd) %>%
   filter(
     # pseudo_ic50_relation == "=",
-    pseudo_kd_concordant == "concordant",
+    # pseudo_kd_concordant == "concordant",
     classification != "discordant"
   ) %>%
   mutate(chembl_kd = pmin(chembl_kd, 10000)) %>%
