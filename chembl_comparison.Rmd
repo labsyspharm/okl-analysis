@@ -13,8 +13,8 @@ syn <- synDownloader("~/data", .cache = TRUE)
 ```
 
 ```{r}
-kinomescan_pseudo_kds <- syn("syn51080578") %>%
-  read_csv()
+# kinomescan_pseudo_kds <- syn("syn51080578") %>%
+#   read_csv()
 
 kinomescan_kd_fits <- syn("syn69680641") %>%
   read_csv()
@@ -37,20 +37,7 @@ chembl_kd_raw <- syn("syn52854574") %>%
 coral_map <- syn("syn61680422") %>%
   read_csv()
 
-# qpcr_misses <- syn("syn33531640") %>%
-#   readxl::read_excel() %>%
-#   left_join(
-#     compound_mapping[, .(lspci_id, external_id)] %>%
-#       unique(),
-#     by = c("Compound Name" = "external_id")
-#   )
-
-# lsp_biochem <- syn("syn25173511") %>%
-#   read_fst()
 lsp_targets <- syn("syn25173506") %>%
-  read_fst()
-
-lsp_biochem_single <- syn("syn25173513") %>%
   read_fst()
 
 nominal_targets <- syn("syn52947779") %>%
@@ -70,23 +57,6 @@ lsp_clinical <- syn("syn26260451") %>%
   as_tibble()
 ```
 
-Aggregate ChEMBL IC50 values. Remove any values that
-have relation that is not "=" unless the relation is ">" or ">=" and the value
-is greater than 9000. This is to avoid underestimating IC50s for cases where
-people just didn't assay higher concentrations.
-
-```{r}
-lsp_biochem <- lsp_biochem_single %>%
-  filter(
-    value_relation == "=" |
-      (value_relation %in% c(">=", ">") & value > 9000)
-  ) %>%
-  group_by(lspci_id, lspci_target_id) %>%
-  summarize(
-    value = quantile(value, 0.25, na.rm = TRUE, names = FALSE),
-    .groups = "drop"
-  )
-```
 
 ```{r pseudo_ic50_vs_kd}
 class_colors <- c(
@@ -96,406 +66,13 @@ class_colors <- c(
     "non-binding" = "black",
     "discordant" = "blue"
 )
-
-pseudo_kd_comp <- kinomescan_pseudo_kds %>%
-  mutate(
-    across(classification, \(x) factor(x, levels = names(class_colors)))
-  ) %>%
-  filter(dataset == "original_repeat_replaced") %>%
-  power_left_join(
-    kinomescan_kd_fits %>%
-      filter(
-        dataset == "original_repeat_replaced",
-        rhat < 1.01
-      ) %>%
-      transmute(
-        hmsl_id, `DiscoveRx Gene Symbol`,
-        kd_relation = if_else(
-          kd > 10000, ">", "="
-        ),
-        kd = pmin(kd, 10000),
-        tas_kd
-      ),
-    by = c("hmsl_id", "DiscoveRx Gene Symbol"),
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    )
-  ) %>%
-  power_left_join(
-    lsp_targets %>%
-      filter(organism == "Homo sapiens") %>%
-      select(lspci_target_id, symbol),
-    by = c("hgnc_symbol" = "symbol"),
-    check = check_specs(
-      duplicate_keys_left = "ignore",
-      duplicate_keys_right = "ignore",
-      unmatched_keys_left = "warn",
-      unmatched_keys_right = "ignore"
-    )
-  ) %>%
-  filter(
-    !exclude_target
-  ) %>%
-  inner_join(
-    lsp_biochem,
-    by = c("lspci_id", "lspci_target_id")
-  ) %>%
-  left_join(
-    lsp_clinical %>%
-      filter(max_phase == 4) %>%
-      transmute(lspci_id, fda_approved = TRUE) %>%
-      distinct(),
-    by = "lspci_id"
-  ) %>%
-  left_join(
-    nominal_targets %>%
-      mutate(nominal_target = TRUE),
-    by = c("lspci_id", "DiscoveRx Gene Symbol")
-  ) %>%
-  replace_na(
-    list(fda_approved = FALSE, nominal_target = FALSE)
-  ) %>%
-  mutate(
-    fda_target = case_when(
-      !fda_approved ~ "no",
-      !nominal_target ~ "offtarget",
-      TRUE ~ "ontarget"
-    ) %>%
-      factor(levels = c("ontarget", "offtarget", "no"))
-  )
-
-
 ```
 
-Check weird cases where we have pseudo Kd < 1000 uM but binding
-is classified as non-binding. Probably results mostly of cases
-where entire binding curve is between 50-35% control so the 35% threshold
-is never triggered but the 50% threshold for Kd is.
-
-```{r}
-pseudo_kd_comp %>%
-    filter(pseudo_kd < 1000, classification == "non-binding", pseudo_kd_concordant == "concordant")
-
-```
-
-Only 152 such cases. Not worth worrying about.
-
-Make scatterplot of ChEMBL IC50 vs KINOMEscan pseudo-Kd
-Also show distribution of pseudo-IC50 values for each binding class as
-beeswarm plot.
-
-```{r}
-p_scatter <- pseudo_kd_comp %>%
-  drop_na(pseudo_kd) %>%
-  arrange(nominal_target) %>%
-  filter(
-    # pseudo_ic50_relation == "=",
-    pseudo_kd_concordant == "concordant",
-    classification != "discordant"
-  ) %>%
-  # Clamp values >10000 to 10000
-  mutate(value = pmin(value, 10000)) %>%
-  ggplot(
-    # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
-    aes(
-      value, pseudo_kd,
-      fill = classification, color = fda_target,
-      text = paste(
-        name, `DiscoveRx Gene Symbol`,
-        "<br>ChEMBL", signif(value, 2), "nM Eurofins", signif(pseudo_kd, 2), "nM"
-      )
-    )
-  ) +
-  geom_point(aes(size = fda_target, shape = pseudo_kd_relation)) +
-  geom_text(
-    aes(label = label),
-    data = \(df) df %>%
-      mutate(across(c(value, pseudo_kd), \(x) -log10(x))) %>%
-      summarize(
-        res = cor.test(
-          value, pseudo_kd
-        ) %>%
-          broom::tidy() %>%
-          list()
-      ) %>%
-      unnest(res) %>%
-      mutate(label = paste("italic(R)^2 ==", signif(estimate**2, 2))),
-    x = -Inf, y = Inf, hjust = 0, vjust = 1,
-    inherit.aes = FALSE, parse = TRUE
-  ) +
-  scale_shape_manual(
-    values = c(
-      `<` = 25, `>` = 24, `=` = 21
-    ),
-    guide = "none"
-  ) +
-  scale_fill_manual(
-    values = map_chr(class_colors, \(x) alpha(x, alpha = 0.5)),
-    guide = guide_legend(override.aes = list(color = alpha("white", 0), shape = 21, alpha = 1))
-  ) +
-  scale_color_manual(
-    values = c(
-      `ontarget` = alpha("black", .9),
-      `offtarget` = alpha("blue", 0),
-      `no` = alpha("purple", 0)
-    ),
-    guide = "none"
-  ) +
-  scale_size_manual(
-    values = c(`ontarget` = 1.5, `offtarget` = 1, `no` = 1),
-    guide = "none"
-  ) +
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
-  scale_y_log10(labels = scales::label_number(big.mark = "")) +
-  coord_equal() +
-  labs(
-    x = "IC50 (ChEMBL)",
-    y = "Pseudo-Kd (KINOMEscan)"
-  )
-
-ggsave(
-    "plots/chembl_ic50_vs_kinomescan_pseudo_kd_new.pdf", p_scatter,
-    width = 8, height = 3
-)
-
-library(plotly)
-
-p_scatter_plotly <- ggplotly(p_scatter, tooltip = "text") %>%
-  toWebGL()
-
-htmlwidgets::saveWidget(p_scatter_plotly, "plots/chembl_ic50_vs_kinomescan_pseudo_kd.html")
-
-library(ggbeeswarm)
-library(ggtext)
-library(glue)
-
-class_labels <- glue_data(
-  distinct(pseudo_kd_comp, classification) %>%
-    filter(classification != "discordant"),
-  "<span style='font-weight: bold; color: {class_colors[classification]}'>{classification}</span>"
-) %>%
-  set_names(
-    distinct(pseudo_kd_comp, classification) %>%
-      filter(classification != "discordant") %>%
-      pull(classification)
-  )
-
-p_beeswarm <- pseudo_kd_comp %>%
-  filter(
-    pseudo_kd_concordant == "concordant",
-    # pseudo_ic50_relation == "=",
-    classification != "discordant"
-  ) %>%
-  mutate(
-    classification = factor(
-      classification,
-      levels = names(class_colors) %>%
-        rev()
-    ),
-    value = pmin(value, 10000)
-  ) %>%
-  ggplot(
-    aes(value, classification, color = classification)
-  ) +
-  geom_quasirandom(groupOnX = FALSE, shape = 16, size = 1, alpha = 0.5) +
-  geom_boxplot(fill = NA, outlier.shape = NA) +
-  scale_color_manual(values = class_colors) +
-  guides(color = "none") +
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
-  scale_y_discrete(labels = class_labels) +
-  theme(axis.text.y = element_markdown()) +
-  labs(x = "IC50 (ChEMBL)", y = NULL)
-
-ggsave(
-    "plots/chembl_ic50_by_kinomescan_class_beeswarm.pdf", p_beeswarm,
-    width = 7, height = 3
-)
-
-library(patchwork)
-p_combined <- egg::ggarrange(
-    p_scatter +
-        labs(x = NULL) +
-        guides(color = "none") +
-        theme(
-            axis.text.x = element_blank(),
-            plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
-        ),
-    p_beeswarm +
-        coord_fixed(ratio = .32) +
-        theme(
-            plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm"),
-            legend.position = "bottom"
-        ),
-    nrow = 2,
-    heights = c(2, 1.2),
-    draw = FALSE
-)
-
-ggsave(
-    "plots/chembl_ic50_by_comparison_combined_new_with_nominal_fda.pdf", p_combined,
-    width = 6, height = 4.5
-)
-```
-
-Same thing for new fitted Kd values
-
-```{r}
-p_scatter <- pseudo_kd_comp %>%
-  drop_na(kd) %>%
-  arrange(nominal_target) %>%
-  filter(
-    classification != "discordant"
-  ) %>%
-  # Clamp values >10000 to 10000
-  mutate(value = pmin(value, 10000)) %>%
-  ggplot(
-    # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
-    aes(
-      value, kd,
-      fill = classification, color = fda_target,
-      text = paste(
-        name, `DiscoveRx Gene Symbol`,
-        "<br>ChEMBL", signif(value, 2), "nM Eurofins", signif(kd, 2), "nM"
-      )
-    )
-  ) +
-  geom_point(aes(size = fda_target, shape = kd_relation)) +
-  geom_text(
-    aes(label = label),
-    data = \(df) df %>%
-      mutate(across(c(value, kd), \(x) log10(x))) %>%
-      summarize(
-        res = cor.test(
-          value, kd
-        ) %>%
-          broom::tidy() %>%
-          list()
-      ) %>%
-      unnest(res) %>%
-      mutate(label = paste("R ==", signif(estimate, 2))),
-    x = -Inf, y = Inf, hjust = 0, vjust = 1,
-    inherit.aes = FALSE, parse = TRUE
-  ) +
-  scale_shape_manual(
-    values = c(
-      `<` = 25, `>` = 24, `=` = 21
-    ),
-    guide = "none"
-  ) +
-  scale_fill_manual(
-    values = map_chr(class_colors, \(x) alpha(x, alpha = 0.5)),
-    guide = guide_legend(override.aes = list(color = alpha("white", 0), shape = 21, alpha = 1))
-  ) +
-  scale_color_manual(
-    values = c(
-      `ontarget` = alpha("black", .9),
-      `offtarget` = alpha("blue", 0),
-      `no` = alpha("purple", 0)
-    ),
-    guide = "none"
-  ) +
-  scale_size_manual(
-    values = c(`ontarget` = 1.5, `offtarget` = 1, `no` = 1),
-    guide = "none"
-  ) +
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
-  scale_y_log10(labels = scales::label_number(big.mark = "")) +
-  coord_equal() +
-  labs(
-    x = "IC50 (ChEMBL)",
-    y = "Fit Kd (KINOMEscan)"
-  )
-
-ggsave(
-    "plots/chembl_ic50_vs_kinomescan_fit_kd_new.pdf", p_scatter,
-    width = 8, height = 5
-)
-
-library(plotly)
-
-p_scatter_plotly <- ggplotly(p_scatter, tooltip = "text") %>%
-  toWebGL()
-
-htmlwidgets::saveWidget(p_scatter_plotly, "plots/chembl_ic50_vs_kinomescan_pseudo_kd.html")
-
-library(ggbeeswarm)
-library(ggtext)
-library(glue)
-
-class_labels <- glue_data(
-  distinct(pseudo_kd_comp, classification) %>%
-    filter(classification != "discordant"),
-  "<span style='font-weight: bold; color: {class_colors[classification]}'>{classification}</span>"
-) %>%
-  set_names(
-    distinct(pseudo_kd_comp, classification) %>%
-      filter(classification != "discordant") %>%
-      pull(classification)
-  )
-
-p_beeswarm <- pseudo_kd_comp %>%
-  filter(
-    # pseudo_ic50_relation == "=",
-    classification != "discordant"
-  ) %>%
-  mutate(
-    classification = factor(
-      classification,
-      levels = names(class_colors) %>%
-        rev()
-    ),
-    value = pmin(value, 10000)
-  ) %>%
-  ggplot(
-    aes(value, classification, color = classification)
-  ) +
-  geom_quasirandom(groupOnX = FALSE, shape = 16, size = 1, alpha = 0.5) +
-  geom_boxplot(fill = NA, outlier.shape = NA) +
-  scale_color_manual(values = class_colors) +
-  guides(color = "none") +
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
-  scale_y_discrete(labels = class_labels) +
-  theme(axis.text.y = element_markdown()) +
-  labs(x = "IC50 (ChEMBL)", y = NULL)
-
-ggsave(
-    "plots/chembl_ic50_by_kinomescan_class_beeswarm.pdf", p_beeswarm,
-    width = 7, height = 3
-)
-
-library(patchwork)
-p_combined <- egg::ggarrange(
-    p_scatter +
-        labs(x = NULL) +
-        guides(color = "none") +
-        theme(
-            axis.text.x = element_blank(),
-            plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
-        ),
-    p_beeswarm +
-        coord_fixed(ratio = .32) +
-        theme(
-            plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm"),
-            legend.position = "bottom"
-        ),
-    nrow = 2,
-    heights = c(2, 1.2),
-    draw = FALSE
-)
-
-ggsave(
-    "plots/chembl_ic50_by_comparison_combined_new_with_nominal_fda.pdf", p_combined,
-    width = 6, height = 4.5
-)
-```
-
-
-Now load the ChEMBL Kd only data and compare to KINOMEscan pseudo-IC50
+Now load the ChEMBL Kd only data and compare to KINOMEscan fitted Kd values.
 
 Remove any ChEMBL Kd values that have relation that is not "=" unless
-the relation is ">" or ">=" and the value is greater than 9000.
+the relation is ">" or ">=" and the value is greater than 9000 (basically)
+confirmed non-binders where higher concentrations were not screened.
 
 
 ```{r}
@@ -522,12 +99,12 @@ chembl_kd <- chembl_kd_raw %>%
     .groups = "drop"
   ) %>%
   power_inner_join(
-    kinomescan_pseudo_kds %>%
+    kinomescan_kd_fits %>%
       distinct(lspci_id, hmsl_id, library, name),
     by = c("lspci_id"),
     check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_right = "warn"
+      unmatched_keys_left = "info",
+      duplicate_keys_right = "info"
     )
   ) %>%
   power_inner_join(
@@ -535,8 +112,7 @@ chembl_kd <- chembl_kd_raw %>%
       distinct(hgnc_symbol, `DiscoveRx Gene Symbol`),
     by = c("gene_symbol" = "hgnc_symbol"),
     check = check_specs(
-      duplicate_keys_right = "ignore",
-      unmatched_keys_left = "warn"
+      unmatched_keys_left = "info"
     )
   )
 
@@ -548,38 +124,24 @@ write_csv(
 chembl_kd %>%
   count(chembl_kd_relation)
 
-pseudo_kd_kd_comp <- kinomescan_pseudo_kds %>%
+kd_fit_kd_comp <- kinomescan_kd_fits %>%
   mutate(
     across(classification, \(x) factor(x, levels = names(class_colors)))
   ) %>%
   filter(
     dataset == "original_repeat_replaced",
-    !exclude_target
+    !exclude_target,
+    rhat < 1.01
+  ) %>%
+  mutate(
+    kd_relation = if_else(
+      kd > 10000, ">", "="
+    ),
+    kd = pmin(kd, 10000),
   ) %>%
   inner_join(
     chembl_kd,
     by = c("lspci_id", "hmsl_id", "library", "name", "DiscoveRx Gene Symbol")
-  ) %>%
-  power_left_join(
-    kinomescan_kd_fits %>%
-      filter(
-        dataset == "original_repeat_replaced",
-        rhat < 1.01
-      ) %>%
-      transmute(
-        hmsl_id, `DiscoveRx Gene Symbol`,
-        kd_relation = if_else(
-          kd > 10000, ">", "="
-        ),
-        kd = pmin(kd, 10000),
-        tas_kd
-      ),
-    by = c("hmsl_id", "DiscoveRx Gene Symbol"),
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      duplicate_keys_left = "warn",
-      duplicate_keys_right = "warn"
-    )
   ) %>%
   left_join(
     lsp_clinical %>%
@@ -609,7 +171,7 @@ pseudo_kd_kd_comp <- kinomescan_pseudo_kds %>%
 
 
 ```{r}
-p_scatter <- pseudo_kd_kd_comp %>%
+p_scatter <- kd_fit_kd_comp %>%
   drop_na(kd) %>%
   filter(
     # pseudo_ic50_relation == "=",
@@ -666,7 +228,7 @@ p_scatter <- pseudo_kd_kd_comp %>%
   coord_equal() +
   labs(
     x = "Kd (ChEMBL)",
-    y = "Pseudo-Kd (KINOMEscan)",
+    y = "Fitted Kd (KINOMEscan)",
     fill = "Class"
   )
 # NA warning comes from values outside of plotted range
@@ -676,7 +238,7 @@ ggsave(
     width = 8, height = 4
 )
 
-p_beeswarm <- pseudo_kd_kd_comp %>%
+p_beeswarm <- kd_fit_kd_comp %>%
   filter(
     pseudo_kd_concordant == "concordant",
     # pseudo_ic50_relation == "=",
