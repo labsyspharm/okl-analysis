@@ -25,7 +25,14 @@ eligible_concentrations = [12.5, 100, 1000, 10000]
 possible_combinations = list(itertools.combinations(eligible_concentrations, 2))
 
 def filter_dataset_conc(dataset, concentrations):
-    return dataset[dataset["Compound Concentration (nM)"].isin(concentrations)]
+    concentrations = set(concentrations)
+    filtered = dataset[dataset["Compound Concentration (nM)"].isin(concentrations)]
+    has_all = (
+        filtered.groupby(["lspci_id", "DiscoveRx Gene Symbol"])["Compound Concentration (nM)"]
+        .apply(lambda x: concentrations.issubset(x))
+    )
+    keep = has_all[has_all].index
+    return filtered.set_index(["lspci_id", "DiscoveRx Gene Symbol"]).loc[keep].reset_index()
 
 pair_dataset_path = pathlib.Path("okl_concentration_pair_datasets")
 pair_dataset_path.mkdir(exist_ok=True)
@@ -88,14 +95,18 @@ def extract_posterior_matrices(db_path: pathlib.Path, n_samples: int):
 _N_SAMPLES = 4 * 2000  # chains * draws
 for conc_pair in possible_combinations:
     pair_name = f"{conc_pair[0]}_{conc_pair[1]}"
+    print(f"Running {pair_name}")
     db_path = pair_dataset_path / f"{pair_name}.db"
     if not db_path.exists():
+        continue
+    npz_path = pair_dataset_path / f"{pair_name}_posteriors.npz"
+    if npz_path.exists():
         continue
     compound_ids, targets, kd_matrix, slope_matrix = extract_posterior_matrices(db_path, _N_SAMPLES)
     if kd_matrix is None:
         continue
     np.savez_compressed(
-        pair_dataset_path / f"{pair_name}_posteriors.npz",
+        str(npz_path),
         compound_ids=compound_ids,
         targets=targets,
         kd=kd_matrix,
@@ -157,3 +168,5 @@ syn = synapseclient.login()
 
 for f in pair_dataset_path.glob("*.csv.gz"):
     syn.store(synapseclient.File(str(f), parent="syn73756839"), forceVersion=False)
+
+syn.store(synapseclient.File(str(pair_dataset_path / "all_eligible_posteriors.zarr.zip"), parent="syn73756839"), forceVersion=False)
