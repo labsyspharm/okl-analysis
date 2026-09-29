@@ -6,7 +6,13 @@ import multiprocessing as mp
 from multiprocessing import Process, Queue
 import os
 import sqlite3
+import sys
 import time
+
+# conda's clang++ fails to link on recent macOS ("-lto_library library filename
+# must be 'libLTO.dylib'"); use Apple's clang for pytensor's C extensions.
+if sys.platform == "darwin" and os.path.exists("/usr/bin/clang++"):
+    os.environ.setdefault("PYTENSOR_FLAGS", "cxx=/usr/bin/clang++")
 
 import click
 import numpy as np
@@ -22,17 +28,33 @@ import tqdm
 # ---------------------------------------------------------------------------
 
 
-def _model_predict(kd, hill_slope, doses):
-    return 100 - 100 / (1 + (kd / doses) ** hill_slope)
+def _model_predict(kd, hill_slope, doses, direction="decreasing"):
+    """Hill curve on a 0-100 scale.
+
+    "decreasing": 100 at low doses -> 0 at high doses (e.g. percent control).
+    "increasing": 0 at low doses -> 100 at high doses (e.g. percent binding).
+    """
+    occupancy = 1 / (1 + (kd / doses) ** hill_slope)
+    if direction == "increasing":
+        return 100 * occupancy
+    return 100 - 100 * occupancy
 
 
-def _error_model(mu):
+def _kinomescan_error_model(mu):
     """KINOMEscan error model (see General Introduction.pptx)."""
     return pymc.math.maximum(0.15 * mu - 0.043, 1)
 
 
-def _create_model():
-    """Return a PyMC model with mutable data containers for doses/responses."""
+def _create_model(
+    direction="decreasing", error_model="kinomescan", sigma_prior_scale=10.0
+):
+    """Return a PyMC model with mutable data containers for doses/responses.
+
+    error_model:
+      "kinomescan": fixed heteroscedastic error, sigma = f(mu).
+      "homoscedastic": a single constant sigma per curve, learned from the
+        data with a HalfNormal(sigma_prior_scale) prior.
+    """
     with pm.Model() as model:
         kd_log = pm.Normal("kd_log", mu=np.log(1e-6), sigma=3)
         kd = pm.Deterministic("kd", pm.math.exp(kd_log))
@@ -43,8 +65,13 @@ def _create_model():
         doses_data = pm.Data("doses_data", np.array([1e-9]))
         responses_data = pm.Data("responses_data", np.array([0.0]))
 
-        mu = _model_predict(kd, hill_slope, doses_data)
-        sigma = _error_model(mu)
+        mu = _model_predict(kd, hill_slope, doses_data, direction)
+        if error_model == "homoscedastic":
+            sigma = pm.HalfNormal("sigma", sigma=sigma_prior_scale)
+        elif error_model == "kinomescan":
+            sigma = _kinomescan_error_model(mu)
+        else:
+            raise ValueError(f"Unknown error_model: {error_model}")
         pm.Normal("obs", mu=mu, sigma=sigma, observed=responses_data)
     return model
 
@@ -252,9 +279,12 @@ def _load_data_from_df(df):
 def _worker(work_q, result_q, cfg):
     """Long-lived worker: compiles the model once, processes items from the queue."""
     try:
-        compiled = nutpie.compile_pymc_model(_create_model(), backend=cfg["backend"])
+        compiled = nutpie.compile_pymc_model(
+            _create_model(**cfg["model"]), backend=cfg["backend"]
+        )
+        compile_error = None
     except Exception as exc:
-        return
+        compiled, compile_error = None, exc
 
     while True:
         try:
@@ -265,6 +295,12 @@ def _worker(work_q, result_q, cfg):
             break
 
         drug_id, target, target_data = item
+        if compile_error is not None:
+            # Report instead of dying silently, which would stall the main loop
+            result_q.put(
+                _error_record(drug_id, target, f"compile failed: {compile_error}")
+            )
+            continue
         with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(
             devnull
         ), contextlib.redirect_stderr(devnull):
@@ -307,7 +343,8 @@ def _run_parallel(items, conn, workers, commit_every, cfg):
             _upsert(conn, rec)
             writes += 1
             done += 1
-            if str(rec[0].get("status", "")).startswith("error"):
+            fit_record = rec[0] if isinstance(rec, tuple) else rec
+            if str(fit_record.get("status", "")).startswith("error"):
                 errors += 1
             if writes % commit_every == 0:
                 conn.commit()
@@ -324,7 +361,9 @@ def _run_parallel(items, conn, workers, commit_every, cfg):
 
 
 def _run_serial(items, conn, commit_every, cfg):
-    compiled = nutpie.compile_pymc_model(_create_model(), backend=cfg["backend"])
+    compiled = nutpie.compile_pymc_model(
+        _create_model(**cfg["model"]), backend=cfg["backend"]
+    )
     done = errors = writes = 0
 
     for drug_id, target, target_data in tqdm.tqdm(items, desc="Fitting"):
@@ -368,11 +407,18 @@ def fit_kd_from_dataframe(
     chains=4,
     commit_every=100,
     backend="numba",
+    direction="decreasing",
+    error_model="kinomescan",
+    sigma_prior_scale=10.0,
 ):
     """Fit Kd and Hill slope for all compound/target pairs in a DataFrame.
 
     DataFrame must contain columns: hmsl_id, DiscoveRx Gene Symbol,
     Compound Concentration (nM), Percent Control.
+
+    direction: "decreasing" (100 -> 0 with dose) or "increasing" (0 -> 100).
+    error_model: "kinomescan" (fixed) or "homoscedastic" (sigma learned per
+    curve, HalfNormal(sigma_prior_scale) prior).
     """
     data = _load_data_from_df(df)
 
@@ -393,6 +439,11 @@ def fit_kd_from_dataframe(
                 "tune": tune,
                 "chains": chains,
                 "backend": backend.lower(),
+                "model": {
+                    "direction": direction.lower(),
+                    "error_model": error_model.lower(),
+                    "sigma_prior_scale": sigma_prior_scale,
+                },
             }
 
             if parallel:
@@ -447,6 +498,27 @@ def fit_kd_from_dataframe(
     type=click.Choice(["numba", "jax"], case_sensitive=False),
     help="nutpie compilation backend.",
 )
+@click.option(
+    "--direction",
+    default="decreasing",
+    type=click.Choice(["decreasing", "increasing"], case_sensitive=False),
+    help="Curve direction: 'decreasing' goes 100 -> 0 with dose (percent "
+    "control), 'increasing' goes 0 -> 100 (e.g. percent binding).",
+)
+@click.option(
+    "--error-model",
+    default="kinomescan",
+    type=click.Choice(["kinomescan", "homoscedastic"], case_sensitive=False),
+    help="'kinomescan': fixed heteroscedastic KINOMEscan error. "
+    "'homoscedastic': constant sigma learned from the data per curve.",
+)
+@click.option(
+    "--sigma-prior-scale",
+    default=10.0,
+    type=float,
+    help="Scale of the HalfNormal prior on sigma (response units) for "
+    "--error-model homoscedastic.",
+)
 def main(
     input_csv,
     db_path,
@@ -459,6 +531,9 @@ def main(
     chains,
     commit_every,
     backend,
+    direction,
+    error_model,
+    sigma_prior_scale,
 ):
     """Fit Kd and Hill slope for every compound/target pair in INPUT_CSV
     and store them in DB_PATH.
@@ -478,6 +553,9 @@ def main(
         chains=chains,
         commit_every=commit_every,
         backend=backend,
+        direction=direction,
+        error_model=error_model,
+        sigma_prior_scale=sigma_prior_scale,
     )
 
     if csv_output and df is not None:
