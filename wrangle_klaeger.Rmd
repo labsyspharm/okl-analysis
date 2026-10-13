@@ -127,7 +127,7 @@ klaeger_ic50s <- klaeger_ic50s_raw %>%
   ) %>%
   mutate(
     IC50 = case_when(
-      str_detect(IC50_raw, "[0-9]+") ~ as.double(str_extract(IC50_raw, "[0-9]+")),
+      str_detect(IC50_raw, "[0-9]+") ~ as.double(str_extract(IC50_raw, "[0-9\\.]+")),
       IC50_raw == "n.i." ~ 5e4,
       TRUE ~ NA_real_
     ) %>%
