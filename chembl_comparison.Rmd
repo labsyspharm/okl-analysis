@@ -74,25 +74,22 @@ Remove any ChEMBL Kd values that have relation that is not "=" unless
 the relation is ">" or ">=" and the value is greater than 9000 (basically)
 confirmed non-binders where higher concentrations were not screened.
 
+Also remove Klaeger et al since we're comparing separately (PMID 29191878)
 
 ```{r}
 chembl_kd <- chembl_kd_raw %>%
   mutate(across(standard_value, as.numeric)) %>%
   filter(
     standard_relation == "=" |
-      (standard_relation %in% c(">=", ">") & standard_value > 9000)
+      (standard_relation %in% c(">=", ">") & standard_value > 9000),
+    pubmed_id != 29191878
   ) %>%
-  # power_inner_join(
-  #   compound_mapping %>%
-  #     filter(source == "chembl") %>%
-  #     distinct(lspci_id, chembl_id_compound = external_id),
-  #   by = "chembl_id_compound",
-  #   check = check_specs(
-  #     duplicate_keys_right = "warn",
-  #     unmatched_keys_left = "warn"
-  #   )
-  # ) %>%
   group_by(gene_symbol, lspci_id) %>%
+  # If "=" values are available for a group, only use those, ignoring
+  # the ">"/">=" non-binder values
+  filter(
+    if (any(standard_relation == "=")) standard_relation == "=" else TRUE
+  ) %>%
   summarize(
     chembl_kd = quantile(standard_value, 0.25, na.rm = TRUE, names = FALSE),
     chembl_kd_relation = paste(sort(unique(standard_relation)), collapse = ""),
@@ -118,7 +115,7 @@ chembl_kd <- chembl_kd_raw %>%
 
 write_csv(
   chembl_kd,
-  file.path("data/chembl_kd_filtered.csv.gz")
+  file.path("data/chembl_kds_filtered.csv.gz")
 )
 
 chembl_kd %>%
@@ -181,16 +178,16 @@ p_scatter <- kd_fit_kd_comp %>%
   arrange(desc(fda_target)) %>%
   ggplot(
     # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
-    aes(chembl_kd, pseudo_kd, fill = classification, color = fda_target)
+    aes(chembl_kd, kd, fill = classification, color = fda_target)
   ) +
-  geom_point(aes(size = fda_target, shape = pseudo_kd_relation)) +
+  geom_point(aes(size = fda_target, shape = kd_relation)) +
   geom_text(
     aes(label = label),
     data = \(df) df %>%
-      mutate(across(c(chembl_kd, pseudo_kd), \(x) -log10(x))) %>%
+      mutate(across(c(chembl_kd, kd), \(x) -log10(x))) %>%
       summarize(
         res = cor.test(
-          chembl_kd, pseudo_kd
+          chembl_kd, kd
         ) %>%
           broom::tidy() %>%
           list()
@@ -299,8 +296,7 @@ ggsave(
 ```{r}
 tas_colors <- c(`1` = "#b2182b", `2` = "#ef8a62", `3` = "#fddbc7", `10` = "#2166ac", `no data` = "#ffffff")
 
-p_scatter <- pseudo_kd_kd_comp %>%
-  drop_na(kd) %>%
+p_scatter <- kd_fit_kd_comp %>%
   filter(
     # pseudo_ic50_relation == "=",
     # pseudo_kd_concordant == "concordant",
@@ -2683,6 +2679,19 @@ ggsave(
   "plots/percent_control_kd_roc_new_symbols.pdf",
   single_dose_comp_roc_plots,
   width = 12, height = 4, device = cairo_pdf
+)
+
+```
+
+
+
+```{r}
+synStoreMany(
+  c(
+    "data/chembl_kds_filtered.csv.gz"
+  ),
+  parentId = "syn18508401",
+  forceVersion = FALSE
 )
 
 ```
