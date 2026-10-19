@@ -1,0 +1,120 @@
+
+```{r}
+library(tidyverse)
+library(synExtra)
+library(fst)
+library(data.table)
+library(powerjoin)
+library(readxl)
+
+synapser::synLogin()
+
+syn <- synDownloader("~/data", .cache = TRUE)
+```
+
+```{r}
+compound_dict <- syn("syn26260332") |>
+  read_fst(as.data.table = TRUE)
+
+compound_names <- syn("syn26260347") |>
+  read_fst(as.data.table = TRUE)
+
+canonical_names <- compound_names[
+  !is.na(name), .(lspci_id, name)
+][
+  , head(.SD, n = 1), by = .(lspci_id)
+]
+
+compound_mapping <- syn("syn26260389") |>
+  read_fst(as.data.table = TRUE)
+
+gujral_raw <- syn("syn77547525") |>
+  read_csv() |>
+  mutate(
+    Name = if_else(
+      Name %in% c("", "-"),
+      NA_character_, Name
+    ) |>
+      coalesce(Compound)
+  )
+```
+
+```{r}
+gujral_mapping_name_raw <- distinct(gujral_raw, Name) |>
+  mutate(
+    name_join = str_replace_all(Name, "[^a-zA-Z0-9]", "") |> str_to_lower()
+  ) |>
+  left_join(
+    compound_names |>
+      drop_na(name) |>
+      mutate(name_join = str_replace(name, "[^a-zA-Z0-9]", "") |> str_to_lower()) |>
+      distinct()
+  )
+
+gujral_mapping_name <- gujral_mapping_name_raw |>
+  filter(!is.na(lspci_id)) |>
+  group_by(Name) |>
+  filter(uniqueN(lspci_id) == 1) |>
+  ungroup() |>
+  distinct(Name, lspci_id)
+
+gujral_raw |>
+  distinct(Name) |>
+  anti_join(
+    gujral_mapping_name |>
+      drop_na(lspci_id)
+  )
+```
+
+Unmapped remain these compounds, which are not in OKL, leaving them unmapped.
+
+   Name
+   <chr>
+ 1 "Midostaurin_PKC412"
+ 2 "AMG-51"
+ 3 "AP26113"
+ 4 "Cdk1/2 Inhibitor III"
+ 5 "G\x9a 6976"
+ 6 "MGCD-265"
+ 7 "PHA690509"
+ 8 "NCGC00347217"
+ 9 "NCGC00344999"
+10 "1099657-02-9"
+11 "185039-990"
+12 "1261496-45-0"
+
+
+```{r}
+gujral_long <- gujral_raw |>
+  select(-Compound) |>
+  power_inner_join(
+    gujral_mapping_name |>
+      select(Name, lspci_id),
+    by = "Name",
+    check = check_specs(
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  pivot_longer(
+    -c(Name, lspci_id, hmsl_id, Dose),
+    names_to = "Kinase",
+    values_to = "IC50"
+  )
+
+write_csv(
+  gujral_long,
+  "data/gujral_long.csv.gz"
+)
+```
+
+
+```{r}
+synStoreMany(
+  "data/gujral_long.csv.gz",
+  parentId = "syn18508401",
+  forceVersion = FALSE,
+  executed = "https://github.com/labsyspharm/okl-analysis/blob/main/wrangle_gujral.Rmd"
+)
+```
+
