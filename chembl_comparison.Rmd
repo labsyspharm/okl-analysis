@@ -17,6 +17,9 @@ syn <- synDownloader("~/data", .cache = TRUE)
 kinomescan_kd_fits <- syn("syn69680641") |>
   read_csv()
 
+kinomescan_pseudo_kds <- syn("syn51080578") |>
+  read_csv()
+
 kinomescan_classes <- syn("syn51080579") |>
   read_csv()
 
@@ -223,7 +226,8 @@ plot_chembl_scatter <- function(
   df, chembl_col, x_label,
   fill_by = c("classification", "tas"),
   highlight_fda = TRUE,
-  cor_label = c("R", "R2")
+  cor_label = c("R", "R2"),
+  y_label = "Fitted Kd (KINOMEscan)"
 ) {
   fill_by <- match.arg(fill_by)
   cor_label <- match.arg(cor_label)
@@ -231,7 +235,7 @@ plot_chembl_scatter <- function(
   fill_values <- if (fill_by == "classification") class_colors else tas_colors
 
   p <- prepare_chembl_plot_data(df, chembl_col) |>
-    arrange(desc(fda_target)) |>
+    arrange(across(any_of("fda_target"), desc)) |>
     ggplot(aes(chembl_value, kd, fill = .data[[fill_col]]))
 
   # Black outline marks FDA-approved compounds on their nominal targets
@@ -293,7 +297,7 @@ plot_chembl_scatter <- function(
     coord_equal() +
     labs(
       x = x_label,
-      y = "Fitted Kd (KINOMEscan)",
+      y = y_label,
       fill = c(classification = "Class", tas = "TAS")[[fill_by]]
     )
   # NA warning comes from values outside of plotted range
@@ -435,6 +439,51 @@ p_combined <- combine_scatter_beeswarm(
 ggsave(
     "plots/chembl_kd_by_comparison_combined_tas_fda_only.pdf", p_combined,
     width = 6, height = 4.5
+)
+```
+
+### Old pseudo Kds vs ChEMBL Kd, color by tas without fda
+
+Pseudo Kds don't have their own TAS, so use the TAS from the fitted Kds.
+
+```{r}
+pseudo_kd_chembl_kd_comp <- kinomescan_pseudo_kds |>
+  filter(
+    dataset == "original_repeat_replaced",
+    !exclude_target
+  ) |>
+  select(
+    lspci_id, hmsl_id, library, name, `DiscoveRx Gene Symbol`,
+    classification, kd = pseudo_kd, kd_relation = pseudo_kd_relation
+  ) |>
+  power_left_join(
+    kinomescan_kd_fits |>
+      filter(dataset == "original_repeat_replaced") |>
+      select(hmsl_id, `DiscoveRx Gene Symbol`, tas_kd),
+    by = c("hmsl_id", "DiscoveRx Gene Symbol"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  inner_join(
+    chembl_kd,
+    by = c("lspci_id", "hmsl_id", "library", "name", "DiscoveRx Gene Symbol")
+  ) |>
+  mutate(
+    tas_kd = replace_na(as.character(tas_kd), "no data"),
+    across(classification, \(x) factor(x, levels = names(class_colors)))
+  )
+
+p_scatter_pseudo <- plot_chembl_scatter(
+  pseudo_kd_chembl_kd_comp, "chembl_kd", "Kd (ChEMBL)",
+  fill_by = "tas", highlight_fda = FALSE, cor_label = "R",
+  y_label = "Pseudo Kd (KINOMEscan)"
+)
+
+ggsave(
+    "plots/chembl_kd_vs_pseudo_kd_tas_no_fda.pdf", p_scatter_pseudo,
+    width = 3.5, height = 4
 )
 ```
 
