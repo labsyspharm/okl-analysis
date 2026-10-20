@@ -34,11 +34,27 @@ chembl_kd_filtered <- syn("syn77771309") |>
 
 saifudeen_kd_raw <- syn("syn77581842") |>
   read_csv()
+
+classical_fit_kd <- syn("syn78148781") |>
+  read_csv()
 ```
 
 
 ```{r}
-kinomescan_kd_fits_comp <- kinomescan_kd_fits |>
+# Pearson R on log10 scale and n of the complete pairs that contribute to it
+cor_label_data <- function(x, y) {
+  x <- log10(x)
+  y <- log10(y)
+  complete <- is.finite(x) & is.finite(y)
+  tibble(
+    r = cor(x[complete], y[complete], method = "pearson"),
+    n = sum(complete)
+  )
+}
+```
+
+```{r}
+kinomescan_kd_fits_comp <-kinomescan_kd_fits |>
   filter(
     dataset == "original_repeat_replaced",
     !exclude_target,
@@ -46,7 +62,7 @@ kinomescan_kd_fits_comp <- kinomescan_kd_fits |>
     classification != "discordant"
   ) |>
   transmute(
-    lspci_id, name, Symbol = `Entrez Gene Symbol`,
+    lspci_id, hmsl_id, name, Symbol = `Entrez Gene Symbol`,
     kd = pmin(kd, 10000),
     classification
   ) |>
@@ -83,13 +99,11 @@ p <- klaeger_ic50_comp |>
   ) +
   geom_text(
     aes(
-      label = paste0("  R = ", signif(r, 2))
+      label = paste0("  R = ", signif(r, 2), "\n  n = ", n)
     ),
     x = -Inf, y = Inf,
     hjust = 0, vjust = 1,
-    data = \(x) tibble(
-      r = cor(log10(x$IC50), log10(x$kd), method = "pearson", use = "complete.obs")
-    ),
+    data = \(x) cor_label_data(x$IC50, x$kd),
     inherit.aes = FALSE
   ) +
   scale_x_log10(labels = scales::label_number(big.mark = "")) +
@@ -140,13 +154,11 @@ p <- ggplot(
   ) +
   geom_text(
     aes(
-      label = paste0("  R = ", signif(r, 2))
+      label = paste0("  R = ", signif(r, 2), "\n  n = ", n)
     ),
     x = -Inf, y = Inf,
     hjust = 0, vjust = 1,
-    data = \(x) tibble(
-      r = cor(log10(x$IC50), log10(x$chembl_kd), method = "pearson", use = "complete.obs")
-    ),
+    data = \(x) cor_label_data(x$IC50, x$chembl_kd),
     inherit.aes = FALSE
   ) +
   scale_x_log10(labels = scales::label_number(big.mark = "")) +
@@ -195,6 +207,24 @@ saifudeen_cdk_map <- c(
   "CDK4+CCND3" = "CDK4-cyclinD3"
 )
 
+saifudeen_compound_map <- saifudeen_kd_raw |>
+  distinct(lspci_id, name_saifudeen = compound_id) |>
+  power_inner_join(
+    kinomescan_kd_fits_comp |>
+      distinct(lspci_id, hmsl_id, name),
+    by = "lspci_id",
+    check = check_specs(
+      unmatched_keys_left = "info",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+write_csv(
+  saifudeen_compound_map,
+  "data/saifudeen_compound_mapping.csv"
+)
+
 saifudeen_kd_comp <- saifudeen_kd_raw |>
   filter(
     status == "ok",
@@ -226,7 +256,10 @@ saifudeen_kd_comp |>
     by = c("Symbol")
   ) |>
   View()
+```
 
+
+```{r}
 p <- saifudeen_vs_kinomescan |>
   ggplot(
     aes(saifudeen_kd, kd)
@@ -238,13 +271,11 @@ p <- saifudeen_vs_kinomescan |>
   ) +
   geom_text(
     aes(
-      label = paste0("  R = ", signif(r, 2))
+      label = paste0("  R = ", signif(r, 2), "\n  n = ", n)
     ),
     x = -Inf, y = Inf,
     hjust = 0, vjust = 1,
-    data = \(x) tibble(
-      r = cor(log10(x$saifudeen_kd), log10(x$kd), method = "pearson", use = "complete.obs")
-    ),
+    data = \(x) cor_label_data(x$saifudeen_kd, x$kd),
     inherit.aes = FALSE
   ) +
   scale_x_log10(labels = scales::label_number(big.mark = "")) +
@@ -288,13 +319,11 @@ p <- ggplot(
   ) +
   geom_text(
     aes(
-      label = paste0("  R = ", signif(r, 2))
+      label = paste0("  R = ", signif(r, 2), "\n  n = ", n)
     ),
     x = -Inf, y = Inf,
     hjust = 0, vjust = 1,
-    data = \(x) tibble(
-      r = cor(log10(x$saifudeen_kd), log10(x$chembl_kd), method = "pearson", use = "complete.obs")
-    ),
+    data = \(x) cor_label_data(x$saifudeen_kd, x$chembl_kd),
     inherit.aes = FALSE
   ) +
   scale_x_log10(labels = scales::label_number(big.mark = "")) +
@@ -313,194 +342,122 @@ ggsave(
 )
 ```
 
-## Enrichment of >10-fold disagreement versus Kinomescan
+## Classical (frequentist) Kd fits vs Chembl
 
-Test Klaeger and Saifudeen separately.
-Each compound–kinase pair contributes once. For kinase enrichment, shuffle
-disagreement labels within compounds; for compound enrichment, shuffle within
-kinases. Simulating hypergeometric counts gives the same per-entity null
-distribution as these shuffles, without repeatedly shuffling the entire table.
-The one-sided p-value tests for more disagreements than expected under this null.
-BH correction covers all kinase and compound tests in both datasets.
-Directional counts include only >10-fold disagreements: higher Kinomescan Kd
-means weaker binding, and lower Kinomescan Kd means stronger binding.
+Classical fits often fail: they return NA, zero or Inf, or extrapolate far
+outside the tested range. Missing, non-finite and non-positive estimates count as
+failed fits. The remaining estimates are clamped to the Chembl range
+(0.01–10,000 nM).
 
 ```{r}
-disagreement_pairs <- bind_rows(
-  klaeger_ic50_comp |>
-    transmute(dataset = "Klaeger", lspci_id, Symbol,
-              external_value = IC50, kd),
-  saifudeen_vs_kinomescan |>
-    transmute(dataset = "Saifudeen", lspci_id, Symbol,
-              external_value = saifudeen_kd, kd)
-) |>
-  filter(
-    !is.na(lspci_id), !is.na(Symbol),
-    is.finite(external_value), external_value > 0,
-    is.finite(kd), kd > 0
+classical_kd_long <- classical_fit_kd |>
+  separate_wider_delim(
+    `compound | kinase`, delim = " | ", names = c("compound", "kinase")
   ) |>
-  mutate(disagree = abs(log10(kd) - log10(external_value)) > 1)
+  rename(chembl_kd = `ChEMBL Kd`) |>
+  pivot_longer(
+    -c(compound, kinase, chembl_kd),
+    names_to = "method", values_to = "fit_kd"
+  ) |>
+  filter(
+    !method %in% c("MCMC", "MAP")
+  ) |>
+  # dr4pl failed for every pair
+  group_by(method) |>
+  filter(any(!is.na(fit_kd))) |>
+  ungroup() |>
+  mutate(
+    method = str_replace(method, coll(" parameter"), "p") |>
+      str_replace(coll("(noisy)"), "(het)"),
+    package = str_extract(method, "^\\S+"),
+    fit_ok = is.finite(fit_kd) & fit_kd > 0,
+    fit_kd = if_else(fit_ok, pmin(pmax(fit_kd, 0.01), 10000), NA_real_)
+  )
 
-# Fail rather than silently count duplicate pairs as independent measurements.
-stopifnot(!anyDuplicated(disagreement_pairs[c("dataset", "lspci_id", "Symbol")]))
+classical_common_pairs <- classical_kd_long |>
+  group_by(compound, kinase) |>
+  filter(all(fit_ok)) |>
+  ungroup() |>
+  distinct(compound, kinase)
 
-stratified_enrichment <- function(pairs, entity_col, stratum_col, n_perm = 100000L) {
-  stopifnot(nrow(pairs) > 0, n_perm > 0)
-  strata <- pairs |>
-    group_by(.data[[stratum_col]]) |>
-    summarise(n = n(), n_disagree = sum(disagree), .groups = "drop")
-
-  map_dfr(unique(pairs[[entity_col]]), function(entity_id) {
-    entity_pairs <- pairs[pairs[[entity_col]] == entity_id, ]
-    coverage <- entity_pairs |>
-      count(.data[[stratum_col]], name = "n_entity") |>
-      left_join(strata, by = stratum_col)
-
-    # Draw the number of discordant pairs assigned to this entity in each stratum.
-    null_counts <- numeric(n_perm)
-    for (i in seq_len(nrow(coverage))) {
-      null_counts <- null_counts + rhyper(
-        n_perm, coverage$n_disagree[i],
-        coverage$n[i] - coverage$n_disagree[i], coverage$n_entity[i]
-      )
-    }
-
-    observed <- sum(entity_pairs$disagree)
-    expected <- sum(coverage$n_entity * coverage$n_disagree / coverage$n)
-    tibble(
-      entity = as.character(entity_id),
-      n_pairs = nrow(entity_pairs),
-      n_disagree = observed,
-      n_kinomescan_higher = sum(entity_pairs$disagree & entity_pairs$kd > entity_pairs$external_value),
-      n_kinomescan_lower = sum(entity_pairs$disagree & entity_pairs$kd < entity_pairs$external_value),
-      disagreement_rate = observed / nrow(entity_pairs),
-      expected_disagreements = expected,
-      fold_enrichment = if (expected > 0) observed / expected else NA_real_,
-      p_value = (1 + sum(null_counts >= observed)) / (n_perm + 1)
+classical_kd_metrics <- function(d) {
+  d |>
+    filter(fit_ok) |>
+    mutate(
+      x = log10(chembl_kd),
+      y = log10(fit_kd)
+    ) |>
+    group_by(package, method) |>
+    summarise(
+      n_pairs = n(),
+      pearson_r = cor(x, y),
+      spearman_rho = cor(x, y, method = "spearman"),
+      # # Pearson on pairs with a quantitative (non-capped) Chembl Kd
+      # pearson_r_chembl_below_cap = cor(x[chembl_kd < 10000], y[chembl_kd < 10000]),
+      # median_abs_log10_error = median(abs(y - x)),
+      # within_10_fold = mean(abs(y - x) <= 1),
+      # # Agreement of binder calls (Kd < 10,000 nM)
+      # binder_balanced_accuracy = (
+      #   mean(fit_kd[chembl_kd < 10000] < 10000) +
+      #     mean(fit_kd[chembl_kd >= 10000] >= 10000)
+      # ) / 2,
+      .groups = "drop"
     )
-  })
 }
 
-disagreement_enrichment <- withr::with_seed(
-  42,
-  disagreement_pairs |>
-    (\(pairs) split(pairs, pairs$dataset))() |>
-    imap_dfr(function(pairs, dataset_name) {
-      bind_rows(
-        kinase = stratified_enrichment(pairs, "Symbol", "lspci_id"),
-        compound = stratified_enrichment(pairs, "lspci_id", "Symbol"),
-        .id = "entity_type"
-      ) |>
-        mutate(dataset = dataset_name, .before = 1)
-    }) |>
-    mutate(q_value = p.adjust(p_value, method = "BH")) |>
-    arrange(q_value, p_value)
-)
+classical_fit_summary <- bind_rows(
+  all_fitted = classical_kd_long |>
+    group_by(package, method) |>
+    summarise(failure_rate = mean(!fit_ok), .groups = "drop") |>
+    left_join(classical_kd_metrics(classical_kd_long), by = c("package", "method")),
+  common_pairs = classical_kd_long |>
+    semi_join(classical_common_pairs, by = c("compound", "kinase")) |>
+    classical_kd_metrics(),
+  .id = "pair_subset"
+) |>
+  arrange(pair_subset, desc(pearson_r))
 
-write_csv(
-  disagreement_enrichment |>
-    inner_Join,
-  "classification/external_disagreement_enrichment.csv"
-)
-disagreement_enrichment |>
-  filter(q_value < 0.05)
+write_csv(classical_fit_summary, "classification/classical_fit_vs_chembl_summary.csv")
+classical_fit_summary
 ```
 
-## Check global offsets and slopes
-
-The >10-fold definition measures absolute agreement with the identity line.
-An assay-wide offset or slope can therefore contribute to kinase enrichment.
-These fits are diagnostics, not replacements for the original disagreement calls.
-Compare all capped pairs with pairs below 10,000 nM in both assays; the latter
-avoid the cap pile-up but still represent a selected subset.
-
-OLS predicts Kinomescan from the external assay. Deming regression allows error
-in both axes; lambda is the Kinomescan/external log-scale error variance ratio.
-Its unknown value is checked at 0.25, 1 and 4. Bootstrap intervals resample whole
-compounds, retaining their kinase measurements, conditional on the kinase panel.
-
 ```{r}
-calibration_coefficients <- function(d, lambda = 1) {
-  sxx <- var(d$x)
-  syy <- var(d$y)
-  sxy <- cov(d$x, d$y)
-  deming_slope <- (syy - lambda * sxx +
-    sqrt((syy - lambda * sxx)^2 + 4 * lambda * sxy^2)) / (2 * sxy)
-  c(
-    mean_offset = mean(d$y - d$x),
-    ols_intercept = mean(d$y) - sxy / sxx * mean(d$x),
-    ols_slope = sxy / sxx,
-    deming_intercept = mean(d$y) - deming_slope * mean(d$x),
-    deming_slope = deming_slope
-  )
-}
-
-set.seed(42)
-calibration_summary <- disagreement_pairs |>
-  mutate(x = log10(external_value), y = log10(kd)) |>
-  (\(pairs) split(pairs, pairs$dataset))() |>
-  imap_dfr(function(pairs, dataset_name) {
-    bind_rows(
-      all_capped = pairs,
-      below_cap = pairs |> filter(external_value < 10000, kd < 10000),
-      .id = "fit_subset"
-    ) |>
-      group_by(fit_subset) |>
-      group_modify(function(d, key) {
-        coefficients <- calibration_coefficients(d)
-        compound_rows <- split(seq_len(nrow(d)), d$lspci_id)
-        bootstrap <- replicate(1000, {
-          sampled <- sample.int(length(compound_rows), replace = TRUE)
-          calibration_coefficients(d[unlist(compound_rows[sampled]), ])
-        })
-        intervals <- t(apply(bootstrap, 1, quantile, probs = c(0.025, 0.975)))
-        delta <- d$y - d$x
-        tibble(
-          n_pairs = nrow(d),
-          n_compounds = n_distinct(d$lspci_id),
-          median_offset = median(delta),
-          deming_slope_lambda025 = calibration_coefficients(d, 0.25)[["deming_slope"]],
-          deming_slope_lambda4 = calibration_coefficients(d, 4)[["deming_slope"]],
-          raw_disagreement_rate = mean(abs(delta) > 1),
-          offset_adjusted_rate = mean(abs(delta - coefficients[["mean_offset"]]) > 1),
-          ols_adjusted_rate = mean(abs(d$y - coefficients[["ols_intercept"]] -
-            coefficients[["ols_slope"]] * d$x) > 1),
-          deming_adjusted_rate = mean(abs(d$y - coefficients[["deming_intercept"]] -
-            coefficients[["deming_slope"]] * d$x) > 1)
-        ) |>
-          bind_cols(as_tibble_row(coefficients)) |>
-          bind_cols(as_tibble_row(setNames(intervals[, 1], paste0(names(coefficients), "_lower")))) |>
-          bind_cols(as_tibble_row(setNames(intervals[, 2], paste0(names(coefficients), "_upper"))))
-      }) |>
-      ungroup() |>
-      mutate(dataset = dataset_name, .before = 1)
-  })
-
-write_csv(calibration_summary, "classification/external_calibration_summary.csv")
-calibration_summary
-
-calibration_plot_data <- disagreement_pairs |>
-  mutate(x = log10(external_value), y = log10(kd)) |>
-  (\(pairs) bind_rows(
-    all_capped = pairs,
-    below_cap = pairs |> filter(external_value < 10000, kd < 10000),
-    .id = "fit_subset"
-  ))()
-
-calibration_lines <- bind_rows(
-  calibration_summary |> transmute(dataset, fit_subset, fit = "Identity", intercept = 0, slope = 1),
-  calibration_summary |> transmute(dataset, fit_subset, fit = "Offset", intercept = mean_offset, slope = 1),
-  calibration_summary |> transmute(dataset, fit_subset, fit = "OLS", intercept = ols_intercept, slope = ols_slope),
-  calibration_summary |> transmute(dataset, fit_subset, fit = "Deming (lambda = 1)", intercept = deming_intercept, slope = deming_slope)
-)
-
-p <- ggplot(calibration_plot_data, aes(x, y)) +
-  geom_point(alpha = 0.08, size = 0.5) +
-  geom_abline(data = calibration_lines, aes(intercept = intercept, slope = slope, color = fit)) +
-  facet_grid(fit_subset ~ dataset) +
+p <- classical_kd_long |>
+  filter(fit_ok) |>
+  ggplot(aes(chembl_kd, fit_kd)) +
+  ggrastr::rasterise(
+    geom_point(
+      alpha = 0.2,
+      shape = 16,
+      size = 0.5
+    ), dpi = 300, device = "ragg_png"
+  ) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  geom_text(
+    aes(
+      label = paste0("  R = ", signif(pearson_r, 2), "\n  n = ", n_pairs)
+    ),
+    x = -Inf, y = Inf,
+    hjust = 0, vjust = 1,
+    size = 3,
+    data = classical_fit_summary |>
+      filter(pair_subset == "all_fitted"),
+    inherit.aes = FALSE
+  ) +
+  scale_x_log10(labels = scales::label_number(big.mark = "")) +
+  scale_y_log10(labels = scales::label_number(big.mark = "")) +
+  facet_wrap(~method, ncol = 3) +
   coord_equal() +
-  labs(x = "log10 external Kd (nM)", y = "log10 Kinomescan Kd (nM)", color = "Fit") +
-  theme_bw()
-ggsave("plots/external_calibration.png", p, width = 9, height = 7, dpi = 180)
+  labs(
+    x = "Kd Chembl",
+    y = "Kd fit"
+  ) +
+  theme(strip.clip = "off")
+
 p
+
+ggsave(
+  "plots/classical_fit_kd_vs_chembl_kd.pdf",
+  p, width = 5, height = 12
+)
 ```
