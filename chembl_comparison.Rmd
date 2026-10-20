@@ -6,6 +6,7 @@ library(fst)
 library(data.table)
 library(powerjoin)
 library(ggbeeswarm)
+library(ggrepel)
 
 synapser::synLogin()
 
@@ -13,37 +14,37 @@ syn <- synDownloader("~/data", .cache = TRUE)
 ```
 
 ```{r}
-# kinomescan_pseudo_kds <- syn("syn51080578") %>%
-#   read_csv()
-
-kinomescan_kd_fits <- syn("syn69680641") %>%
+kinomescan_kd_fits <- syn("syn69680641") |>
   read_csv()
 
-kinomescan_classes <- syn("syn51080579") %>%
+kinomescan_classes <- syn("syn51080579") |>
   read_csv()
 
-kinomescan_kinase_info <- syn("syn51286743") %>%
+kinomescan_kinase_info <- syn("syn51286743") |>
   read_csv()
 
-single_dose <- syn("syn52504516") %>%
+single_dose <- syn("syn52504516") |>
   read_csv()
 
-compound_mapping <- syn("syn26260389") %>%
-  read_fst(as.data.table = TRUE)
+# compound_mapping <- syn("syn26260389") |>
+#   read_fst(as.data.table = TRUE)
 
-chembl_kd_raw <- syn("syn52854574") %>%
+chembl_kd_raw <- syn("syn52854574") |>
   read_csv()
 
-coral_map <- syn("syn61680422") %>%
+chembl_ic50_raw <- syn("syn78304878") |>
   read_csv()
 
-lsp_targets <- syn("syn25173506") %>%
+coral_map <- syn("syn61680422") |>
+  read_csv()
+
+lsp_targets <- syn("syn25173506") |>
   read_fst()
 
-nominal_targets <- syn("syn52947779") %>%
-  read_csv() %>%
+nominal_targets <- syn("syn52947779") |>
+  read_csv() |>
   power_inner_join(
-    single_dose %>%
+    single_dose |>
       distinct(lspci_id, hmsl_id),
     by = c("HMSLID" = "hmsl_id"),
     check = check_specs(
@@ -52,13 +53,13 @@ nominal_targets <- syn("syn52947779") %>%
     )
   )
 
-lsp_clinical <- syn("syn26260451") %>%
-  read_fst() %>%
+lsp_clinical <- syn("syn26260451") |>
+  read_fst() |>
   as_tibble()
 ```
 
 
-```{r pseudo_ic50_vs_kd}
+```{r class_colors}
 class_colors <- c(
     "binding" = "firebrick1",
     "weakly-binding" = "darkorange",
@@ -66,223 +67,297 @@ class_colors <- c(
     "non-binding" = "black",
     "discordant" = "blue"
 )
+
+# Classification names colored by class, for ggtext::element_markdown() axis labels
+class_labels <- class_colors[names(class_colors) != "discordant"] |>
+  imap_chr(\(color, class) glue::glue("<span style='font-weight: bold; color: {color}'>{class}</span>"))
 ```
 
-Now load the ChEMBL Kd only data and compare to KINOMEscan fitted Kd values.
+Now load the ChEMBL Kd and IC50 data and compare to KINOMEscan fitted Kd values.
+Kds and IC50s are aggregated separately using the same procedure.
 
-Remove any ChEMBL Kd values that have relation that is not "=" unless
+Remove any ChEMBL values that have relation that is not "=" unless
 the relation is ">" or ">=" and the value is greater than 9000 (basically)
 confirmed non-binders where higher concentrations were not screened.
 
 Also remove Klaeger et al since we're comparing separately (PMID 29191878)
 
 ```{r}
-chembl_kd <- chembl_kd_raw %>%
-  mutate(across(standard_value, as.numeric)) %>%
-  filter(
-    standard_relation == "=" |
-      (standard_relation %in% c(">=", ">") & standard_value > 9000),
-    pubmed_id != 29191878
-  ) %>%
-  group_by(gene_symbol, lspci_id) %>%
-  # If "=" values are available for a group, only use those, ignoring
-  # the ">"/">=" non-binder values
-  filter(
-    if (any(standard_relation == "=")) standard_relation == "=" else TRUE
-  ) %>%
-  summarize(
-    chembl_kd = quantile(standard_value, 0.25, na.rm = TRUE, names = FALSE),
-    chembl_kd_relation = paste(sort(unique(standard_relation)), collapse = ""),
-    .groups = "drop"
-  ) %>%
-  power_inner_join(
-    kinomescan_kd_fits %>%
-      distinct(lspci_id, hmsl_id, library, name),
-    by = c("lspci_id"),
-    check = check_specs(
-      unmatched_keys_left = "info",
-      duplicate_keys_right = "info"
+aggregate_chembl <- function(chembl_raw, value_col) {
+  relation_col <- paste0(value_col, "_relation")
+  chembl_raw |>
+    mutate(across(standard_value, as.numeric)) |>
+    filter(
+      standard_relation == "=" |
+        (standard_relation %in% c(">=", ">") & standard_value > 9000),
+      pubmed_id != 29191878
+    ) |>
+    group_by(gene_symbol, lspci_id) |>
+    # If "=" values are available for a group, only use those, ignoring
+    # the ">"/">=" non-binder values
+    filter(
+      if (any(standard_relation == "=")) standard_relation == "=" else TRUE
+    ) |>
+    summarize(
+      !!value_col := quantile(standard_value, 0.25, na.rm = TRUE, names = FALSE),
+      !!relation_col := paste(sort(unique(standard_relation)), collapse = ""),
+      .groups = "drop"
+    ) |>
+    power_inner_join(
+      kinomescan_kd_fits |>
+        distinct(lspci_id, hmsl_id, library, name),
+      by = c("lspci_id"),
+      check = check_specs(
+        unmatched_keys_left = "info",
+        duplicate_keys_right = "info"
+      )
+    ) |>
+    power_inner_join(
+      kinomescan_kinase_info |>
+        distinct(hgnc_symbol, `DiscoveRx Gene Symbol`),
+      by = c("gene_symbol" = "hgnc_symbol"),
+      check = check_specs(
+        unmatched_keys_left = "info"
+      )
     )
-  ) %>%
-  power_inner_join(
-    kinomescan_kinase_info %>%
-      distinct(hgnc_symbol, `DiscoveRx Gene Symbol`),
-    by = c("gene_symbol" = "hgnc_symbol"),
-    check = check_specs(
-      unmatched_keys_left = "info"
-    )
-  )
+}
+
+chembl_kd <- aggregate_chembl(chembl_kd_raw, "chembl_kd")
+chembl_ic50 <- aggregate_chembl(chembl_ic50_raw, "chembl_ic50")
 
 write_csv(
   chembl_kd,
   file.path("data/chembl_kds_filtered.csv.gz")
 )
 
-chembl_kd %>%
+write_csv(
+  chembl_ic50,
+  file.path("data/chembl_ic50s_filtered.csv.gz")
+)
+
+chembl_kd |>
   count(chembl_kd_relation)
 
-kd_fit_kd_comp <- kinomescan_kd_fits %>%
-  mutate(
-    across(classification, \(x) factor(x, levels = names(class_colors)))
-  ) %>%
-  filter(
-    dataset == "original_repeat_replaced",
-    !exclude_target,
-    rhat < 1.01
-  ) %>%
-  mutate(
-    kd_relation = if_else(
-      kd > 10000, ">", "="
-    ),
-    kd = pmin(kd, 10000),
-  ) %>%
-  inner_join(
-    chembl_kd,
-    by = c("lspci_id", "hmsl_id", "library", "name", "DiscoveRx Gene Symbol")
-  ) %>%
-  left_join(
-    lsp_clinical %>%
-      filter(max_phase == 4) %>%
-      transmute(lspci_id, fda_approved = TRUE) %>%
-      distinct(),
-    by = "lspci_id"
-  ) %>%
-  left_join(
-    nominal_targets %>%
-      mutate(nominal_target = TRUE),
-    by = c("lspci_id", "DiscoveRx Gene Symbol")
-  ) %>%
-  replace_na(
-    list(fda_approved = FALSE, nominal_target = FALSE)
-  ) %>%
-  mutate(
-    fda_target = case_when(
-      !fda_approved ~ "no",
-      !nominal_target ~ "offtarget",
-      TRUE ~ "ontarget"
-    ) %>%
-      factor(levels = c("ontarget", "offtarget", "no"))
-  )
+chembl_ic50 |>
+  count(chembl_ic50_relation)
+
+join_kd_fits <- function(chembl_agg) {
+  kinomescan_kd_fits |>
+    mutate(
+      across(classification, \(x) factor(x, levels = names(class_colors)))
+    ) |>
+    filter(
+      dataset == "original_repeat_replaced",
+      !exclude_target,
+      rhat < 1.01
+    ) |>
+    mutate(
+      kd_relation = if_else(
+        kd > 10000, ">", "="
+      ),
+      kd = pmin(kd, 10000),
+    ) |>
+    inner_join(
+      chembl_agg,
+      by = c("lspci_id", "hmsl_id", "library", "name", "DiscoveRx Gene Symbol")
+    ) |>
+    left_join(
+      lsp_clinical |>
+        filter(max_phase == 4) |>
+        transmute(lspci_id, fda_approved = TRUE) |>
+        distinct(),
+      by = "lspci_id"
+    ) |>
+    left_join(
+      nominal_targets |>
+        mutate(nominal_target = TRUE),
+      by = c("lspci_id", "DiscoveRx Gene Symbol")
+    ) |>
+    replace_na(
+      list(fda_approved = FALSE, nominal_target = FALSE)
+    ) |>
+    mutate(
+      fda_target = case_when(
+        !fda_approved ~ "no",
+        !nominal_target ~ "offtarget",
+        TRUE ~ "ontarget"
+      ) |>
+        factor(levels = c("ontarget", "offtarget", "no"))
+    )
+}
+
+kd_fit_kd_comp <- join_kd_fits(chembl_kd)
+kd_fit_ic50_comp <- join_kd_fits(chembl_ic50)
 
 ```
 
 
-```{r}
-p_scatter <- kd_fit_kd_comp %>%
-  drop_na(kd) %>%
-  filter(
-    # pseudo_ic50_relation == "=",
-    classification != "discordant"
-  ) %>%
-  mutate(chembl_kd = pmin(chembl_kd, 10000)) %>%
-  arrange(desc(fda_target)) %>%
-  ggplot(
-    # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
-    aes(chembl_kd, kd, fill = classification, color = fda_target)
-  ) +
-  geom_point(aes(size = fda_target, shape = kd_relation)) +
-  geom_text(
-    aes(label = label),
-    data = \(df) df %>%
-      mutate(across(c(chembl_kd, kd), \(x) -log10(x))) %>%
-      summarize(
-        res = cor.test(
-          chembl_kd, kd
-        ) %>%
-          broom::tidy() %>%
-          list()
-      ) %>%
-      unnest(res) %>%
-      mutate(label = paste("R ==", signif(estimate, 2))),
-    x = -Inf, y = Inf, hjust = 0, vjust = 1,
-    inherit.aes = FALSE, parse = TRUE
-  ) +
-  scale_shape_manual(
-    values = c(
-      `<` = 25, `>` = 24, `=` = 21
-    ),
-    guide = "none"
-  ) +
-  scale_fill_manual(
-    values = map_chr(class_colors, \(x) alpha(x, alpha = 0.5)),
-    guide = guide_legend(override.aes = list(color = alpha("white", 0), shape = 21, alpha = 1))
-  ) +
-  scale_color_manual(
-    values = c(
-      `ontarget` = alpha("black", .9),
-      `offtarget` = alpha("black", 0),
-      `no` = alpha("purple", 0)
-    ),
-    guide = "none"
-  ) +
-  scale_size_manual(
-    values = c(`ontarget` = 1.5, `offtarget` = 1, `no` = 1),
-    guide = "none"
-  ) +
-  # Limiting to between 1 and 10000 because barely any data outside this range
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
-  scale_y_log10(labels = scales::label_number(big.mark = "")) +
-  coord_equal() +
-  labs(
-    x = "Kd (ChEMBL)",
-    y = "Fitted Kd (KINOMEscan)",
-    fill = "Class"
-  )
-# NA warning comes from values outside of plotted range
+Plotting helpers shared by all ChEMBL vs KINOMEscan fitted Kd figures below.
 
-ggsave(
-    "plots/chembl_kd_vs_kinomescan_pseudo_kd_new2_with_nominal.pdf", p_scatter,
-    width = 8, height = 4
+```{r}
+tas_colors <- c(
+  `1` = "#b2182b",
+  `2` = "#ef8a62",
+  `3` = "#fddbc7",
+  `10` = "#2166ac",
+  `no data` = "#ffffff"
 )
 
-p_beeswarm <- kd_fit_kd_comp %>%
-  filter(
-    pseudo_kd_concordant == "concordant",
-    # pseudo_ic50_relation == "=",
-    classification != "discordant"
-  ) %>%
-  mutate(
-    classification = factor(
-      classification,
-      levels = names(class_colors) %>%
-        rev()
-    ),
-    chembl_kd = pmin(chembl_kd, 10000)
-  ) %>%
-  ggplot(
-    aes(chembl_kd, classification, color = classification)
-  ) +
-  geom_quasirandom(orientation = "y", shape = 16, size = 1, alpha = 0.5, width = 0.3) +
-  geom_boxplot(fill = NA, outlier.shape = NA) +
-  scale_color_manual(values = class_colors) +
-  guides(color = "none") +
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
-  scale_y_discrete(labels = class_labels) +
-  theme(axis.text.y = element_markdown()) +
-  labs(x = "Kd (ChEMBL)", y = NULL)
+# Cap values at 10 µM and floor fitted Kds at 0.1 nM, marking the floored ones with "<".
+# The ChEMBL column is renamed to `chembl_value` so Kds and IC50s can share plot code.
+prepare_chembl_plot_data <- function(df, chembl_col) {
+  df |>
+    rename(chembl_value = all_of(chembl_col)) |>
+    drop_na(kd) |>
+    filter(classification != "discordant") |>
+    mutate(
+      across(c(kd, chembl_value), \(x) pmin(x, 10000)),
+      kd_relation = if_else(kd < .1, "<", kd_relation),
+      across(kd, \(x) pmax(x, .1)),
+      tas_kd = as.character(tas_kd) |>
+        factor(levels = names(tas_colors))
+    )
+}
 
-# ggsave(
-#     "plots/chembl_kd_by_kinomescan_class_beeswarm.pdf", p_beeswarm,
-#     width = 7, height = 3
-# )
+plot_chembl_scatter <- function(
+  df, chembl_col, x_label,
+  fill_by = c("classification", "tas"),
+  highlight_fda = TRUE,
+  cor_label = c("R", "R2")
+) {
+  fill_by <- match.arg(fill_by)
+  cor_label <- match.arg(cor_label)
+  fill_col <- c(classification = "classification", tas = "tas_kd")[[fill_by]]
+  fill_values <- if (fill_by == "classification") class_colors else tas_colors
 
-p_combined <- egg::ggarrange(
+  p <- prepare_chembl_plot_data(df, chembl_col) |>
+    arrange(desc(fda_target)) |>
+    ggplot(aes(chembl_value, kd, fill = .data[[fill_col]]))
+
+  # Black outline marks FDA-approved compounds on their nominal targets
+  p <- if (highlight_fda) {
+    p +
+      geom_point(aes(size = fda_target, shape = kd_relation, color = fda_target)) +
+      scale_color_manual(
+        values = c(
+          `ontarget` = alpha("black", .9),
+          `offtarget` = alpha("black", 0),
+          `no` = alpha("black", 0)
+        ),
+        guide = "none"
+      ) +
+      scale_size_manual(
+        values = c(`ontarget` = 1.5, `offtarget` = 1, `no` = 1),
+        guide = "none"
+      )
+  } else {
+    p + geom_point(aes(shape = kd_relation), color = alpha("black", 0), size = 1)
+  }
+
+  p +
+    geom_text(
+      aes(label = label, vjust = vjust),
+      # Correlation on the first line, number of compound-kinase pairs below
+      data = \(d) d |>
+        summarize(
+          r = cor(-log10(chembl_value), -log10(kd)),
+          n = n()
+        ) |>
+        reframe(
+          label = c(
+            if (cor_label == "R") {
+              paste("R ==", signif(r, 2))
+            } else {
+              paste("italic(R)^2 ==", signif(r^2, 2))
+            },
+            paste("italic(n) ==", n)
+          ),
+          vjust = c(1, 2.6)
+        ),
+      x = -Inf, y = Inf, hjust = 0,
+      inherit.aes = FALSE, parse = TRUE
+    ) +
+    scale_shape_manual(
+      values = c(
+        `<` = 25, `>` = 24, `=` = 21
+      ),
+      guide = "none"
+    ) +
+    scale_fill_manual(
+      values = map_chr(fill_values, \(x) alpha(x, alpha = 0.5)),
+      guide = guide_legend(override.aes = list(color = alpha("white", 0), shape = 21, alpha = 1))
+    ) +
+    # Limiting to between 1 and 10000 because barely any data outside this range
+    scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
+    scale_y_log10(labels = scales::label_number(big.mark = "")) +
+    coord_equal() +
+    labs(
+      x = x_label,
+      y = "Fitted Kd (KINOMEscan)",
+      fill = c(classification = "Class", tas = "TAS")[[fill_by]]
+    )
+  # NA warning comes from values outside of plotted range
+}
+
+plot_chembl_beeswarm <- function(df, chembl_col, x_label, by = c("classification", "tas")) {
+  by <- match.arg(by)
+  df <- prepare_chembl_plot_data(df, chembl_col)
+
+  if (by == "classification") {
+    df <- mutate(df, group = fct_rev(classification))
+    colors <- class_colors
+    labels <- class_labels
+  } else {
+    df <- mutate(df, group = fct_rev(tas_kd) |> fct_relabel(\(x) paste("TAS", x)))
+    colors <- set_names(tas_colors, paste("TAS", names(tas_colors)))
+    labels <- waiver()
+  }
+
+  p <- df |>
+    ggplot(aes(chembl_value, group, color = group)) +
+    geom_quasirandom(orientation = "y", shape = 16, size = 1, alpha = 0.5, width = 0.3) +
+    geom_boxplot(fill = NA, outlier.shape = NA) +
+    scale_color_manual(values = colors) +
+    guides(color = "none") +
+    scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
+    scale_y_discrete(labels = labels) +
+    labs(x = x_label, y = NULL)
+
+  if (by == "classification") {
+    p <- p + theme(axis.text.y = ggtext::element_markdown())
+  }
+  p
+}
+
+# Scatter on top, beeswarm below, sharing the x axis
+combine_scatter_beeswarm <- function(p_scatter, p_beeswarm) {
+  egg::ggarrange(
     p_scatter +
-        labs(x = NULL) +
-        guides(color = "none") +
-        theme(
-            axis.text.x = element_blank(),
-            plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
-        ),
+      labs(x = NULL) +
+      guides(color = "none") +
+      theme(
+        axis.text.x = element_blank(),
+        plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
+      ),
     p_beeswarm +
-        coord_fixed(ratio = .32) +
-        theme(
-            plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm"),
-            legend.position = "bottom"
-        ),
+      coord_fixed(ratio = .32) +
+      theme(
+        plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm"),
+        legend.position = "bottom"
+      ),
     nrow = 2,
     heights = c(2, 1.2),
     draw = FALSE
+  )
+}
+```
+
+### ChEMBL Kd vs KINOMEscan Kd, color by class
+
+```{r}
+p_combined <- combine_scatter_beeswarm(
+  plot_chembl_scatter(kd_fit_kd_comp, "chembl_kd", "Kd (ChEMBL)"),
+  plot_chembl_beeswarm(kd_fit_kd_comp, "chembl_kd", "Kd (ChEMBL)")
 )
 
 ggsave(
@@ -291,131 +366,23 @@ ggsave(
 )
 ```
 
+### ChEMBL IC50 vs KINOMEscan Kd
+
+```{r}
+p_scatter_ic50 <- plot_chembl_scatter(kd_fit_ic50_comp, "chembl_ic50", "IC50 (ChEMBL)")
+
+ggsave(
+    "plots/chembl_ic50_vs_kinomescan_kd_with_nominal.pdf", p_scatter_ic50,
+    width = 8, height = 4
+)
+```
+
 ### color by tas
 
 ```{r}
-tas_colors <- c(`1` = "#b2182b", `2` = "#ef8a62", `3` = "#fddbc7", `10` = "#2166ac", `no data` = "#ffffff")
-
-p_scatter <- kd_fit_kd_comp %>%
-  filter(
-    # pseudo_ic50_relation == "=",
-    # pseudo_kd_concordant == "concordant",
-    classification != "discordant"
-  ) %>%
-  mutate(
-    across(c(kd, chembl_kd), \(x) pmin(x, 10000)),
-    kd_relation = if_else(kd < .1, "<", "="),
-    across(kd, \(x) pmax(x, .1)),
-    tas_kd = as.character(tas_kd) %>%
-      factor(levels = names(tas_colors))
-  ) %>%
-  arrange(desc(fda_target)) %>%
-  ggplot(
-    aes(chembl_kd, kd, fill = tas_kd)
-  ) +
-  geom_point(
-    aes(size = fda_target, shape = kd_relation, color = fda_target),
-  ) +
-  geom_text(
-    aes(label = label),
-    data = \(df) df %>%
-      mutate(across(c(chembl_kd, kd), \(x) -log10(x))) %>%
-      summarize(
-        res = cor.test(
-          chembl_kd, kd
-        ) %>%
-          broom::tidy() %>%
-          list()
-      ) %>%
-      unnest(res) %>%
-      mutate(label = paste("R ==", signif(estimate, 2))),
-    x = -Inf, y = Inf, hjust = 0, vjust = 1,
-    inherit.aes = FALSE, parse = TRUE
-  ) +
-  scale_shape_manual(
-    values = c(
-      `<` = 25, `>` = 24, `=` = 21
-    ),
-    guide = "none"
-  ) +
-  scale_fill_manual(
-    values = map_chr(tas_colors, \(x) alpha(x, alpha = 0.5)),
-    guide = guide_legend(override.aes = list(color = alpha("white", 0), shape = 21, alpha = 1))
-  ) +
-  scale_color_manual(
-    values = c(
-      `ontarget` = alpha("black", .9),
-      `offtarget` = alpha("purple", 0),
-      `no` = alpha("purple", 0)
-    ),
-    guide = "none"
-  ) +
-  scale_size_manual(
-    values = c(`ontarget` = 1.5, `offtarget` = 1, `no` = 1),
-    guide = "none"
-  ) +
-  # Limiting to between 1 and 10000 because barely any data outside this range
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
-  scale_y_log10(labels = scales::label_number(big.mark = "")) +
-  coord_equal() +
-  labs(
-    x = "Kd (ChEMBL)",
-    y = "Kd (KINOMEscan)",
-    fill = "TAS"
-  )
-# NA warning comes from values outside of plotted range
-
-# ggsave(
-#     "plots/chembl_kd_vs_kinomescan_pseudo_kd_tas_with_fda.pdf", p_scatter,
-#     width = 8, height = 4
-# )
-
-p_beeswarm <- pseudo_kd_kd_comp %>%
-  filter(
-    # pseudo_ic50_relation == "=",
-    classification != "discordant"
-  ) %>%
-  mutate(
-    tas_kd = as.character(tas_kd) %>%
-      factor(levels = names(tas_colors)) %>%
-      fct_rev() %>%
-      fct_relabel(\(x) paste("TAS", x)),
-    chembl_kd = pmin(chembl_kd, 10000)
-  ) %>%
-  ggplot(
-    aes(chembl_kd, tas_kd, color = tas_kd)
-  ) +
-  geom_quasirandom(orientation = "y", shape = 16, size = 1, alpha = 0.5, width = 0.3) +
-  geom_boxplot(fill = NA, outlier.shape = NA) +
-  scale_color_manual(values = set_names(tas_colors, paste("TAS", names(tas_colors)))) +
-  guides(color = "none") +
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
-  # scale_y_discrete(labels = class_labels) +
-  # theme(axis.text.y = element_markdown()) +
-  labs(x = "Kd (ChEMBL)", y = NULL)
-
-# ggsave(
-#     "plots/chembl_kd_by_kinomescan_class_beeswarm.pdf", p_beeswarm,
-#     width = 7, height = 3
-# )
-
-p_combined <- egg::ggarrange(
-    p_scatter +
-        labs(x = NULL) +
-        guides(color = "none") +
-        theme(
-            axis.text.x = element_blank(),
-            plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
-        ),
-    p_beeswarm +
-        coord_fixed(ratio = .32) +
-        theme(
-            plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm"),
-            legend.position = "bottom"
-        ),
-    nrow = 2,
-    heights = c(2, 1.2),
-    draw = FALSE
+p_combined <- combine_scatter_beeswarm(
+  plot_chembl_scatter(kd_fit_kd_comp, "chembl_kd", "Kd (ChEMBL)", fill_by = "tas"),
+  plot_chembl_beeswarm(kd_fit_kd_comp, "chembl_kd", "Kd (ChEMBL)", by = "tas")
 )
 
 ggsave(
@@ -423,224 +390,26 @@ ggsave(
     width = 6, height = 4.5
 )
 
+p_scatter_ic50 <- plot_chembl_scatter(
+  kd_fit_ic50_comp, "chembl_ic50", "IC50 (ChEMBL)",
+  fill_by = "tas", highlight_fda = FALSE
+)
 
-pseudo_kd_kd_comp |>
-  summarize(
-    lm_res = list(
-      lm(kd ~ chembl_kd, data = cur_data()) %>%
-        broom::tidy()
-    )
-  ) |>
-  unnest(lm_res)
-
-pseudo_kd_kd_comp |>
-  summarize(
-    lm_res = list(
-      lm(log10(kd) ~ log10(chembl_kd), data = cur_data()) %>%
-        broom::tidy()
-    )
-  ) |>
-  unnest(lm_res)
-
-pseudo_kd_kd_comp %>%
-  drop_na(pseudo_kd) %>%
-  filter(
-    # pseudo_ic50_relation == "=",
-    pseudo_kd_concordant == "concordant",
-    classification != "discordant"
-  ) %>%
-  mutate(
-    across(c(kd, chembl_kd), \(x) pmin(x, 10000)),
-    kd_relation = if_else(kd < .1, "<", "="),
-    across(kd, \(x) pmax(x, .1)),
-    tas_kd = as.character(tas_kd) %>%
-      factor(levels = names(tas_colors))
-  ) %>%
-  arrange(desc(fda_target)) %>%
-  ggplot(
-    aes(chembl_kd, kd, fill = tas_kd)
-  ) +
-  geom_point(
-    aes(size = fda_target, shape = kd_relation, color = fda_target),
-  ) +
-  # geom_abline(
-  #   slope = .626, intercept = 2612,
-  #   color = "black"
-  # ) +
-  geom_abline(
-    slope = .875, intercept = 10^2.74,
-    color = "black"
-  ) +
-  geom_text(
-    aes(label = label),
-    data = \(df) df %>%
-      mutate(across(c(chembl_kd, kd), \(x) -log10(x))) %>%
-      summarize(
-        res = cor.test(
-          chembl_kd, kd
-        ) %>%
-          broom::tidy() %>%
-          list()
-      ) %>%
-      unnest(res) %>%
-      mutate(label = paste("italic(R)^2 ==", signif(estimate**2, 2))),
-    x = -Inf, y = Inf, hjust = 0, vjust = 1,
-    inherit.aes = FALSE, parse = TRUE
-  ) +
-  scale_shape_manual(
-    values = c(
-      `<` = 25, `>` = 24, `=` = 21
-    ),
-    guide = "none"
-  ) +
-  scale_fill_manual(
-    values = map_chr(tas_colors, \(x) alpha(x, alpha = 0.5)),
-    guide = guide_legend(override.aes = list(color = alpha("white", 0), shape = 21, alpha = 1))
-  ) +
-  scale_color_manual(
-    values = c(
-      `ontarget` = alpha("black", .9),
-      `offtarget` = alpha("purple", 0),
-      `no` = alpha("purple", 0)
-    ),
-    guide = "none"
-  ) +
-  scale_size_manual(
-    values = c(`ontarget` = 1.5, `offtarget` = 1, `no` = 1),
-    guide = "none"
-  ) +
-  # Limiting to between 1 and 10000 because barely any data outside this range
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
-  scale_y_log10(labels = scales::label_number(big.mark = "")) +
-  coord_equal() +
-  labs(
-    x = "Kd (ChEMBL)",
-    y = "Kd (KINOMEscan)",
-    fill = "TAS"
-  )
-
+ggsave(
+    "plots/chembl_ic50_vs_kinomescan_kd_tas_no_fda.pdf", p_scatter_ic50,
+    width = 3.5, height = 4
+)
 ```
 
 ### color by tas without fda
 
 ```{r}
-tas_colors <- c(`1` = "#b2182b", `2` = "#ef8a62", `3` = "#fddbc7", `10` = "#2166ac", `no data` = "#ffffff")
-
-p_scatter <- pseudo_kd_kd_comp %>%
-  drop_na(pseudo_kd) %>%
-  filter(
-    # pseudo_ic50_relation == "=",
-    # pseudo_kd_concordant == "concordant",
-    classification != "discordant"
-  ) %>%
-  mutate(chembl_kd = pmin(chembl_kd, 10000)) %>%
-  arrange(desc(fda_target)) %>%
-  ggplot(
-    aes(chembl_kd, pseudo_kd, fill = tas_pseudo_kd)
-  ) +
-  geom_point(
-    aes(shape = pseudo_kd_relation),
-    color = alpha("black", 0), size = 1
-  ) +
-  geom_text(
-    aes(label = label),
-    data = \(df) df %>%
-      mutate(across(c(chembl_kd, pseudo_kd), \(x) -log10(x))) %>%
-      summarize(
-        res = cor.test(
-          chembl_kd, pseudo_kd
-        ) %>%
-          broom::tidy() %>%
-          list()
-      ) %>%
-      unnest(res) %>%
-      mutate(label = paste("italic(R)^2 ==", signif(estimate**2, 2))),
-    x = -Inf, y = Inf, hjust = 0, vjust = 1,
-    inherit.aes = FALSE, parse = TRUE
-  ) +
-  scale_shape_manual(
-    values = c(
-      `<` = 25, `>` = 24, `=` = 21
-    ),
-    guide = "none"
-  ) +
-  scale_fill_manual(
-    values = map_chr(tas_colors, \(x) alpha(x, alpha = 0.5)),
-    guide = guide_legend(override.aes = list(color = alpha("white", 0), shape = 21, alpha = 1))
-  ) +
-  # scale_color_manual(
-  #   values = c(
-  #     `ontarget` = alpha("black", .9),
-  #     `offtarget` = alpha("black", .1),
-  #     `no` = alpha("purple", 0)
-  #   ),
-  #   guide = "none"
-  # ) +
-  # scale_size_manual(
-  #   values = c(`ontarget` = 1.5, `offtarget` = 1, `no` = 1),
-  #   guide = "none"
-  # ) +
-  # Limiting to between 1 and 10000 because barely any data outside this range
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
-  scale_y_log10(labels = scales::label_number(big.mark = "")) +
-  coord_equal() +
-  labs(
-    x = "Kd (ChEMBL)",
-    y = "Pseudo-Kd (KINOMEscan)",
-    fill = "TAS"
-  )
-# NA warning comes from values outside of plotted range
-
-# ggsave(
-#     "plots/chembl_kd_vs_kinomescan_pseudo_kd_tas_with_fda.pdf", p_scatter,
-#     width = 8, height = 4
-# )
-
-p_beeswarm <- pseudo_kd_kd_comp %>%
-  filter(
-    pseudo_kd_concordant == "concordant",
-    # pseudo_ic50_relation == "=",
-    classification != "discordant"
-  ) %>%
-  mutate(
-    tas_pseudo_kd = fct_rev(tas_pseudo_kd) %>%
-      fct_relabel(\(x) paste("TAS", x)),
-    chembl_kd = pmin(chembl_kd, 10000)
-  ) %>%
-  ggplot(
-    aes(chembl_kd, tas_pseudo_kd, color = tas_pseudo_kd)
-  ) +
-  geom_quasirandom(orientation = "y", shape = 16, size = 1, alpha = 0.5, width = 0.3) +
-  geom_boxplot(fill = NA, outlier.shape = NA) +
-  scale_color_manual(values = set_names(tas_colors, paste("TAS", names(tas_colors)))) +
-  guides(color = "none") +
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
-  # scale_y_discrete(labels = class_labels) +
-  # theme(axis.text.y = element_markdown()) +
-  labs(x = "Kd (ChEMBL)", y = NULL)
-
-# ggsave(
-#     "plots/chembl_kd_by_kinomescan_class_beeswarm.pdf", p_beeswarm,
-#     width = 7, height = 3
-# )
-
-p_combined <- egg::ggarrange(
-    p_scatter +
-        labs(x = NULL) +
-        guides(color = "none") +
-        theme(
-            axis.text.x = element_blank(),
-            plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
-        ),
-    p_beeswarm +
-        coord_fixed(ratio = .32) +
-        theme(
-            plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm"),
-            legend.position = "bottom"
-        ),
-    nrow = 2,
-    heights = c(2, 1.2),
-    draw = FALSE
+p_combined <- combine_scatter_beeswarm(
+  plot_chembl_scatter(
+    kd_fit_kd_comp, "chembl_kd", "Kd (ChEMBL)",
+    fill_by = "tas", highlight_fda = FALSE, cor_label = "R2"
+  ),
+  plot_chembl_beeswarm(kd_fit_kd_comp, "chembl_kd", "Kd (ChEMBL)", by = "tas")
 )
 
 ggsave(
@@ -652,124 +421,15 @@ ggsave(
 ### color by tas fda only
 
 ```{r}
-tas_colors <- c(`1` = "#b2182b", `2` = "#ef8a62", `3` = "#fddbc7", `10` = "#2166ac", `no data` = "#ffffff")
+kd_fit_kd_comp_fda <- kd_fit_kd_comp |>
+  filter(fda_approved)
 
-p_scatter <- pseudo_kd_kd_comp %>%
-  drop_na(pseudo_kd) %>%
-  filter(
-    # pseudo_ic50_relation == "=",
-    pseudo_kd_concordant == "concordant",
-    classification != "discordant",
-    fda_approved
-  ) %>%
-  mutate(chembl_kd = pmin(chembl_kd, 10000)) %>%
-  arrange(desc(fda_target)) %>%
-  ggplot(
-    aes(chembl_kd, pseudo_kd, fill = tas_pseudo_kd)
-  ) +
-  geom_point(
-    aes(shape = pseudo_kd_relation, color = fda_target, size = fda_target),
-  ) +
-  geom_text(
-    aes(label = label),
-    data = \(df) df %>%
-      mutate(across(c(chembl_kd, pseudo_kd), \(x) -log10(x))) %>%
-      summarize(
-        res = cor.test(
-          chembl_kd, pseudo_kd
-        ) %>%
-          broom::tidy() %>%
-          list()
-      ) %>%
-      unnest(res) %>%
-      mutate(label = paste("italic(R)^2 ==", signif(estimate**2, 2))),
-    x = -Inf, y = Inf, hjust = 0, vjust = 1,
-    inherit.aes = FALSE, parse = TRUE
-  ) +
-  scale_shape_manual(
-    values = c(
-      `<` = 25, `>` = 24, `=` = 21
-    ),
-    guide = "none"
-  ) +
-  scale_fill_manual(
-    values = map_chr(tas_colors, \(x) alpha(x, alpha = 0.5)),
-    guide = guide_legend(override.aes = list(color = alpha("white", 0), shape = 21, alpha = 1))
-  ) +
-  scale_color_manual(
-    values = c(
-      `ontarget` = alpha("black", .9),
-      `offtarget` = alpha("black", .0),
-      `no` = alpha("purple", 0)
-    ),
-    guide = "none"
-  ) +
-  scale_size_manual(
-    values = c(`ontarget` = 1.5, `offtarget` = 1, `no` = 1),
-    guide = "none"
-  ) +
-  # Limiting to between 1 and 10000 because barely any data outside this range
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
-  scale_y_log10(labels = scales::label_number(big.mark = "")) +
-  coord_equal() +
-  labs(
-    x = "Kd (ChEMBL)",
-    y = "Pseudo-Kd (KINOMEscan)",
-    fill = "TAS"
-  )
-# NA warning comes from values outside of plotted range
-
-# ggsave(
-#     "plots/chembl_kd_vs_kinomescan_pseudo_kd_tas_with_fda.pdf", p_scatter,
-#     width = 8, height = 4
-# )
-
-p_beeswarm <- pseudo_kd_kd_comp %>%
-  filter(
-    pseudo_kd_concordant == "concordant",
-    # pseudo_ic50_relation == "=",
-    classification != "discordant",
-    fda_approved
-  ) %>%
-  mutate(
-    tas_pseudo_kd = fct_rev(tas_pseudo_kd) %>%
-      fct_relabel(\(x) paste("TAS", x)),
-    chembl_kd = pmin(chembl_kd, 10000)
-  ) %>%
-  ggplot(
-    aes(chembl_kd, tas_pseudo_kd, color = tas_pseudo_kd)
-  ) +
-  geom_quasirandom(orientation = "y", shape = 16, size = 1, alpha = 0.5, width = 0.3) +
-  geom_boxplot(fill = NA, outlier.shape = NA) +
-  scale_color_manual(values = set_names(tas_colors, paste("TAS", names(tas_colors)))) +
-  guides(color = "none") +
-  scale_x_log10(labels = scales::label_number(big.mark = ""), limits = c(1, NA)) +
-  # scale_y_discrete(labels = class_labels) +
-  # theme(axis.text.y = element_markdown()) +
-  labs(x = "Kd (ChEMBL)", y = NULL)
-
-# ggsave(
-#     "plots/chembl_kd_by_kinomescan_class_beeswarm.pdf", p_beeswarm,
-#     width = 7, height = 3
-# )
-
-p_combined <- egg::ggarrange(
-    p_scatter +
-        labs(x = NULL) +
-        guides(color = "none") +
-        theme(
-            axis.text.x = element_blank(),
-            plot.margin = unit(c(0.5, 0.5, 0, 0.5), "cm")
-        ),
-    p_beeswarm +
-        coord_fixed(ratio = .32) +
-        theme(
-            plot.margin = unit(c(0, 0.5, 0.5, 0.5), "cm"),
-            legend.position = "bottom"
-        ),
-    nrow = 2,
-    heights = c(2, 1.2),
-    draw = FALSE
+p_combined <- combine_scatter_beeswarm(
+  plot_chembl_scatter(
+    kd_fit_kd_comp_fda, "chembl_kd", "Kd (ChEMBL)",
+    fill_by = "tas", cor_label = "R2"
+  ),
+  plot_chembl_beeswarm(kd_fit_kd_comp_fda, "chembl_kd", "Kd (ChEMBL)", by = "tas")
 )
 
 ggsave(
@@ -778,7 +438,8 @@ ggsave(
 )
 ```
 
-Compute correlation coefficients between the ChEMBL IC50s / Kds and the KINOMEscan pseudo-IC50s.
+Compute correlation coefficients between the ChEMBL IC50s / Kds and the KINOMEscan fitted Kds.
+Same transformation as in the scatter plots: values capped at 10 µM, then -log10.
 
 Using Fisher r-to-z transformation to test for significant difference between the correlations.
 
@@ -788,40 +449,37 @@ two_cor_test <- function(r1, r2, n1, n2) {
     sqrt(1/(n1-3) + 1/(n2-3))
 }
 
-pseudo_kd_comp_both <- bind_rows(
-  ic50 = pseudo_kd_comp %>%
-    filter(
-      pseudo_kd_concordant == "concordant",
-      # pseudo_ic50_relation == "=",
-      classification != "discordant"
-    ) %>%
-    select(lspci_id, name, `DiscoveRx Gene Symbol`, gene_symbol = hgnc_symbol, value, pseudo_kd, classification, pseudo_kd_relation),
-  kd = pseudo_kd_kd_comp %>%
-    filter(
-      pseudo_kd_concordant == "concordant",
-      # pseudo_ic50_relation == "=",
-      classification != "discordant"
-    ) %>%
-    select(lspci_id, name, `DiscoveRx Gene Symbol`, gene_symbol, value = chembl_kd, pseudo_kd, classification, pseudo_kd_relation),
+kd_fit_comp_both <- bind_rows(
+  ic50 = kd_fit_ic50_comp |>
+    select(lspci_id, name, `DiscoveRx Gene Symbol`, gene_symbol, value = chembl_ic50, value_relation = chembl_ic50_relation, kd, kd_relation, classification, fda_target),
+  kd = kd_fit_kd_comp |>
+    select(lspci_id, name, `DiscoveRx Gene Symbol`, gene_symbol, value = chembl_kd, value_relation = chembl_kd_relation, kd, kd_relation, classification, fda_target),
   .id = "chembl_type"
-)
+) |>
+  drop_na(kd) |>
+  filter(
+    classification != "discordant"
+  ) |>
+  mutate(value = pmin(value, 10000))
 
-pseudo_kd_comp_cor_res <- pseudo_kd_comp_both %>%
-  group_by(chembl_type) %>%
+kd_fit_comp_cor_res <- kd_fit_comp_both |>
+  group_by(chembl_type) |>
   summarize(
     res = cor.test(
-      ~value + pseudo_kd, data = cur_data()
-    ) %>%
-      broom::tidy() %>%
+      -log10(value), -log10(kd)
+    ) |>
+      broom::tidy() |>
       list(),
     n = n(),
     .groups = "drop"
-  ) %>%
+  ) |>
   unnest(res)
 
-pseudo_kd_comp_cor_res %>%
-  select(chembl_type, estimate, n) %>%
-  pivot_wider(names_from = chembl_type, values_from = c(estimate, n)) %>%
+kd_fit_comp_cor_res
+
+kd_fit_comp_cor_res |>
+  select(chembl_type, estimate, n) |>
+  pivot_wider(names_from = chembl_type, values_from = c(estimate, n)) |>
   with(
     two_cor_test(
       estimate_ic50, estimate_kd,
@@ -837,122 +495,113 @@ targets that are consistently discordant?
 Use Kd data
 
 ```{r}
-pseudo_kd_comp_false_class <- pseudo_kd_comp_both %>%
-  filter(
-    pseudo_kd_relation == "=" | (
-      pseudo_kd_relation == "<" & pseudo_kd < 90
-    ) | (
-      pseudo_kd_relation == ">" & pseudo_kd > 9000
-    )
-  ) %>%
+# Fitted Kds are only censored at the top (kd_relation ">" means > 10 µM),
+# so no pre-filtering on relation is needed, unlike for the pseudo-Kds
+kd_fit_comp_false_class <- kd_fit_comp_both |>
   mutate(
     false_class = case_when(
-      (value > (10 * pseudo_kd)) & pseudo_kd != 10000 ~ "false positive",
-      (value < (0.1 * pseudo_kd)) & pseudo_kd != 12.5 ~ "false negative",
+      (value > (10 * kd)) & kd_relation != ">" ~ "false positive",
+      value < (0.1 * kd) ~ "false negative",
       TRUE ~ "concordant"
     )
   )
 
 write_csv(
-  pseudo_kd_comp_false_class,
-  "classification/pseudo_kd_chembl_comparison_false_class.csv"
+  kd_fit_comp_false_class,
+  "classification/kd_fit_chembl_comparison_false_class.csv"
 )
 
-pseudo_kd_comp_false_class %>%
+kd_fit_comp_false_class |>
   count(chembl_type, false_class)
 
-pseudo_kd_comp_false_class_by_compound <- pseudo_kd_comp_false_class %>%
-  count(chembl_type, lspci_id, name, false_class) %>%
-  group_by(chembl_type, lspci_id, name) %>%
-  filter(sum(n) > 50) %>%
+kd_fit_comp_false_class_by_compound <- kd_fit_comp_false_class |>
+  count(chembl_type, lspci_id, name, false_class) |>
+  group_by(chembl_type, lspci_id, name) |>
+  filter(sum(n) > 50) |>
   mutate(
     prop = n / sum(n)
-  ) %>%
+  ) |>
   ungroup()
 
-pseudo_kd_comp_false_wide_by_compound <- pseudo_kd_comp_false_class_by_compound %>%
+kd_fit_comp_false_wide_by_compound <- kd_fit_comp_false_class_by_compound |>
   pivot_wider(names_from = false_class, values_from = c(n, prop), values_fill = list(n = 0L, prop = 0))
 
 View(
-  pseudo_kd_comp_false_wide_by_compound %>%
-    filter(chembl_type == "kd") %>%
+  kd_fit_comp_false_wide_by_compound |>
+    filter(chembl_type == "kd") |>
     arrange(desc(`prop_false negative` + `prop_false positive`))
 )
 
-pseudo_kd_comp_false_class_by_kinase <- pseudo_kd_comp_false_class %>%
-  count(chembl_type, `DiscoveRx Gene Symbol`, gene_symbol, false_class) %>%
-  group_by(chembl_type, `DiscoveRx Gene Symbol`, gene_symbol) %>%
-  filter(sum(n) > 50) %>%
+kd_fit_comp_false_class_by_kinase <- kd_fit_comp_false_class |>
+  count(chembl_type, `DiscoveRx Gene Symbol`, gene_symbol, false_class) |>
+  group_by(chembl_type, `DiscoveRx Gene Symbol`, gene_symbol) |>
+  filter(sum(n) > 50) |>
   mutate(
     prop = n / sum(n)
-  ) %>%
+  ) |>
   ungroup()
 
-pseudo_kd_comp_false_wide_by_kinase <- pseudo_kd_comp_false_class_by_kinase %>%
+kd_fit_comp_false_wide_by_kinase <- kd_fit_comp_false_class_by_kinase |>
   pivot_wider(names_from = false_class, values_from = c(n, prop), values_fill = list(n = 0L, prop = 0))
 
 View(
-  pseudo_kd_comp_false_wide_by_kinase %>%
-    filter(chembl_type == "kd") %>%
+  kd_fit_comp_false_wide_by_kinase |>
+    filter(chembl_type == "kd") |>
     arrange(desc(`prop_false negative` + `prop_false positive`))
 )
 
-pseudo_kd_comp_false_wide_by_kinase %>%
-    filter(chembl_type == "kd") %>%
-    arrange(desc(`prop_false negative`)) %>%
-    head(n = 20) %>%
-    select(-chembl_type, -gene_symbol) %>%
+kd_fit_comp_false_wide_by_kinase |>
+    filter(chembl_type == "kd") |>
+    arrange(desc(`prop_false negative`)) |>
+    head(n = 20) |>
+    select(-chembl_type, -gene_symbol) |>
     print(n = Inf)
 
-pseudo_kd_comp_false_wide_by_kinase %>%
-    filter(chembl_type == "kd") %>%
-    arrange(desc(`prop_false positive`)) %>%
-    head(n = 20) %>%
-    select(-chembl_type, -gene_symbol) %>%
+kd_fit_comp_false_wide_by_kinase |>
+    filter(chembl_type == "kd") |>
+    arrange(desc(`prop_false positive`)) |>
+    head(n = 20) |>
+    select(-chembl_type, -gene_symbol) |>
     print(n = Inf)
 ```
 
 Plot common false positives/negatives
 
 ```{r}
-pseudo_kd_comp_false_cherrypicked <- pseudo_kd_comp_false_class_by_kinase %>%
-  filter(chembl_type == "kd", false_class != "concordant") %>%
-  group_by(false_class) %>%
-  arrange(desc(n)) %>%
-  slice_head(n = 5) %>%
+kd_fit_comp_false_cherrypicked <- kd_fit_comp_false_class_by_kinase |>
+  filter(chembl_type == "kd", false_class != "concordant") |>
+  group_by(false_class) |>
+  arrange(desc(n)) |>
+  slice_head(n = 5) |>
   ungroup()
 
-library(ggrepel)
-p <- pseudo_kd_kd_comp %>%
-  drop_na(pseudo_kd) %>%
+p <- kd_fit_kd_comp |>
+  drop_na(kd) |>
   filter(
-    # pseudo_ic50_relation == "=",
-    pseudo_kd_concordant == "concordant",
     classification != "discordant"
-  ) %>%
+  ) |>
   ggplot(
-    # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
-    aes(chembl_kd, pseudo_kd, fill = classification)
+    aes(chembl_kd, kd, fill = classification)
   ) +
   scale_fill_manual(values = map_chr(class_colors, \(x) alpha(x, alpha = 0.5))) +
   geom_point(
     aes(color = false_class, size = false_class),
-    data = \(x) x %>%
+    data = \(x) x |>
       left_join(
-        pseudo_kd_comp_false_class %>%
+        kd_fit_comp_false_class |>
           filter(
             chembl_type == "kd"
-          ) %>%
+          ) |>
           semi_join(
-            pseudo_kd_comp_false_cherrypicked,
+            kd_fit_comp_false_cherrypicked,
             by = c("DiscoveRx Gene Symbol", "false_class")
-          ) %>%
+          ) |>
           transmute(
             lspci_id, `DiscoveRx Gene Symbol`,
             false_class
           ),
         by = c("lspci_id", "DiscoveRx Gene Symbol")
-      ) %>%
+      ) |>
       arrange(desc(is.na(false_class))),
     shape = 21
   ) +
@@ -966,22 +615,22 @@ p <- pseudo_kd_kd_comp %>%
   ) +
   # geom_label_repel(
   #   aes(label = label),
-  #   data = \(x) x %>%
+  #   data = \(x) x |>
   #     left_join(
-  #       pseudo_kd_comp_false_class %>%
+  #       kd_fit_comp_false_class |>
   #         filter(
   #           chembl_type == "kd"
-  #         ) %>%
+  #         ) |>
   #         semi_join(
-  #           pseudo_kd_comp_false_cherrypicked,
+  #           kd_fit_comp_false_cherrypicked,
   #           by = c("DiscoveRx Gene Symbol", "false_class")
-  #         ) %>%
+  #         ) |>
   #         transmute(
   #           lspci_id, `DiscoveRx Gene Symbol`,
   #           label = `DiscoveRx Gene Symbol`
   #         ),
   #       by = c("lspci_id", "DiscoveRx Gene Symbol")
-  #     ) %>%
+  #     ) |>
   #     mutate(label = replace_na(label, "")),
   #     show.legend = FALSE
   # ) +
@@ -991,11 +640,11 @@ p <- pseudo_kd_kd_comp %>%
   coord_equal() +
   labs(
     x = "Kd (ChEMBL)",
-    y = "Pseudo-Kd (KINOMEscan)"
+    y = "Fitted Kd (KINOMEscan)"
   )
 
 ggsave(
-    "plots/chembl_kd_vs_kinomescan_pseudo_kd_top_false.pdf", p,
+    "plots/chembl_kd_vs_kinomescan_kd_fit_top_false.pdf", p,
     width = 10, height = 6
 )
 
@@ -1018,37 +667,37 @@ In the ChEMBL comparison, using the `exclude_target` column, we are already
 removing any data points from mutants in Kinomescan.
 
 ```{r}
-kinase_n_variants <- kinomescan_kinase_info %>%
-  filter(`Kinase Form` == "Wild Type") %>%
+kinase_n_variants <- kinomescan_kinase_info |>
+  filter(`Kinase Form` == "Wild Type") |>
   count(hgnc_symbol)
 
-kinase_multiple_variants <- kinase_n_variants %>%
-  filter(n > 1) %>%
-  pull(hgnc_symbol) %>%
+kinase_multiple_variants <- kinase_n_variants |>
+  filter(n > 1) |>
+  pull(hgnc_symbol) |>
   c(c("EIF2AK4", "JAK2", "JAK3"))
 
-kinomescan_kinase_info %>%
+kinomescan_kinase_info |>
   filter(
     `Kinase Form` == "Wild Type",
     hgnc_symbol %in% kinase_multiple_variants
   )
 
-pseudo_kd_comp_false_class_by_kinase_no_var <- pseudo_kd_comp_false_class %>%
-  filter(!gene_symbol %in% kinase_multiple_variants) %>%
-  count(chembl_type, `DiscoveRx Gene Symbol`, gene_symbol, false_class) %>%
-  group_by(chembl_type, `DiscoveRx Gene Symbol`, gene_symbol) %>%
-  filter(sum(n) > 50) %>%
+kd_fit_comp_false_class_by_kinase_no_var <- kd_fit_comp_false_class |>
+  filter(!gene_symbol %in% kinase_multiple_variants) |>
+  count(chembl_type, `DiscoveRx Gene Symbol`, gene_symbol, false_class) |>
+  group_by(chembl_type, `DiscoveRx Gene Symbol`, gene_symbol) |>
+  filter(sum(n) > 50) |>
   mutate(
     prop = n / sum(n)
-  ) %>%
+  ) |>
   ungroup()
 
-pseudo_kd_comp_false_wide_by_kinase_no_var <- pseudo_kd_comp_false_class_by_kinase_no_var %>%
+kd_fit_comp_false_wide_by_kinase_no_var <- kd_fit_comp_false_class_by_kinase_no_var |>
   pivot_wider(names_from = false_class, values_from = c(n, prop), values_fill = list(n = 0L, prop = 0))
 
 View(
-  pseudo_kd_comp_false_wide_by_kinase_no_var %>%
-    filter(chembl_type == "kd") %>%
+  kd_fit_comp_false_wide_by_kinase_no_var |>
+    filter(chembl_type == "kd") |>
     arrange(desc(`prop_false negative` + `prop_false positive`))
 )
 ```
@@ -1057,33 +706,30 @@ Visualize which false positive/negative outliers are proteins with variants
 in Kinomescan. Marking them large and with black outline
 
 ```{r}
-p <- pseudo_kd_kd_comp %>%
-  drop_na(pseudo_kd) %>%
+p <- kd_fit_kd_comp |>
+  drop_na(kd) |>
   filter(
-    # pseudo_ic50_relation == "=",
-    pseudo_kd_concordant == "concordant",
     classification != "discordant"
-  ) %>%
+  ) |>
   ggplot(
-    # aes(value, pseudo_ic50, color = classification, shape = pseudo_ic50_relation)
-    aes(chembl_kd, pseudo_kd, fill = classification)
+    aes(chembl_kd, kd, fill = classification)
   ) +
   scale_fill_manual(values = map_chr(class_colors, \(x) alpha(x, alpha = 0.5))) +
   geom_point(
     aes(color = false_class, size = false_class),
-    data = \(x) x %>%
+    data = \(x) x |>
       left_join(
-        pseudo_kd_comp_false_class %>%
+        kd_fit_comp_false_class |>
           filter(
             chembl_type == "kd",
             gene_symbol %in% kinase_multiple_variants
-          ) %>%
+          ) |>
           transmute(
             lspci_id, `DiscoveRx Gene Symbol`,
             false_class
           ),
         by = c("lspci_id", "DiscoveRx Gene Symbol")
-      ) %>%
+      ) |>
       arrange(desc(is.na(false_class))),
     shape = 21
   ) +
@@ -1097,22 +743,22 @@ p <- pseudo_kd_kd_comp %>%
   ) +
   # geom_label_repel(
   #   aes(label = label),
-  #   data = \(x) x %>%
+  #   data = \(x) x |>
   #     left_join(
-  #       pseudo_kd_comp_false_class %>%
+  #       kd_fit_comp_false_class |>
   #         filter(
   #           chembl_type == "kd"
-  #         ) %>%
+  #         ) |>
   #         semi_join(
-  #           pseudo_kd_comp_false_cherrypicked,
+  #           kd_fit_comp_false_cherrypicked,
   #           by = c("DiscoveRx Gene Symbol", "false_class")
-  #         ) %>%
+  #         ) |>
   #         transmute(
   #           lspci_id, `DiscoveRx Gene Symbol`,
   #           label = `DiscoveRx Gene Symbol`
   #         ),
   #       by = c("lspci_id", "DiscoveRx Gene Symbol")
-  #     ) %>%
+  #     ) |>
   #     mutate(label = replace_na(label, "")),
   #     show.legend = FALSE
   # ) +
@@ -1122,11 +768,11 @@ p <- pseudo_kd_kd_comp %>%
   coord_equal() +
   labs(
     x = "Kd (ChEMBL)",
-    y = "Pseudo-Kd (KINOMEscan)"
+    y = "Fitted Kd (KINOMEscan)"
   )
 
 ggsave(
-    "plots/chembl_kd_vs_kinomescan_pseudo_kd_false_multiple_variants_new.pdf", p,
+    "plots/chembl_kd_vs_kinomescan_kd_fit_false_multiple_variants_new.pdf", p,
     width = 10, height = 6
 )
 
@@ -1135,25 +781,25 @@ ggsave(
 What proportion of false positives/negatives are due to multiple variants?
 
 ```{r}
-pseudo_kd_comp_false_class_with_var <- pseudo_kd_comp_false_class %>%
+kd_fit_comp_false_class_with_var <- kd_fit_comp_false_class |>
   mutate(
     multiple_variants = gene_symbol %in% kinase_multiple_variants
   )
 
-pseudo_kd_comp_false_class_with_var_xtab <- pseudo_kd_comp_false_class_with_var %>%
-  count(false_class, multiple_variants) %>%
+kd_fit_comp_false_class_with_var_xtab <- kd_fit_comp_false_class_with_var |>
+  count(false_class, multiple_variants) |>
   pivot_wider(names_from = multiple_variants, values_from = n)
 
-pseudo_kd_comp_false_class_with_var_xtab %>%
-  column_to_rownames("false_class") %>%
-  rstatix::pairwise_fisher_test(detailed = TRUE) %>%
+kd_fit_comp_false_class_with_var_xtab |>
+  column_to_rownames("false_class") |>
+  rstatix::pairwise_fisher_test(detailed = TRUE) |>
   select(group1, group2, estimate, p)
 
 library(janitor)
-pseudo_kd_comp_false_class_with_var_xtab %>%
-  as_tabyl(col_var_name = "multiple_variants", row_var_name = "false_class") %>%
-  adorn_percentages("row") %>%
-  adorn_pct_formatting(digits = 1) %>%
+kd_fit_comp_false_class_with_var_xtab |>
+  as_tabyl(col_var_name = "multiple_variants", row_var_name = "false_class") |>
+  adorn_percentages("row") |>
+  adorn_pct_formatting(digits = 1) |>
   adorn_ns()
 ```
 
@@ -1170,43 +816,43 @@ Select some false positives and negatives that are not due to multiple variants
 for further analysis, perhaps for collecting full IC50s from Reaction Biology.
 
 ```{r}
-pseudo_kd_comp_for_verification <- pseudo_kd_comp_false_class_with_var %>%
-  filter(!multiple_variants, chembl_type == "kd") %>%
+kd_fit_comp_for_verification <- kd_fit_comp_false_class_with_var |>
+  filter(!multiple_variants, chembl_type == "kd") |>
   mutate(
-    lfc = log2(pseudo_kd / value)
-  ) %>%
+    lfc = log2(kd / value)
+  ) |>
   arrange(desc(abs(lfc)))
 
-View(pseudo_kd_comp_for_verification)
+View(kd_fit_comp_for_verification)
 ```
 
 Double check if the dose-resonse curves for these look geom_pointdensity
 
 ```{r}
-kinomescan_classification_raw <- syn("syn52428590") %>%
+kinomescan_classification_raw <- syn("syn52428590") |>
   qs::qread()
 
-pseudo_kd_comp_for_verification_hm <- pseudo_kd_comp_for_verification %>%
+kd_fit_comp_for_verification_hm <- kd_fit_comp_for_verification |>
   filter(
     false_class == "false negative"
-  ) %>%
-  head(n = 100) %>%
+  ) |>
+  head(n = 100) |>
   inner_join(
-    kinomescan_classification_raw %>%
-      filter(dataset == "original_repeat_replaced") %>%
+    kinomescan_classification_raw |>
+      filter(dataset == "original_repeat_replaced") |>
       select(lspci_id, `DiscoveRx Gene Symbol`, data),
     by = c("lspci_id", "DiscoveRx Gene Symbol")
-  ) %>%
+  ) |>
   transmute(
     combo = paste(name, `DiscoveRx Gene Symbol`, sep = " "), data
-  ) %>%
-  unnest(data) %>%
-  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
-  select(combo, `Compound Concentration (nM)`, `Percent Control`) %>%
+  ) |>
+  unnest(data) |>
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) |>
+  select(combo, `Compound Concentration (nM)`, `Percent Control`) |>
   pivot_wider(names_from = `Compound Concentration (nM)`, values_from = `Percent Control`)
 
 p <- pheatmap::pheatmap(
-  pseudo_kd_comp_for_verification_hm %>%
+  kd_fit_comp_for_verification_hm |>
     column_to_rownames("combo"),
   cluster_cols = FALSE,
   color = rev(viridisLite::viridis(100)),
@@ -1214,191 +860,55 @@ p <- pheatmap::pheatmap(
 )
 
 ggsave(
-  "plots/chembl_kd_vs_kinomescan_pseudo_kd_false_negative_top100_heatmap.pdf",
+  "plots/chembl_kd_vs_kinomescan_kd_fit_false_negative_top100_heatmap.pdf",
   p, width = 8, height = 12
 )
 
-pseudo_kd_comp_for_verification_hm <- pseudo_kd_comp_for_verification %>%
+kd_fit_comp_for_verification_hm <- kd_fit_comp_for_verification |>
   filter(
     false_class == "false positive"
-  ) %>%
-  head(n = 100) %>%
+  ) |>
+  head(n = 100) |>
   inner_join(
-    kinomescan_classification_raw %>%
-      filter(dataset == "original_repeat_replaced") %>%
+    kinomescan_classification_raw |>
+      filter(dataset == "original_repeat_replaced") |>
       select(lspci_id, `DiscoveRx Gene Symbol`, data),
     by = c("lspci_id", "DiscoveRx Gene Symbol")
-  ) %>%
+  ) |>
   transmute(
     combo = paste(name, `DiscoveRx Gene Symbol`, sep = " "), data
-  ) %>%
-  unnest(data) %>%
-  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) %>%
-  select(combo, `Compound Concentration (nM)`, `Percent Control`) %>%
+  ) |>
+  unnest(data) |>
+  filter(`Compound Concentration (nM)` %in% c(12.5, 100, 1000, 10000)) |>
+  select(combo, `Compound Concentration (nM)`, `Percent Control`) |>
   pivot_wider(names_from = `Compound Concentration (nM)`, values_from = `Percent Control`)
 
 p <- pheatmap::pheatmap(
-  pseudo_kd_comp_for_verification_hm %>%
+  kd_fit_comp_for_verification_hm |>
     column_to_rownames("combo"),
   cluster_cols = FALSE,
   color = rev(viridisLite::viridis(100)),
   silent = TRUE
 )
 ggsave(
-  "plots/chembl_kd_vs_kinomescan_pseudo_kd_false_positive_top100_heatmap.pdf",
+  "plots/chembl_kd_vs_kinomescan_kd_fit_false_positive_top100_heatmap.pdf",
   p, width = 8, height = 12
 )
 
 ```
 
-```{r}
-pseudo_ic50_comp_false_wide_brms_input <- pseudo_ic50_comp_false_wide_by_compound %>%
-  mutate(
-    n_total = concordant + `false positive` + `false negative`
-  ) %>%
-  transmute(
-    chembl_type,
-    lspci_id, name,
-    n_total,
-    y = data.frame(
-      concordant = concordant,
-      `false positive` = `false positive`,
-      `false negative` = `false negative`
-    ) %>%
-      as.matrix()
-  )
-
-library(brms)
-mdl <- brm(
-  y | trials(n_total) ~ 1 + (1 | name),
-  data = pseudo_ic50_comp_false_wide_brms_input %>%
-    filter(chembl_type == "kd"),
-  family = multinomial(refcat = "concordant"),
-  cores = 4,
-  chains = 4
-)
-
-mdl2 <- brm(
-  y | trials(n_total) ~ 1 + (1 | name) + chembl_type,
-  data = pseudo_ic50_comp_false_wide_brms_input,
-  family = multinomial(refcat = "concordant"),
-  cores = 4,
-  chains = 4
-)
-
-pseudo_ic50_comp_false_fisher_by_compound <- pseudo_ic50_comp_false_wide_by_compound %>%
-  mutate(
-    n_total = concordant + `false positive` + `false negative`
-  ) %>%
-  pivot_longer(
-    c(`false positive`, `false negative`),
-    names_to = "false_class",
-    values_to = "n_class"
-  ) %>%
-  mutate(
-    n_other = n_total - n_class
-  ) %>%
-  group_by(
-    chembl_type, false_class
-  ) %>%
-  mutate(
-    n_rest_class = sum(n_class) - n_class,
-    n_rest_other = sum(n_other) - n_other
-  ) %>%
-  ungroup()
-
-
-
-pseudo_ic50_comp_false_fisher_res_by_compound <- pseudo_ic50_comp_false_fisher_by_compound %>%
-  group_by(chembl_type, lspci_id, name) %>%
-  summarize(
-    res = fisher.test(
-      matrix(
-        c(n_class, n_rest_class, n_other, n_rest_other),
-        ncol = 2
-      ),
-      simulate = TRUE
-    ) %>%
-      broom::tidy() %>%
-      list(),
-    .groups = "drop"
-  ) %>%
-  unnest(res)
-
-library(brms)
-data(HairEyeColor)
-haireye <- as.data.frame(HairEyeColor)
-names(haireye) <- tolower(names(haireye))
-names(haireye)[names(haireye) == "freq"] <- "number"
-haireye
-he_formula <- brmsformula(number ~ sex + hair + eye + sex:hair + sex:eye + hair:eye)
-get_prior(he_formula, data=haireye, family='poisson')
-
-
-pseudo_ic50_comp_false_class_by_kinase <- pseudo_ic50_comp_false_class %>%
-  count(chembl_type, `DiscoveRx Gene Symbol`, false_class) %>%
-  group_by(chembl_type, `DiscoveRx Gene Symbol`) %>%
-  mutate(
-    prop = n / sum(n)
-  )
-```
-
-```{r}
-pseudo_ic50_comp %>%
-  filter(
-    pseudo_ic50_concordant == "concordant",
-    # pseudo_ic50_relation == "=",
-    classification != "discordant"
-  ) %>%
-  group_by(classification) %>%
-  mutate(ic50 = value) %>%
-  summarize(
-    across(
-      c(pseudo_ic50, ic50),
-      list(
-        # average = ~10^(mean(log10(.x))),
-        # ci = ~list(10^DescTools::MeanCI(log10(.x)))
-        ci = ~list(10^quantile(log10(.x), c(.05, .5, .95), na.rm = TRUE))
-      )
-    ),
-    .groups = "drop"
-  ) %>%
-  unnest_wider(ends_with("ci"), names_sep = "_")
-
-
-pseudo_ic50_comp_left <- pseudo_ic50_class %>%
-  group_by(
-    lspci_id, hmsl_id, `Entrez Gene Symbol`, lspci_target_id
-  ) %>%
-  arrange(classification == "discordant", pseudo_ic50_relation != "=", pseudo_ic50) %>%
-  slice_head(n = 1) %>%
-  ungroup() %>%
-  left_join(
-    lsp_biochem,
-    by = c("lspci_id", "lspci_target_id")
-  )
-
-pseudo_ic50_comp_left %>%
-  mutate(
-    chembl_is_covered = !is.na(value)
-  ) %>%
-  count(chembl_is_covered)
-
-
-```
-
-```{r ic50_single_dose_comp}
-single_dose_trans <- single_dose %>%
+```{r single_dose_comp}
+single_dose_trans <- single_dose |>
   mutate(
     log_inhibition = log10(`Percent Control` + 0.01),
-  ) %>%
+  ) |>
   as_tibble()
 
 
-single_dose_comp <- single_dose_trans %>%
+single_dose_comp <- single_dose_trans |>
   # power_left_join(
-  #   lsp_targets %>%
-  #     filter(organism == "Homo sapiens") %>%
+  #   lsp_targets |>
+  #     filter(organism == "Homo sapiens") |>
   #     select(lspci_target_id, symbol),
   #   by = c("Entrez Gene Symbol" = "symbol"),
   #   check = check_specs(
@@ -1407,12 +917,12 @@ single_dose_comp <- single_dose_trans %>%
   #     unmatched_keys_left = "warn",
   #     unmatched_keys_right = "ignore"
   #   )
-  # )  %>%
-  filter(dataset == "original_repeat_replaced") %>%
+  # )  |>
+  filter(dataset == "original_repeat_replaced") |>
   power_left_join(
-    kinomescan_classes %>%
-      filter(dataset == "original_repeat_replaced") %>%
-      distinct(lspci_id, `DiscoveRx Gene Symbol`, classification) %>%
+    kinomescan_classes |>
+      filter(dataset == "original_repeat_replaced") |>
+      distinct(lspci_id, `DiscoveRx Gene Symbol`, classification) |>
       mutate(across(classification, \(x) factor(x, levels = names(class_colors)))),
     by = c("lspci_id", "DiscoveRx Gene Symbol"),
     check = check_specs(
@@ -1421,16 +931,16 @@ single_dose_comp <- single_dose_trans %>%
       unmatched_keys_left = "warn",
       unmatched_keys_right = "warn"
     )
-  ) %>%
+  ) |>
   inner_join(
-    chembl_kd %>%
+    chembl_kd |>
       select(lspci_id, chembl_kd, chembl_kd_relation, `DiscoveRx Gene Symbol`),
     by = c("lspci_id", "DiscoveRx Gene Symbol")
   )
 ```
 
 ```{r}
-p <- single_dose_comp %>%
+p <- single_dose_comp |>
   mutate(
     percent_control_zero = `Percent Control` == 0,
     percent_control_trans = if_else(
@@ -1439,15 +949,15 @@ p <- single_dose_comp %>%
       `Percent Control`
     ),
     chembl_kd = pmin(chembl_kd, 10000)
-  ) %>%
-  group_by(`Compound Concentration (nM)`) %>%
-  filter(n() > 1000) %>%
-  ungroup() %>%
+  ) |>
+  group_by(`Compound Concentration (nM)`) |>
+  filter(n() > 1000) |>
+  ungroup() |>
   filter(
     !qpcr_miss,
     !exclude_target,
     classification != "discordant"
-  ) %>%
+  ) |>
   ggplot(
     aes(chembl_kd, `Percent Control`)
   ) +
@@ -1480,7 +990,7 @@ density_2d <- function (x, y = NULL, nbin = 128, bandwidth) {
   dens
 }
 
-ps <- single_dose_comp %>%
+ps <- single_dose_comp |>
   mutate(
     percent_control_zero = `Percent Control` == 0,
     percent_control_trans = if_else(
@@ -1489,22 +999,22 @@ ps <- single_dose_comp %>%
       `Percent Control`
     ),
     chembl_kd = pmin(chembl_kd, 10000)
-  ) %>%
+  ) |>
   filter(
     !qpcr_miss,
     !exclude_target,
     classification != "discordant"
-  ) %>%
-  group_by(`Compound Concentration (nM)`) %>%
+  ) |>
+  group_by(`Compound Concentration (nM)`) |>
   summarize(
     plot = list(
-      cur_data() %>%
+      cur_data() |>
         mutate(
           density = density_2d(
             log10(chembl_kd), `Percent Control`
           )
-        ) %>%
-        arrange(density) %>%
+        ) |>
+        arrange(density) |>
       # ggplot(cur_data(), aes(value, percent_control_trans, shape = percent_control_zero)) +
       ggplot(aes(chembl_kd, `Percent Control`, color = density)) +
         ggrastr::rasterize(
@@ -1542,95 +1052,48 @@ pwalk(
     )
   }
 )
-
-
-ps <- single_dose_comp %>%
-  mutate(
-    percent_control_zero = `Percent Control` == 0,
-    percent_control_trans = if_else(
-      percent_control_zero,
-      0.5 * min(`Percent Control`[`Percent Control` > 0]),
-      `Percent Control`
-    ),
-    value = pmin(value, 30000)
-  ) %>%
-  filter(
-    !qpcr_miss
-  ) %>%
-  group_by(`Compound Concentration (nM)`) %>%
-  summarize(
-    plot = list(
-      # ggplot(cur_data(), aes(value, percent_control_trans, shape = percent_control_zero)) +
-      ggplot(cur_data(), aes(value, `Percent Control`)) +
-        geom_point(alpha = 0.5) +
-        # scale_shape_manual(
-        #   values = c(`TRUE` = 25, `FALSE` = 16)
-        # ) +
-        scale_x_log10(breaks = c(0.1, 1, 10, 100, 1000, 10000), labels = scales::label_number()) +
-        # scale_y_log10() +
-        guides(shape = "none") +
-        labs(
-          x = "IC50 ChEMBL (nM)",
-          y = "% control Eurofins",
-          title = paste("Compound concentration", cur_group()$`Compound Concentration (nM)`, "nM")
-        )
-    )
-  )
-
-pwalk(
-  ps,
-  function(`Compound Concentration (nM)`, plot, ...) {
-    ggsave(
-      paste0("plots/single_dose_vs_chembl_ic50_", `Compound Concentration (nM)`, "nM.pdf"),
-      plot,
-      width = 8, height = 8
-    )
-  }
-)
 ```
 
 Testing if there are any kinases or compounds that are particularly discordant
 compared to the ChEBML data.
 
 First, establishing the Percent Control thresholds necessary to ensure a 95%
-probability that the ChEMBL IC50 is below 5000 nM.
+probability that the ChEMBL Kd is below 5000 nM.
 
 To do that, first plot for each possible Percent Control threshold what proportion
-of IC50s is below 5000 nM.
+of Kds is below 5000 nM.
 
 
 ```{r}
-percent_control_threshold_plotting_data <- single_dose_comp %>%
-  group_by(`Compound Concentration (nM)`) %>%
-  filter(n() > 1000) %>%
-  ungroup() %>%
+percent_control_threshold_plotting_data <- single_dose_comp |>
+  group_by(`Compound Concentration (nM)`) |>
+  filter(n() > 1000) |>
+  ungroup() |>
   filter(
     classification != "discordant",
     !qpcr_miss
-  ) %>%
-  # crossing(ic_50_threshold = 10**seq(2, 4, length.out = 6)) %>%
-  crossing(ic_50_threshold = c(100, 200, 500, 1000, 5000, 10000)) %>%
-  group_by(`Compound Concentration (nM)`, ic_50_threshold) %>%
-  arrange(`Percent Control`) %>%
+  ) |>
+  crossing(kd_threshold = c(100, 200, 500, 1000, 5000, 10000)) |>
+  group_by(`Compound Concentration (nM)`, kd_threshold) |>
+  arrange(`Percent Control`) |>
   mutate(
-    cumsum_below_threshold = cumsum(value < ic_50_threshold),
+    cumsum_below_threshold = cumsum(chembl_kd < kd_threshold),
     frac_below_threshold = cumsum_below_threshold / seq_len(n())
-  ) %>%
-  ungroup() %>%
-  group_by(`Compound Concentration (nM)`, `Percent Control`, ic_50_threshold) %>%
-  slice_tail(n = 1) %>%
+  ) |>
+  ungroup() |>
+  group_by(`Compound Concentration (nM)`, `Percent Control`, kd_threshold) |>
+  slice_tail(n = 1) |>
   ungroup()
 
-p <- percent_control_threshold_plotting_data %>%
-  mutate(across(c(ic_50_threshold, `Compound Concentration (nM)`), ~as.character(.x) %>% fct_inseq(ordered = TRUE))) %>%
+p <- percent_control_threshold_plotting_data |>
+  mutate(across(c(kd_threshold, `Compound Concentration (nM)`), ~as.character(.x) |> fct_inseq(ordered = TRUE))) |>
   ggplot(aes(`Percent Control`, frac_below_threshold, color = `Compound Concentration (nM)`)) +
   geom_line() +
-  # geom_point() +
-  facet_wrap(~ic_50_threshold) +
-  labs(y = "Fraction of measurements below IC50 threshold")
+  facet_wrap(~kd_threshold) +
+  labs(y = "Fraction of measurements below ChEMBL Kd threshold")
 
 ggsave(
-  "plots/percent_control_below_ic50_threshold_no_discordant.pdf", p,
+  "plots/percent_control_below_chembl_kd_threshold_no_discordant.pdf", p,
   width = 8, height = 4
 )
 
@@ -1638,17 +1101,17 @@ ggsave(
 
 
 ```{r}
-pseudo_ic50_comp_stats <- pseudo_ic50_comp %>%
-  drop_na(pseudo_ic50) %>%
-  filter(classification != "discordant") %>%
+kd_fit_comp_stats <- kd_fit_kd_comp |>
+  drop_na(kd) |>
+  filter(classification != "discordant") |>
   mutate(
-      log10_ic50 = log10(value),
-      log10_pseudo_ic50 = log10(pseudo_ic50),
-      log_ic50_diff = log10_ic50 - log10_pseudo_ic50,
-      diff_greater_than_1 = abs(log_ic50_diff) > 1,
+      log10_chembl_kd = log10(chembl_kd),
+      log10_kd = log10(kd),
+      log_kd_diff = log10_chembl_kd - log10_kd,
+      diff_greater_than_1 = abs(log_kd_diff) > 1,
       difference_class = case_when(
-          log_ic50_diff > 1 ~ "FP",
-          log_ic50_diff < -1 ~ "FN",
+          log_kd_diff > 1 ~ "FP",
+          log_kd_diff < -1 ~ "FN",
           TRUE ~ "concordant"
       )
   )
@@ -1657,15 +1120,15 @@ pseudo_ic50_comp_stats <- pseudo_ic50_comp %>%
 
 ```{r}
 stats_per_group <- function(grouped_df) {
-    grouped_df %>%
+    grouped_df |>
     summarize(
         n = n(),
         n_binding_class = sum(classification == "binding"),
         frac_binding_class = n_binding_class / n,
         n_diff_greater_than_1 = sum(diff_greater_than_1, na.rm = TRUE),
         frac_diff_greater_than_1 = n_diff_greater_than_1 / n,
-        mean_log_ic50_diff = mean(log_ic50_diff, na.rm = TRUE),
-        sd_log_ic50_diff = sd(log_ic50_diff, na.rm = TRUE),
+        mean_log_kd_diff = mean(log_kd_diff, na.rm = TRUE),
+        sd_log_kd_diff = sd(log_kd_diff, na.rm = TRUE),
         n_false_positives = sum(difference_class == "FP", na.rm = TRUE),
         n_false_negatives = sum(difference_class == "FN", na.rm = TRUE),
         frac_false_positives = n_false_positives / n,
@@ -1674,15 +1137,14 @@ stats_per_group <- function(grouped_df) {
     )
 }
 
-pseudo_ic50_comp_stats_per_compound <- pseudo_ic50_comp_stats %>%
-    group_by(lspci_id, name) %>%
-    filter(n() > 10) %>%
+kd_fit_comp_stats_per_compound <- kd_fit_comp_stats |>
+    group_by(lspci_id, name) |>
+    filter(n() > 10) |>
     stats_per_group()
 ```
 
 ```{r}
-library(ggrepel)
-p <- pseudo_ic50_comp_stats_per_compound %>%
+p <- kd_fit_comp_stats_per_compound |>
   mutate(
     outside_prediction_interval = {
       mdl <- lm(
@@ -1692,7 +1154,7 @@ p <- pseudo_ic50_comp_stats_per_compound %>%
       pred_interval <- predict(mdl, interval = "prediction", level = 0.8)
       frac_diff_greater_than_1 < pred_interval[, "lwr"] | frac_diff_greater_than_1 > pred_interval[, "upr"]
     }
-  ) %>%
+  ) |>
   ggplot(
     aes(
       frac_binding_class, frac_diff_greater_than_1,
@@ -1702,7 +1164,7 @@ p <- pseudo_ic50_comp_stats_per_compound %>%
     geom_point(shape = 16) +
     geom_text_repel(
       aes(label = name),
-      data = ~.x %>%
+      data = ~.x |>
         mutate(name = if_else(!outside_prediction_interval, "", name)),
       # min.segment.length = 0,
       max.overlaps = Inf,
@@ -1710,7 +1172,7 @@ p <- pseudo_ic50_comp_stats_per_compound %>%
     guides(color = "none") +
     labs(
         x = "Fraction of 'binding' dose-response curves",
-        y = "Fraction of pseudo IC50s with >10x difference",
+        y = "Fraction of fitted Kds with >10x difference to ChEMBL",
         title = "Per compound"
     )
 
@@ -1718,7 +1180,7 @@ p <- pseudo_ic50_comp_stats_per_compound %>%
 plotly::ggplotly(p)
 
 ggsave(
-    "plots/eurofins_ic50_vs_kinomescan_pseudo_ic50_differences_per_compound.pdf", p,
+    "plots/chembl_kd_vs_kinomescan_kd_fit_differences_per_compound.pdf", p,
     width = 10, height = 7
 )
 ```
@@ -1727,10 +1189,10 @@ Now do the same per kinase
 
 ```{r}
 
-pseudo_ic50_comp_stats_per_kinase <- pseudo_ic50_comp_stats %>%
-    group_by(`DiscoveRx Gene Symbol`) %>%
-    filter(n() > 10) %>%
-    stats_per_group() %>%
+kd_fit_comp_stats_per_kinase <- kd_fit_comp_stats |>
+    group_by(`DiscoveRx Gene Symbol`) |>
+    filter(n() > 10) |>
+    stats_per_group() |>
     inner_join(
       kinomescan_kinase_info
     )
@@ -1739,16 +1201,16 @@ pseudo_ic50_comp_stats_per_kinase <- pseudo_ic50_comp_stats %>%
 ```{r}
 lm(
   frac_diff_greater_than_1 ~ frac_binding_class,
-  data = pseudo_ic50_comp_stats_per_kinase
-) %>%
+  data = kd_fit_comp_stats_per_kinase
+) |>
   summary()
 
 cor.test(
   ~frac_diff_greater_than_1 + frac_binding_class,
-  data = pseudo_ic50_comp_stats_per_kinase
+  data = kd_fit_comp_stats_per_kinase
 )
 
-p <- pseudo_ic50_comp_stats_per_kinase %>%
+p <- kd_fit_comp_stats_per_kinase |>
   mutate(
     outside_prediction_interval = {
       mdl <- lm(
@@ -1758,7 +1220,7 @@ p <- pseudo_ic50_comp_stats_per_kinase %>%
       pred_interval <- predict(mdl, interval = "prediction", level = 0.8)
       frac_diff_greater_than_1 < pred_interval[, "lwr"] | frac_diff_greater_than_1 > pred_interval[, "upr"]
     }
-  ) %>%
+  ) |>
   ggplot(
     aes(
       frac_binding_class, frac_diff_greater_than_1,
@@ -1769,7 +1231,7 @@ p <- pseudo_ic50_comp_stats_per_kinase %>%
     geom_point(shape = 16) +
     geom_text_repel(
       aes(label = `DiscoveRx Gene Symbol`),
-      data = ~.x %>%
+      data = ~.x |>
         mutate(`DiscoveRx Gene Symbol` = if_else(!outside_prediction_interval, "", `DiscoveRx Gene Symbol`)),
       # min.segment.length = 0,
       max.overlaps = Inf,
@@ -1781,14 +1243,14 @@ p <- pseudo_ic50_comp_stats_per_kinase %>%
     guides(color = "none") +
     labs(
         x = "Fraction of 'binding' dose-response curves",
-        y = "Fraction of pseudo IC50s with >10x difference",
+        y = "Fraction of fitted Kds with >10x difference to ChEMBL",
         title = "Per kinase"
     )
 
 plotly::ggplotly(p)
 
 ggsave(
-    "plots/eurofins_ic50_vs_kinomescan_pseudo_ic50_differences_per_kinase.pdf", p,
+    "plots/chembl_kd_vs_kinomescan_kd_fit_differences_per_kinase.pdf", p,
     width = 10, height = 7
 )
 ```
@@ -1796,8 +1258,8 @@ ggsave(
 ## Use pROC
 
 ```{r}
-single_dose_comp_binned <- single_dose_comp %>%
-  filter(dataset == "original_repeat_replaced") %>%
+single_dose_comp_binned <- single_dose_comp |>
+  filter(dataset == "original_repeat_replaced") |>
   mutate(
     percent_control_bin = cut(
       `Percent Control`,
@@ -1809,10 +1271,10 @@ single_dose_comp_binned <- single_dose_comp %>%
     )
   )
 
-single_dose_comp_binned_filtered <- single_dose_comp_binned %>%
-  group_by(`Compound Concentration (nM)`) %>%
-  filter(n() > 1000) %>%
-  ungroup() %>%
+single_dose_comp_binned_filtered <- single_dose_comp_binned |>
+  group_by(`Compound Concentration (nM)`) |>
+  filter(n() > 1000) |>
+  ungroup() |>
   mutate(
     across(
       `Compound Concentration (nM)`,
@@ -1822,7 +1284,7 @@ single_dose_comp_binned_filtered <- single_dose_comp_binned %>%
         labels = paste0(sort(unique(.x)), " nM")
       )
     )
-  ) %>%
+  ) |>
   filter(
     classification != "discordant",
     !qpcr_miss,
@@ -1836,11 +1298,11 @@ KD_THRESHOLDS <- c(10, 100, 1000, 5000)
 
 # fn_fp_weights <- c("2xFN" = 2, "equal" = 1, "2xFP" = .5)
 # prevalence_estimate <-
-single_dose_comp_proc <- single_dose_comp_binned_filtered %>%
+single_dose_comp_proc <- single_dose_comp_binned_filtered |>
   crossing(
     kd_threshold = KD_THRESHOLDS
-  ) %>%
-  group_by(`Compound Concentration (nM)`, kd_threshold) %>%
+  ) |>
+  group_by(`Compound Concentration (nM)`, kd_threshold) |>
   summarize(
     roc = pROC::roc(
       chembl_kd < cur_group()$kd_threshold,
@@ -1848,17 +1310,17 @@ single_dose_comp_proc <- single_dose_comp_binned_filtered %>%
       direction = ">",
       smooth = FALSE,
       plot = FALSE
-    ) %>%
+    ) |>
       list(),
     .groups = "drop"
-  ) %>%
+  ) |>
   # cross_join(
   #   enframe(
   #     fn_fp_weights,
   #     name = "weight_name",
   #     value = "fn_fp_weight"
   #   )
-  # ) %>%
+  # ) |>
   mutate(
     # fn_fp_weight = (1 - fn_fp_weight) / fn_fp_weight,
     fn_fp_weight = 1,
@@ -1867,13 +1329,13 @@ single_dose_comp_proc <- single_dose_comp_binned_filtered %>%
       fn_fp_weight,
       \(x, w) pROC::coords(
         x, x = "all", ret = "all"
-      ) %>%
+      ) |>
       # \(x, w) pROC::coords(
       #   x,
       #   x = c(-Inf, seq(0, 100, 1), Inf), input = "threshold",
       #   ret = "all"
-      # ) %>%
-        as_tibble() %>%
+      # ) |>
+        as_tibble() |>
         mutate(
           f1 = 2 * ppv * tpr / (ppv + tpr),
           # https://en.wikipedia.org/wiki/P4-metric
@@ -1882,11 +1344,11 @@ single_dose_comp_proc <- single_dose_comp_binned_filtered %>%
     )
   )
 
-single_dose_comp_proc_scores <- single_dose_comp_proc %>%
-  select(`Compound Concentration (nM)`, kd_threshold, scores) %>%
+single_dose_comp_proc_scores <- single_dose_comp_proc |>
+  select(`Compound Concentration (nM)`, kd_threshold, scores) |>
   unnest(scores)
 
-single_dose_comp_proc_scores_long <- single_dose_comp_proc_scores %>%
+single_dose_comp_proc_scores_long <- single_dose_comp_proc_scores |>
   pivot_longer(
     -c(`Compound Concentration (nM)`, kd_threshold, threshold),
     names_to = "measure",
@@ -1898,27 +1360,27 @@ write_csv(
   file.path("classification", "okl_eurofins_single_dose_chembl_kd_comparison_proc_scores.csv.gz")
 )
 
-single_dose_comp_proc_scores_long_best <- single_dose_comp_proc_scores_long %>%
+single_dose_comp_proc_scores_long_best <- single_dose_comp_proc_scores_long |>
   filter(
     measure %in% c("youden", "closest.topleft", "f1", "p4")
-  ) %>%
-  group_by(`Compound Concentration (nM)`, kd_threshold, measure) %>%
+  ) |>
+  group_by(`Compound Concentration (nM)`, kd_threshold, measure) |>
   slice(
     if (cur_group()$measure %in% c("youden", "f1", "p4"))
       which.max(value)
     else
       which.min(value)
-  ) %>%
+  ) |>
   ungroup()
 ```
 
 
 ```{r}
-p <- single_dose_comp_proc_scores_long %>%
+p <- single_dose_comp_proc_scores_long |>
   filter(
     measure %in% c("youden", "closest.topleft", "f1", "p4")
-  ) %>%
-  group_by(`Compound Concentration (nM)`, kd_threshold, measure) %>%
+  ) |>
+  group_by(`Compound Concentration (nM)`, kd_threshold, measure) |>
   mutate(
     threshold = if_else(is.infinite(threshold), 100, threshold),
     best = if_else(
@@ -1926,18 +1388,18 @@ p <- single_dose_comp_proc_scores_long %>%
       value == max(value, na.rm = TRUE),
       value == min(value, na.rm = TRUE)
     )
-  ) %>%
-  ungroup() %>%
+  ) |>
+  ungroup() |>
   ggplot(
     aes(threshold, value, color = measure)
   ) +
     geom_line() +
     geom_point(
-      data = \(x) x %>% filter(best)
+      data = \(x) x |> filter(best)
     ) +
     geom_vline(
       aes(xintercept = threshold, color = measure),
-      data = \(x) x %>% filter(best),
+      data = \(x) x |> filter(best),
       linetype = "dashed"
     ) +
     facet_grid(
@@ -1953,37 +1415,37 @@ ggsave(
 Chose closest.topleft as optimization criterion
 
 ```{r}
-single_dose_comp_optim_and_flat <- single_dose_comp_proc_scores_long_best %>%
-  select(criterion = measure, `Compound Concentration (nM)`, kd_threshold, threshold) %>%
+single_dose_comp_optim_and_flat <- single_dose_comp_proc_scores_long_best |>
+  select(criterion = measure, `Compound Concentration (nM)`, kd_threshold, threshold) |>
   bind_rows(
     crossing(
-      single_dose_comp_proc_scores_long_best %>%
+      single_dose_comp_proc_scores_long_best |>
         distinct(`Compound Concentration (nM)`, kd_threshold),
         threshold = 35
-    ) %>%
+    ) |>
       mutate(criterion = "flat")
   )
 
-single_dose_comp_optim_best_dose <- single_dose_comp_proc_scores_long_best %>%
-  group_by(kd_threshold, measure) %>%
+single_dose_comp_optim_best_dose <- single_dose_comp_proc_scores_long_best |>
+  group_by(kd_threshold, measure) |>
   slice(if (cur_group()$measure %in% c("youden", "f1", "p4"))
     which.max(value)
   else
     which.min(value)
-  ) %>%
+  ) |>
   ungroup()
 ```
 
 
 ```{r}
-p <- single_dose_comp_proc_scores %>%
+p <- single_dose_comp_proc_scores |>
   ggplot(
     aes(precision, recall)
   ) +
     geom_line() +
     geom_point(
       aes(color = measure),
-      data = \(x) x %>%
+      data = \(x) x |>
         inner_join(
           single_dose_comp_proc_scores_long_best,
           by = join_by(`Compound Concentration (nM)`, kd_threshold, threshold)
@@ -2001,46 +1463,46 @@ param_order <- c(
   threshold = "threshold", sensitivity = "SENS", specificity = "SPEC", ppv = "PREC", space = "space"
 )
 
-optimal_params_table_raw <- single_dose_comp_optim_and_flat %>%
-  filter(criterion == "closest.topleft") %>%
+optimal_params_table_raw <- single_dose_comp_optim_and_flat |>
+  filter(criterion == "closest.topleft") |>
   power_inner_join(
-    single_dose_comp_proc_scores_long %>%
+    single_dose_comp_proc_scores_long |>
       filter(measure %in% names(param_order)),
     by = join_by(`Compound Concentration (nM)`, kd_threshold, threshold),
     check = check_specs(
       duplicate_keys_left = "warn",
       unmatched_keys_left = "warn"
     )
-  ) %>%
-  select(-criterion, -threshold) %>%
+  ) |>
+  select(-criterion, -threshold) |>
   bind_rows(
-    single_dose_comp_optim_and_flat %>%
-      filter(criterion == "closest.topleft") %>%
+    single_dose_comp_optim_and_flat |>
+      filter(criterion == "closest.topleft") |>
       transmute(
         `Compound Concentration (nM)`, kd_threshold,
         measure = "threshold", value = threshold
       )
   )
 
-optimal_params_table <- optimal_params_table_raw %>%
+optimal_params_table <- optimal_params_table_raw |>
   mutate(
     value = case_when(
       measure %in% c("sensitivity", "specificity", "ppv") ~ sprintf("%.2f", value),
       TRUE ~ sprintf("%.0f", value)
     ),
     measure = factor(measure, levels = names(param_order), labels = param_order),
-    kd_threshold = fct_inseq(as.character(kd_threshold)) %>%
+    kd_threshold = fct_inseq(as.character(kd_threshold)) |>
       fct_relabel(\(x) paste0("<", x, " nM"))
-  ) %>%
+  ) |>
   tidyr::complete(
     `Compound Concentration (nM)`, kd_threshold, measure,
     fill = list(value = "")
-  ) %>%
+  ) |>
   arrange(
     kd_threshold,
     `Compound Concentration (nM)`,
     measure
-  ) %>%
+  ) |>
   pivot_wider(
     names_from = c(kd_threshold, measure),
     values_from = value
@@ -2120,31 +1582,31 @@ param_order <- c(
   "Cutoff", "FP", "FN", "SENS", "SPEC", "PREC"
 )
 
-param_comparison_table <- single_dose_comp_proc_scores_long_best %>%
-  filter(measure == "closest.topleft") %>%
-  select(`Compound Concentration (nM)`, kd_threshold, threshold) %>%
-  mutate(optim = "optim") %>%
+param_comparison_table <- single_dose_comp_proc_scores_long_best |>
+  filter(measure == "closest.topleft") |>
+  select(`Compound Concentration (nM)`, kd_threshold, threshold) |>
+  mutate(optim = "optim") |>
   bind_rows(
-    select(., -threshold) %>%
-    distinct() %>%
+    select(., -threshold) |>
+    distinct() |>
     crossing(
       threshold = c(1, 10, 20, 35, 50, 60, 70)
-    ) %>%
+    ) |>
     mutate(optim = "flat")
-  ) %>%
+  ) |>
   # Make sure Cutoffs are not present twice (once in optim and once in flat)
-  group_by(`Compound Concentration (nM)`, kd_threshold, threshold) %>%
+  group_by(`Compound Concentration (nM)`, kd_threshold, threshold) |>
   filter(
     if (uniqueN(optim) == 1 || cur_group()$threshold == 35)
       TRUE
     else
       optim == "optim"
-  ) %>%
-  ungroup() %>%
+  ) |>
+  ungroup() |>
   power_inner_join(
     single_dose_comp_binned_filtered,
     by = c("Compound Concentration (nM)")
-  ) %>%
+  ) |>
   mutate(
     hit_kinomescan = `Percent Control` <= threshold,
     hit_chembl = chembl_kd <= kd_threshold,
@@ -2156,18 +1618,18 @@ param_comparison_table <- single_dose_comp_proc_scores_long_best %>%
     )
   )
 
-param_comparison_table_optim_vs_flat <- param_comparison_table %>%
+param_comparison_table_optim_vs_flat <- param_comparison_table |>
   select(
     `Compound Concentration (nM)`, kd_threshold, optim, threshold,
     lspci_id, hmsl_id, name, library, `DiscoveRx Gene Symbol`, `Entrez Gene Symbol`,
     starts_with("hit")
-  ) %>%
-  filter(optim == "optim" | threshold == 35) %>%
-  # select(-Cutoff) %>%
+  ) |>
+  filter(optim == "optim" | threshold == 35) |>
+  # select(-Cutoff) |>
   pivot_wider(
     names_from = optim,
     values_from = c(threshold, starts_with("hit"))
-  ) %>%
+  ) |>
   mutate(
     change_class = if_else(
       hit_class_flat == hit_class_optim,
@@ -2179,17 +1641,17 @@ param_comparison_table_optim_vs_flat <- param_comparison_table %>%
     )
   )
 
-param_comparison_table_optim_vs_flat_best_doses <- param_comparison_table_optim_vs_flat %>%
+param_comparison_table_optim_vs_flat_best_doses <- param_comparison_table_optim_vs_flat |>
   semi_join(
-    single_dose_comp_optim_best_dose %>%
+    single_dose_comp_optim_best_dose |>
       filter(measure == "closest.topleft"),
     by = c("Compound Concentration (nM)", "kd_threshold")
   )
 
-param_comparison_table_optim_vs_flat_best_doses_coral <- param_comparison_table_optim_vs_flat_best_doses %>%
+param_comparison_table_optim_vs_flat_best_doses_coral <- param_comparison_table_optim_vs_flat_best_doses |>
   power_inner_join(
-    coral_map %>%
-      distinct(`DiscoveRx Gene Symbol`, CORAL) %>%
+    coral_map |>
+      distinct(`DiscoveRx Gene Symbol`, CORAL) |>
       drop_na(CORAL),
     by = c("DiscoveRx Gene Symbol"),
     check = check_specs(
@@ -2198,41 +1660,41 @@ param_comparison_table_optim_vs_flat_best_doses_coral <- param_comparison_table_
     )
   )
 
-param_comparison_table_optim_vs_flat_best_doses_coral_classes_wide <- param_comparison_table_optim_vs_flat_best_doses_coral %>%
+param_comparison_table_optim_vs_flat_best_doses_coral_classes_wide <- param_comparison_table_optim_vs_flat_best_doses_coral |>
   count(
     name, kd_threshold, change_class
-  ) %>%
+  ) |>
   pivot_wider(
     names_from = change_class,
     values_from = n,
     values_fill = list(n = 0)
-  ) %>%
+  ) |>
   mutate(
     n_optim_better = `FN->TP` + `FP->TN`,
     n_flat_better = `TN->FP` + `TP->FN`,
     n_diff = n_optim_better - n_flat_better
   )
 
-param_comparison_table_optim_vs_flat_best_doses_coral_classes_wide %>%
-  arrange(desc(`FN->TP`), desc(n_diff)) %>%
+param_comparison_table_optim_vs_flat_best_doses_coral_classes_wide |>
+  arrange(desc(`FN->TP`), desc(n_diff)) |>
   View()
 
-param_comparison_table_optim_vs_flat_best_doses_coral %>%
-  filter(name == "RUXOLITINIB", kd_threshold == 1000) %>%
+param_comparison_table_optim_vs_flat_best_doses_coral |>
+  filter(name == "RUXOLITINIB", kd_threshold == 1000) |>
   select(
     CORAL, change_class
-  ) %>%
+  ) |>
   clipr::write_clip()
 
-param_comparison_table_optim_vs_flat_best_doses_coral %>%
-  filter(name == "RUXOLITINIB", kd_threshold == 1000) %>%
+param_comparison_table_optim_vs_flat_best_doses_coral |>
+  filter(name == "RUXOLITINIB", kd_threshold == 1000) |>
   select(
     CORAL, hit_class_optim
-  ) %>%
+  ) |>
   clipr::write_clip()
 
-param_comparison_table_optim_vs_flat_best_doses_coral %>%
-  filter(name == "RUXOLITINIB", kd_threshold == 1000) %>%
+param_comparison_table_optim_vs_flat_best_doses_coral |>
+  filter(name == "RUXOLITINIB", kd_threshold == 1000) |>
   count(
     change_class
   )
@@ -2242,8 +1704,8 @@ param_comparison_table_optim_vs_flat_best_doses_coral %>%
 # 1 FP->TN          30
 # 2 same           334
 
-param_comparison_table_optim_vs_flat_best_doses_coral %>%
-  filter(name == "RUXOLITINIB", kd_threshold == 1000) %>%
+param_comparison_table_optim_vs_flat_best_doses_coral |>
+  filter(name == "RUXOLITINIB", kd_threshold == 1000) |>
   count(
     hit_class_optim, hit_class_flat
   )
@@ -2256,14 +1718,14 @@ param_comparison_table_optim_vs_flat_best_doses_coral %>%
 # 4 TN              TN               212
 # 5 TP              TP                56
 
-param_comparison_table_optim_vs_flat_best_doses_coral %>%
-  filter(name == "RUXOLITINIB", kd_threshold == 1000) %>%
+param_comparison_table_optim_vs_flat_best_doses_coral |>
+  filter(name == "RUXOLITINIB", kd_threshold == 1000) |>
   transmute(
     CORAL, size = if_else(change_class == "same", 5, 50)
-  ) %>%
+  ) |>
   clipr::write_clip()
 
-param_comparison_table_optim_vs_flat_best_doses_coral %>%
+param_comparison_table_optim_vs_flat_best_doses_coral |>
   group_nest(kd_threshold)
 ```
 
@@ -2274,9 +1736,9 @@ Make heatmap how status changes as Cutoff is changed
 library(seriation)
 cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
   # browser()
-  mat <- df %>%
-    select({{row_var}}, {{col_var}}, {{value_var}}) %>%
-    pivot_wider(names_from = {{col_var}}, values_from = {{value_var}}, values_fill = values_fill) %>%
+  mat <- df |>
+    select({{row_var}}, {{col_var}}, {{value_var}}) |>
+    pivot_wider(names_from = {{col_var}}, values_from = {{value_var}}, values_fill = values_fill) |>
     column_to_rownames(rlang::as_name(rlang::enquo(row_var)))
   # browser()
   if (rlang::is_bare_numeric(pull(df, {{value_var}}))) {
@@ -2285,36 +1747,36 @@ cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
   } else {
     # browser()
     dist_rows <- cluster::daisy(mat, metric = "gower")
-    dist_cols <- t(mat) %>%
-      as.data.frame() %>%
-      mutate(across(everything(), \(x) factor(x, levels = levels(pull(df, {{value_var}}))))) %>%
+    dist_cols <- t(mat) |>
+      as.data.frame() |>
+      mutate(across(everything(), \(x) factor(x, levels = levels(pull(df, {{value_var}}))))) |>
       cluster::daisy(metric = "gower")
   }
-  clust_rows <- hclust(dist_rows, method = "average") %>%
+  clust_rows <- hclust(dist_rows, method = "average") |>
       reorder(dist_rows, method = "olo")
-  clust_cols <- hclust(dist_cols, method = "average") %>%
+  clust_cols <- hclust(dist_cols, method = "average") |>
       reorder(dist_cols, method = "olo")
-  df %>%
+  df |>
     mutate(
       "{{row_var}}" := factor({{row_var}}, levels = clust_rows$labels[clust_rows$order]),
       "{{col_var}}" := factor({{col_var}}, levels = clust_cols$labels[clust_cols$order])
     )
 }
 
-p <- param_comparison_table %>%
-  filter(name == "TAE-684", kd_threshold == 10) %>%
+p <- param_comparison_table |>
+  filter(name == "TAE-684", kd_threshold == 10) |>
   semi_join(
     single_dose_comp_best_doses,
     by = c("Compound Concentration (nM)", "kd_threshold")
-  ) %>%
+  ) |>
   mutate(
     across(hit_class, \(x) factor(as.character(x), levels = c(unique(x), "NA")))
-  ) %>%
-  cluster_df(Cutoff, `DiscoveRx Gene Symbol`, hit_class, values_fill = "NA") %>%
+  ) |>
+  cluster_df(Cutoff, `DiscoveRx Gene Symbol`, hit_class, values_fill = "NA") |>
   mutate(
     Cutoff = fct_inseq(as.character(Cutoff), ordered = TRUE),
     false_hit = hit_chembl != hit_kinomescan
-  ) %>%
+  ) |>
   ggplot(
     aes(
       x = Cutoff,
@@ -2346,16 +1808,16 @@ ggsave(
   p, width = 8, height = 6
 )
 
-single_dose_comp_scores_weighted_diagnostics %>%
-  filter(variable == "score", weight_name == "equal") %>%
+single_dose_comp_scores_weighted_diagnostics |>
+  filter(variable == "score", weight_name == "equal") |>
   filter(
     name == "TAE-684", kd_threshold == 10
-  ) %>%
+  ) |>
   semi_join(
     single_dose_comp_best_doses,
     by = c("Compound Concentration (nM)", "kd_threshold")
-  ) %>%
-  select(`Compound Concentration (nM)`, kd_threshold, Cutoff, variable, value) %>%
+  ) |>
+  select(`Compound Concentration (nM)`, kd_threshold, Cutoff, variable, value) |>
   pivot_wider(
     names_from = "variable",
     values_from = value
@@ -2369,7 +1831,7 @@ Plot precision-recall curves
 
 ```{r}
 get_scores_for_thresholds <- function(thresholds) {
-  single_dose_comp_proc %>%
+  single_dose_comp_proc |>
     mutate(
       scores = map(
         roc,
@@ -2379,29 +1841,29 @@ get_scores_for_thresholds <- function(thresholds) {
           ret = "all"
         )
       )
-    ) %>%
-    select(`Compound Concentration (nM)`, kd_threshold, scores) %>%
+    ) |>
+    select(`Compound Concentration (nM)`, kd_threshold, scores) |>
     unnest(scores)
 }
 
-single_dose_comp_proc_scores_best_and_series_and_all <- single_dose_comp_proc_scores %>%
+single_dose_comp_proc_scores_best_and_series_and_all <- single_dose_comp_proc_scores |>
   left_join(
-    single_dose_comp_proc_scores_long_best %>%
-      filter(measure == "closest.topleft") %>%
-      select(`Compound Concentration (nM)`, kd_threshold, threshold) %>%
+    single_dose_comp_proc_scores_long_best |>
+      filter(measure == "closest.topleft") |>
+      select(`Compound Concentration (nM)`, kd_threshold, threshold) |>
       mutate(point_type = "best"),
     by = join_by(`Compound Concentration (nM)`, kd_threshold, threshold)
-  ) %>%
+  ) |>
   bind_rows(
     anti_join(
-      get_scores_for_thresholds(35) %>%
+      get_scores_for_thresholds(35) |>
         mutate(
           point_type = "flat"
         ),
       .,
       by = join_by(`Compound Concentration (nM)`, kd_threshold, threshold)
     )
-  ) %>%
+  ) |>
   mutate(
     point_type = replace_na(point_type, "all"),
     threshold_label = case_when(
@@ -2409,42 +1871,41 @@ single_dose_comp_proc_scores_best_and_series_and_all <- single_dose_comp_proc_sc
       point_type == "flat" ~ paste0(as.character(signif(threshold, 2)), "%"),
       TRUE ~ ""
     )
-  ) %>%
+  ) |>
   left_join(
-    filter(., point_type %in% c("best", "flat")) %>%
-      group_by(`Compound Concentration (nM)`, kd_threshold) %>%
-      arrange(threshold, .by_group = TRUE) %>%
+    filter(., point_type %in% c("best", "flat")) |>
+      group_by(`Compound Concentration (nM)`, kd_threshold) |>
+      arrange(threshold, .by_group = TRUE) |>
       mutate(
         ahead_diff = lead(threshold) - threshold,
         behind_diff = threshold - lag(threshold),
         keep_label = point_type == "best" |
           (replace_na(ahead_diff > 2.5, TRUE) & replace_na(behind_diff > 2.5, TRUE))
-      ) %>%
-      ungroup() %>%
+      ) |>
+      ungroup() |>
       select(`Compound Concentration (nM)`, kd_threshold, threshold, ahead_diff, behind_diff, keep_label),
     by = join_by(`Compound Concentration (nM)`, kd_threshold, threshold)
-  ) %>%
+  ) |>
   mutate(
     keep_label = replace_na(keep_label, FALSE)
   )
 
-single_dose_comp_proc_scores_best_and_series <- single_dose_comp_proc_scores_best_and_series_and_all %>%
-  filter(point_type %in% c("best", "flat")) %>%
-  group_by(`Compound Concentration (nM)`, kd_threshold) %>%
-  arrange(threshold, .by_group = TRUE) %>%
+single_dose_comp_proc_scores_best_and_series <- single_dose_comp_proc_scores_best_and_series_and_all |>
+  filter(point_type %in% c("best", "flat")) |>
+  group_by(`Compound Concentration (nM)`, kd_threshold) |>
+  arrange(threshold, .by_group = TRUE) |>
   mutate(
     ahead_diff = lead(threshold) - threshold,
     behind_diff = threshold - lag(threshold),
     keep_label = point_type == "best" |
       (replace_na(ahead_diff > 2.5, TRUE) & replace_na(behind_diff > 2.5, TRUE))
-  ) %>%
+  ) |>
   ungroup()
 
-library(ggrepel)
-single_dose_comp_pr_plots <- single_dose_comp_proc_scores_best_and_series_and_all %>%
+single_dose_comp_pr_plots <- single_dose_comp_proc_scores_best_and_series_and_all |>
   # filter(
   #   kd_threshold %in% c(100, 1000, 5000)
-  # ) %>%
+  # ) |>
   ggplot(
     aes(
       sensitivity, ppv,
@@ -2509,10 +1970,10 @@ ggsave(
   width = 12, height = 4
 )
 
-single_dose_comp_roc_plots <- single_dose_comp_proc_scores_best_and_series_and_all %>%
+single_dose_comp_roc_plots <- single_dose_comp_proc_scores_best_and_series_and_all |>
   # filter(
   #   kd_threshold %in% c(100, 1000, 5000)
-  # ) %>%
+  # ) |>
   ggplot(
     aes(
       1 - specificity, sensitivity,
@@ -2584,17 +2045,17 @@ Alternative version with symbols for quartiles
 
 ```{r}
 
-single_dose_comp_roc_plots <- single_dose_comp_proc_scores_best_and_series_and_all %>%
+single_dose_comp_roc_plots <- single_dose_comp_proc_scores_best_and_series_and_all |>
   # filter(
   #   kd_threshold %in% c(100, 1000, 5000)
-  # ) %>%
+  # ) |>
   mutate(
     point_label = case_when(
       point_type == "series" ~ paste0(threshold_label, "%"),
       point_type == "best" ~ "optimal",
       TRUE ~ ""
     )
-  ) %>%
+  ) |>
   ggplot(
     aes(
       1 - specificity, sensitivity,
@@ -2631,7 +2092,7 @@ single_dose_comp_roc_plots <- single_dose_comp_proc_scores_best_and_series_and_a
     data = \(x) filter(
       x,
       point_type == "best"
-    ) %>%
+    ) |>
       mutate(
         threshold_label = str_replace(threshold_label, fixed("*"), "%")
       ),
@@ -2688,7 +2149,8 @@ ggsave(
 ```{r}
 synStoreMany(
   c(
-    "data/chembl_kds_filtered.csv.gz"
+    "data/chembl_kds_filtered.csv.gz",
+    "data/chembl_ic50s_filtered.csv.gz"
   ),
   parentId = "syn18508401",
   forceVersion = FALSE
