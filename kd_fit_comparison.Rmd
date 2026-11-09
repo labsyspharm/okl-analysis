@@ -41,7 +41,7 @@ kd_fit_pairs <- syn("syn73759909") |>
 kd_fits <- syn("syn69680641") |>
   read_csv()
 
-chembl_kd_raw <- syn("syn52854574") |>
+chembl_kd <- syn("syn77771309") |>
   read_csv()
 
 compound_mapping <- syn("syn26260389") |>
@@ -70,31 +70,6 @@ hmsl_id_name_map <- distinct(
   hmsl_id, name
 ) |>
   with(set_names(name, hmsl_id))
-```
-
-
-```{r}
-chembl_kd <- chembl_kd_raw |>
-  mutate(across(standard_value, as.numeric)) |>
-  filter(
-    standard_relation == "=" |
-      (standard_relation %in% c(">=", ">") & standard_value > 9000)
-  ) |>
-  group_by(gene_symbol, lspci_id) |>
-  summarize(
-    chembl_kd = quantile(standard_value, 0.25, na.rm = TRUE, names = FALSE),
-    chembl_kd_relation = paste(sort(unique(standard_relation)), collapse = ""),
-    .groups = "drop"
-  ) |>
-  power_inner_join(
-    kinomescan_kinase_info |>
-      distinct(hgnc_symbol, `DiscoveRx Gene Symbol`),
-    by = c("gene_symbol" = "hgnc_symbol"),
-    check = check_specs(
-      duplicate_keys_right = "ignore",
-      unmatched_keys_left = "warn"
-    )
-  )
 ```
 
 
@@ -175,7 +150,9 @@ kd_comparison <- power_inner_join(
 ) |>
   power_left_join(
     chembl_kd |>
-      select(-gene_symbol),
+      select(
+        lspci_id, `DiscoveRx Gene Symbol`, chembl_kd
+      ),
     by = c("lspci_id", "DiscoveRx Gene Symbol"),
     check = check_specs(
       duplicate_keys_right = "warn"
@@ -464,7 +441,7 @@ p <- ggplot(
   geom_hex() +
   geom_text(
     aes(
-      label = paste("R² =", signif(r_squared, 2))
+      label = paste("R =", signif(sqrt(r_squared), 2))
     ),
     data = pair_combinations_cor_df |>
       mutate(
@@ -496,7 +473,7 @@ p <- ggplot(
 p
 
 ggsave(
-  here("plots", "pair_kd_vs_all_hex_v2.pdf"),
+  here("plots", "pair_kd_vs_all_hex_v3.pdf"),
   p, width = 7, height = 4
 )
 ```
